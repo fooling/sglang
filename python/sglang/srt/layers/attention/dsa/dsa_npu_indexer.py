@@ -588,12 +588,15 @@ class DSANPUIndexerMixin:
         # midpoint. Using (q.size(0)+1)//2 is only correct when bs==1 and
         # prev/next happen to be equal.
         split_len = forward_batch.attn_cp_metadata.total_q_prev_tokens
-        q_prev, q_next = torch.split(q, split_len, dim=0)
+        # Slice instead of torch.split: a zigzag half can legitimately be
+        # empty (every sequence's block on that side has zero length), and
+        # torch.split with an int cannot express that -- it returns 1 chunk
+        # when split_len >= q.size(0), so unpacking prev/next fails.
+        q_prev, q_next = q[:split_len], q[split_len:]
         weights_prev, weights_next = None, None
         if indexer_weights is not None:
-            weights_prev, weights_next = torch.split(
-                indexer_weights, split_len, dim=0
-            )
+            weights_prev = indexer_weights[:split_len]
+            weights_next = indexer_weights[split_len:]
             weights_prev = weights_prev.contiguous().view(-1, weights_prev.shape[-1])
             weights_next = weights_next.contiguous().view(-1, weights_next.shape[-1])
 
@@ -606,6 +609,15 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_q_prev = torch.cumsum(actual_seq_lengths_q_prev, dim=0)
         actual_seq_lengths_q_next = torch.cumsum(actual_seq_lengths_q_next, dim=0)
 
+        # FIXME: this writes in place. In the no-prefix path
+        # actual_seq_lengths_kv_next IS attn_cp_metadata.kv_len_next_tensor,
+        # which do_cp_balance_attn reads directly, so the write corrupts the
+        # last sequence's KV length for attention and every later layer
+        # (bs > 1 only; for bs == 1 both indices are the same element and
+        # this line is a no-op). Also unconfirmed whether the workaround
+        # itself is needed at all -- added without explanation in
+        # 23302f7e32. Fix properly (clone, or drop the line) once its
+        # purpose is confirmed with the author.
         actual_seq_lengths_kv_next[-1] = actual_seq_lengths_kv_next[0]
 
         if use_quant_lightning_indexer:
@@ -617,87 +629,103 @@ class DSANPUIndexerMixin:
             past_key_states_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                 layer_id
             )
-            topk_indices_prev = torch_npu.npu_quant_lightning_indexer(
-                query=q_prev,
-                key=past_key_states,
-                weights=weights_prev,
-                query_dequant_scale=q_prev_scale,
-                key_dequant_scale=past_key_states_scale,
-                actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-                query_quant_mode=0,
-                key_quant_mode=0,
-            )
+            # An empty half (all tokens on the other zigzag side) must skip
+            # its kernel call; only the computed parts are concatenated.
+            topk_indices_prev = None
+            if q_prev.size(0) > 0:
+                topk_indices_prev = torch_npu.npu_quant_lightning_indexer(
+                    query=q_prev,
+                    key=past_key_states,
+                    weights=weights_prev,
+                    query_dequant_scale=q_prev_scale,
+                    key_dequant_scale=past_key_states_scale,
+                    actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                )
             q_next, q_next_scale = _quantize_npu_indexer_activation(
                 q_next,
                 self._npu_hadamard_128,
                 get_token_to_kv_pool().dtype,
             )
-            topk_indices_next = torch_npu.npu_quant_lightning_indexer(
-                query=q_next,
-                key=past_key_states,
-                weights=weights_next,
-                query_dequant_scale=q_next_scale,
-                key_dequant_scale=past_key_states_scale,
-                actual_seq_lengths_query=actual_seq_lengths_q_next.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-                query_quant_mode=0,
-                key_quant_mode=0,
-            )
-            return torch.cat([topk_indices_prev, topk_indices_next], dim=0).squeeze(1)
+            topk_indices_next = None
+            if q_next.size(0) > 0:
+                topk_indices_next = torch_npu.npu_quant_lightning_indexer(
+                    query=q_next,
+                    key=past_key_states,
+                    weights=weights_next,
+                    query_dequant_scale=q_next_scale,
+                    key_dequant_scale=past_key_states_scale,
+                    actual_seq_lengths_query=actual_seq_lengths_q_next.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                )
+            topk_parts = [
+                t for t in (topk_indices_prev, topk_indices_next) if t is not None
+            ]
+            return torch.cat(topk_parts, dim=0).squeeze(1)
 
         else:
-            topk_indices_prev = torch_npu.npu_lightning_indexer(
-                query=q_prev,
-                key=past_key_states,
-                weights=weights_prev,
-                actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )
-            topk_indices_next = torch_npu.npu_lightning_indexer(
-                query=q_next,
-                key=past_key_states,
-                weights=weights_next,
-                actual_seq_lengths_query=actual_seq_lengths_q_next.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )
-            return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
+            topk_indices_prev = None
+            if q_prev.size(0) > 0:
+                topk_indices_prev = torch_npu.npu_lightning_indexer(
+                    query=q_prev,
+                    key=past_key_states,
+                    weights=weights_prev,
+                    actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                )
+            topk_indices_next = None
+            if q_next.size(0) > 0:
+                topk_indices_next = torch_npu.npu_lightning_indexer(
+                    query=q_next,
+                    key=past_key_states,
+                    weights=weights_next,
+                    actual_seq_lengths_query=actual_seq_lengths_q_next.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
+                        device=q.device, dtype=torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                )
+            topk_parts = [
+                t[0] for t in (topk_indices_prev, topk_indices_next) if t is not None
+            ]
+            return torch.cat(topk_parts, dim=0).squeeze(1)
 
 
 def scattered_to_tp_attn_full(

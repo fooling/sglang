@@ -1224,15 +1224,20 @@ class AscendAttnBackend(AttentionBackend):
         # midpoint. Using (seq_len+1)//2 is only correct when bs==1 and
         # prev/next happen to be equal.
         split_len = forward_batch.attn_cp_metadata.total_q_prev_tokens
-        q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
-        q_rope_prev, q_rope_next = torch.split(q_pe, split_len, dim=0)
+        # Slice instead of torch.split: a zigzag half can legitimately be
+        # empty (every sequence's block on that side has zero length), and
+        # torch.split with an int cannot express that -- it returns 1 chunk
+        # when split_len >= q.size(0), so unpacking prev/next fails.
+        q_nope_prev, q_nope_next = q_nope[:split_len], q_nope[split_len:]
+        q_rope_prev, q_rope_next = q_pe[:split_len], q_pe[split_len:]
         q_nope_prev = q_nope_prev.contiguous()
         q_nope_next = q_nope_next.contiguous()
         q_rope_prev = q_rope_prev.contiguous()
         q_rope_next = q_rope_next.contiguous()
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        topk_indices_prev, topk_indices_next = torch.split(
-            topk_indices, split_len, dim=0
+        topk_indices_prev, topk_indices_next = (
+            topk_indices[:split_len],
+            topk_indices[split_len:],
         )
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
@@ -1244,6 +1249,9 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen_prev = torch.cumsum(actual_seq_qlen_prev, dim=0)
         actual_seq_qlen_next = torch.cumsum(actual_seq_qlen_next, dim=0)
 
+        # An empty half (all tokens on the other zigzag side) must skip its
+        # kernel call; only the computed parts are concatenated.
+        attn_out_prev = attn_out_next = None
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
             if q_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
                 raise RuntimeError(
@@ -1266,124 +1274,129 @@ class AscendAttnBackend(AttentionBackend):
                     f"Unexpected packed DSA KV dtype {k_nope.dtype}, "
                     f"expected {torch.float8_e4m3fn}."
                 )
-            attn_out_prev = torch_npu.npu_kv_quant_sparse_flash_attention(
-                query=torch.cat((q_nope_prev, q_rope_prev), dim=-1).contiguous(),
-                key=k_nope.view(
-                    -1,
-                    self.page_size,
-                    1,
-                    packed_cache_dim,
-                ),
-                value=k_nope.view(
-                    -1,
-                    self.page_size,
-                    1,
-                    packed_cache_dim,
-                ),
-                sparse_indices=topk_indices_prev,
-                scale_value=layer.scaling,
-                key_quant_mode=2,
-                value_quant_mode=2,
-                key_dequant_scale=None,
-                value_dequant_scale=None,
-                actual_seq_lengths_query=actual_seq_qlen_prev.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                quant_scale_repo_mode=1,
-                tile_size=DSA_KV_QUANT_TILE_SIZE,
-                rope_head_dim=self.qk_rope_head_dim,
-            )
-            attn_out_next = torch_npu.npu_kv_quant_sparse_flash_attention(
-                query=torch.cat((q_nope_next, q_rope_next), dim=-1).contiguous(),
-                key=k_nope.view(
-                    -1,
-                    self.page_size,
-                    1,
-                    packed_cache_dim,
-                ),
-                value=k_nope.view(
-                    -1,
-                    self.page_size,
-                    1,
-                    packed_cache_dim,
-                ),
-                sparse_indices=topk_indices_next,
-                scale_value=layer.scaling,
-                key_quant_mode=2,
-                value_quant_mode=2,
-                key_dequant_scale=None,
-                value_dequant_scale=None,
-                actual_seq_lengths_query=actual_seq_qlen_next.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                quant_scale_repo_mode=1,
-                tile_size=DSA_KV_QUANT_TILE_SIZE,
-                rope_head_dim=self.qk_rope_head_dim,
-            )
+            if q_nope_prev.size(0) > 0:
+                attn_out_prev = torch_npu.npu_kv_quant_sparse_flash_attention(
+                    query=torch.cat((q_nope_prev, q_rope_prev), dim=-1).contiguous(),
+                    key=k_nope.view(
+                        -1,
+                        self.page_size,
+                        1,
+                        packed_cache_dim,
+                    ),
+                    value=k_nope.view(
+                        -1,
+                        self.page_size,
+                        1,
+                        packed_cache_dim,
+                    ),
+                    sparse_indices=topk_indices_prev,
+                    scale_value=layer.scaling,
+                    key_quant_mode=2,
+                    value_quant_mode=2,
+                    key_dequant_scale=None,
+                    value_dequant_scale=None,
+                    actual_seq_lengths_query=actual_seq_qlen_prev.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    sparse_block_size=1,
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                    attention_mode=2,
+                    quant_scale_repo_mode=1,
+                    tile_size=DSA_KV_QUANT_TILE_SIZE,
+                    rope_head_dim=self.qk_rope_head_dim,
+                )
+            if q_nope_next.size(0) > 0:
+                attn_out_next = torch_npu.npu_kv_quant_sparse_flash_attention(
+                    query=torch.cat((q_nope_next, q_rope_next), dim=-1).contiguous(),
+                    key=k_nope.view(
+                        -1,
+                        self.page_size,
+                        1,
+                        packed_cache_dim,
+                    ),
+                    value=k_nope.view(
+                        -1,
+                        self.page_size,
+                        1,
+                        packed_cache_dim,
+                    ),
+                    sparse_indices=topk_indices_next,
+                    scale_value=layer.scaling,
+                    key_quant_mode=2,
+                    value_quant_mode=2,
+                    key_dequant_scale=None,
+                    value_dequant_scale=None,
+                    actual_seq_lengths_query=actual_seq_qlen_next.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    sparse_block_size=1,
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                    attention_mode=2,
+                    quant_scale_repo_mode=1,
+                    tile_size=DSA_KV_QUANT_TILE_SIZE,
+                    rope_head_dim=self.qk_rope_head_dim,
+                )
         else:
-            attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
-                query=q_nope_prev,
-                key=k_nope,
-                value=k_nope,
-                query_rope=q_rope_prev,
-                key_rope=k_pe,
-                sparse_indices=topk_indices_prev,
-                scale_value=layer.scaling,
-                actual_seq_lengths_query=actual_seq_qlen_prev.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                return_softmax_lse=False,
-            )
-            attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
-                query=q_nope_next,
-                key=k_nope,
-                value=k_nope,
-                query_rope=q_rope_next,
-                key_rope=k_pe,
-                sparse_indices=topk_indices_next,
-                scale_value=layer.scaling,
-                actual_seq_lengths_query=actual_seq_qlen_next.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                return_softmax_lse=False,
-            )
-        return torch.cat([attn_out_prev, attn_out_next], dim=0)
+            if q_nope_prev.size(0) > 0:
+                attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
+                    query=q_nope_prev,
+                    key=k_nope,
+                    value=k_nope,
+                    query_rope=q_rope_prev,
+                    key_rope=k_pe,
+                    sparse_indices=topk_indices_prev,
+                    scale_value=layer.scaling,
+                    actual_seq_lengths_query=actual_seq_qlen_prev.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    sparse_block_size=1,
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                    attention_mode=2,
+                    return_softmax_lse=False,
+                )
+            if q_nope_next.size(0) > 0:
+                attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
+                    query=q_nope_next,
+                    key=k_nope,
+                    value=k_nope,
+                    query_rope=q_rope_next,
+                    key_rope=k_pe,
+                    sparse_indices=topk_indices_next,
+                    scale_value=layer.scaling,
+                    actual_seq_lengths_query=actual_seq_qlen_next.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    sparse_block_size=1,
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                    attention_mode=2,
+                    return_softmax_lse=False,
+                )
+        attn_outs = [t for t in (attn_out_prev, attn_out_next) if t is not None]
+        return torch.cat(attn_outs, dim=0)
 
     def do_cp_attn_fia(
         self,
