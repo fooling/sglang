@@ -49,6 +49,9 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
+from sglang.srt.disaggregation.moe_transfer_window import (
+    maybe_install_moe_transfer_window_hooks,
+)
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
@@ -1451,6 +1454,12 @@ class DeepseekV2MoE(nn.Module):
             and self.shared_experts.supports_split_forward()
             and isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
         )
+
+        # Expose this layer's expert-GEMM phase (between dispatch and combine)
+        # as a window in which PD KV transfer workers may issue their RDMA.
+        # No-op unless SGLANG_DISAGGREGATION_ENABLE_MOE_WINDOW_PACING is set;
+        # installs at most once per dispatcher.
+        maybe_install_moe_transfer_window_hooks(self.experts.dispatcher)
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)

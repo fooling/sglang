@@ -9,13 +9,19 @@ import numpy.typing as npt
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
+from sglang.srt.disaggregation.moe_transfer_window import (
+    get_moe_transfer_window,
+    moe_window_layer_group_size,
+    moe_window_pacing_enabled,
+    slice_for_moe_window,
+)
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -229,6 +235,23 @@ class AscendKVManager(MooncakeKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
+        # Split the transfer into slices and issue each one inside a MoE
+        # expert-GEMM window, where the NPU egress is otherwise idle. Each wait
+        # is bounded and fails open, so this only moves *when* the RDMA is
+        # issued -- never whether it happens.
+        def process_layers_moe_window_paced(
+            layers_params: List[Tuple[int, int, int]],
+        ) -> int:
+            window = get_moe_transfer_window()
+            for layer_slice in slice_for_moe_window(
+                layers_params, moe_window_layer_group_size()
+            ):
+                window.wait_for_window()
+                status = process_layers(layer_slice)
+                if status != 0:
+                    return status
+            return 0
+
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
@@ -245,6 +268,8 @@ class AscendKVManager(MooncakeKVManager):
                     for f in futures:
                         f.cancel()
                     return status
+        elif moe_window_pacing_enabled():
+            return process_layers_moe_window_paced(layers_params)
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads

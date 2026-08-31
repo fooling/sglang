@@ -438,6 +438,18 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # Pace the prefill->decode KV RDMA into the MoE expert-GEMM phase, so it
+    # stops colliding with DeepEP dispatch/combine on the shared NPU egress.
+    # The transfer is split into slices of LAYER_GROUP layers; each slice waits
+    # up to WAIT_MS for a window and then sends regardless (fail-open).
+    # The phase is tracked in device time with a ring of RING_SIZE event pairs
+    # (the host runs ahead of the device by several layers), polled every
+    # POLL_US microseconds via the non-synchronizing Event.query().
+    SGLANG_DISAGGREGATION_ENABLE_MOE_WINDOW_PACING = EnvBool(False)
+    SGLANG_DISAGGREGATION_MOE_WINDOW_LAYER_GROUP = EnvInt(8)
+    SGLANG_DISAGGREGATION_MOE_WINDOW_WAIT_MS = EnvFloat(5.0)
+    SGLANG_DISAGGREGATION_MOE_WINDOW_POLL_US = EnvInt(200)
+    SGLANG_DISAGGREGATION_MOE_WINDOW_RING_SIZE = EnvInt(64)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
