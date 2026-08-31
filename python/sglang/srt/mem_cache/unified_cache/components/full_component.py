@@ -433,11 +433,18 @@ class FullComponent(TreeComponent):
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
+            # Each entry is one node's `value` (see the device_frees append in
+            # _collect_device_frees): a page-exact segment owned by that node
+            # alone, so page ids come from a stride slice. Plain free() would
+            # dedup with torch.unique, whose data-dependent output shape forces
+            # a stream sync -- once per evicted node, inside the scheduler step.
             for indices in action.indices:
                 if self.cache.is_swa_enabled:
+                    # SWA pairs each full slot with an swa peer; left on the
+                    # plain free() until that side grows a free_segment.
                     alloc.full_attn_allocator.free(indices)
                 else:
-                    alloc.free(indices)
+                    alloc.free_segment(indices, start_pos=0)
             return
         raise AssertionError(
             f"FullComponent: unhandled ComponentAction {type(action).__name__}"

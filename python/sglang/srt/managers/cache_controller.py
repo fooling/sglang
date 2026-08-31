@@ -952,7 +952,10 @@ class HiCacheController:
         self._prefetch_state = None
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
-        self.mem_pool_device_allocator.free(device_indices)
+        # Tree-node values are page-exact segments, so page representatives are
+        # a stride slice -- no torch.unique, whose data-dependent output shape
+        # forces a device sync (see PagedTokenToKVPoolAllocator.free_segment).
+        self.mem_pool_device_allocator.free_segment(device_indices, start_pos=0)
         return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:

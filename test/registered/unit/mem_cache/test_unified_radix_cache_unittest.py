@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -5402,6 +5403,51 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.token_to_kv_pool_allocator.full_attn_allocator.free.assert_called_once_with(
             indices
         )
+
+    def test_apply_component_action_device_kv_full_frees_pages_without_unique(self):
+        """Device eviction releases the same page set as the torch.unique
+        reference, without calling torch.unique.
+
+        A node's value is a page-exact segment, so the allocator can take page
+        representatives by stride. Plain free() instead dedups with
+        torch.unique, whose data-dependent output shape forces a stream sync --
+        once per evicted node, inside the scheduler step. Goes red both if the
+        routing reverts to free() and if the stride picks the wrong pages.
+        """
+        page_size = 4
+        alloc = PagedTokenToKVPoolAllocator(
+            size=256,
+            page_size=page_size,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = mock.MagicMock()
+        cache.is_swa_enabled = False
+        cache.token_to_kv_pool_allocator = alloc
+        values = [alloc.alloc(8), alloc.alloc(4), alloc.alloc(12)]
+        expected = torch.unique(torch.cat(values) // page_size)
+        free_before = len(alloc.free_pages)
+
+        unique_calls = []
+        real_unique = torch.unique
+        with mock.patch.object(
+            torch,
+            "unique",
+            side_effect=lambda *a, **k: (
+                unique_calls.append(a[0].shape),
+                real_unique(*a, **k),
+            )[1],
+        ):
+            _component_with_cache(ComponentType.FULL, cache).apply_component_action(
+                FreeComponentDeviceSlot(values, component_type=ComponentType.FULL)
+            )
+
+        self.assertEqual(unique_calls, [], "eviction still calls torch.unique")
+        # _release_page_ids prepends, so the newly freed ids are the head slice.
+        freed = alloc.free_pages[: len(alloc.free_pages) - free_before]
+        self.assertTrue(torch.equal(torch.sort(freed)[0], expected))
 
     def test_apply_component_action_device_kv_swa_uses_free_swa(self):
         cache = mock.MagicMock()
