@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
     set_global_dwdp_manager,
 )
+from sglang.srt.distributed.collective_gate import collective_bracket
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -1086,7 +1087,10 @@ class GroupCoordinator:
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
-            self._reduce_scatter_tensor(output, input)
+            # Mark the collective so the PD KV transfer limiter can tell when
+            # the interconnect is busy. Inert unless that limiter is enabled.
+            with collective_bracket:
+                self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
         else:
@@ -1266,7 +1270,8 @@ class GroupCoordinator:
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
-            self._all_gather_into_tensor(output, input)
+            with collective_bracket:
+                self._all_gather_into_tensor(output, input)
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
             # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor

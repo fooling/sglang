@@ -6,17 +6,22 @@ from typing import List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.disaggregation.ascend.kv_transfer_flow import (
+    get_kv_transfer_pacer,
+    split_blocks,
+)
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -38,6 +43,52 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        """Meter the transfer while the device is inside a collective.
+
+        Every Ascend PD send funnels through here (the MLA branch of
+        ``transfer_worker`` reaches ``send_kvcache``, and the staging and
+        ``send_kvcache_slice`` branches sit behind it in the same if/elif, so
+        they are unreachable for an MLA model such as GLM-5.2).  Metering here
+        therefore covers KV, the DSA indexer, the state components and the aux
+        payloads -- every send that leaves this rank -- without touching
+        ``send_kvcache`` or the transfer worker.
+
+        Only the issue rate changes; the bytes and their order do not.
+        """
+        pacer = get_kv_transfer_pacer()
+        if pacer is None or not transfer_blocks:
+            return super()._transfer_data(mooncake_session_id, transfer_blocks)
+
+        for slice_blocks in split_blocks(transfer_blocks):
+            # Rate limiting stretches one transfer over up to hundreds of
+            # milliseconds, which also stretches the window in which we keep
+            # pushing bytes at a peer that has since died. The worker only
+            # checks the session between destinations, so check it between
+            # slices too -- before the pacing sleep, so we never wait on
+            # behalf of a dead session.
+            if self._session_is_dead(mooncake_session_id):
+                logger.debug(
+                    "Aborting KV transfer: remote session %s died mid-transfer",
+                    mooncake_session_id,
+                )
+                return -1
+            pacer.send(sum(block[2] for block in slice_blocks))
+            status = super()._transfer_data(mooncake_session_id, slice_blocks)
+            if status != 0:
+                return status
+        return 0
+
+    def _session_is_dead(self, mooncake_session_id: str) -> bool:
+        failed = getattr(self, "failed_sessions", None)
+        if not failed:
+            return False
+        lock = getattr(self, "session_lock", None)
+        if lock is None:
+            return mooncake_session_id in failed
+        with lock:
+            return mooncake_session_id in failed
+
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)

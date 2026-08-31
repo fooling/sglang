@@ -439,6 +439,16 @@ class Envs:
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
 
+    # Rate limit for the prefill->decode KV transfer on Ascend, where the KV
+    # RDMA shares the NPU egress with the model's collectives. The transfer is
+    # capped while the device is inside a collective and released when it is
+    # not. DURING_COLLECTIVE = 0 disables the whole feature (default).
+    # Sizing: the cap must exceed the KV production rate, which for GLM-5.2 is
+    # about 54 KB/token (~1.1 GB/s at 20K tok/s), so 3072 is a sane start --
+    # a few times production, an order of magnitude under line rate.
+    SGLANG_DISAGGREGATION_KV_TRANSFER_MBPS_DURING_COLLECTIVE = EnvInt(0)
+    SGLANG_DISAGGREGATION_KV_TRANSFER_MBPS = EnvInt(0)
+
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)

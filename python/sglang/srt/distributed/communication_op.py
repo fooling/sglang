@@ -7,13 +7,15 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.distributed
 
+from sglang.srt.distributed.collective_gate import collective_bracket
+
 from .parallel_state import (
+    get_attn_o_tensor_parallel_world_size,
+    get_attn_o_tp_group,
     get_attn_tp_group,
     get_moe_ep_group,
     get_moe_tp_group,
     get_tp_group,
-    get_attn_o_tp_group,
-    get_attn_o_tensor_parallel_world_size
 )
 
 
@@ -80,9 +82,8 @@ def attn_o_model_parallel_reduce_scatter(input_):
     group = get_attn_o_tp_group().device_group
     out_shape[0] //= get_attn_o_tensor_parallel_world_size()
     output = torch.empty(out_shape, device=input_.device, dtype=input_.dtype)
-    torch.distributed.reduce_scatter_tensor(
-        output, input_, group=group
-    )
+    with collective_bracket:
+        torch.distributed.reduce_scatter_tensor(output, input_, group=group)
     return output
 
 
