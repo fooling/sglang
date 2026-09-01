@@ -662,6 +662,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             self.index_k_buffer = None
             self.index_k_scale_buffer = None
+            self.index_k_scale_staging = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
                     (
@@ -681,6 +682,29 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                             self.size // self.page_size + 1,
                             self.page_size,
                             1,
+                        ),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    # Page-major staging mirror of index_k_scale_buffer, laid
+                    # out byte-identically to the host pool's page-first scale
+                    # buffer.  The HiCache transfer lands here in one block per
+                    # page covering every Indexer layer at once (page_size *
+                    # num_indexer_layers * 4 B) instead of one 512 B block per
+                    # (layer, page); scatter_index_k_scale() then transposes it
+                    # into the layer-major cache the Indexer kernel reads, whose
+                    # layout is left untouched.
+                    #
+                    # The leading singleton is a dummy layer axis: comp_meta()
+                    # treats dim0 as the layer stride and derives the block
+                    # width from shape[2:], so this shape yields exactly one
+                    # (layer, page) block per page.
+                    self.index_k_scale_staging = torch.zeros(
+                        (
+                            1,
+                            self.size // self.page_size + 1,
+                            self.num_indexer_layers,
+                            self.page_size,
                         ),
                         dtype=torch.float32,
                         device=self.device,
@@ -714,6 +738,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             if self.index_k_scale_buffer is not None:
                 for index_k_scale_cache in self.index_k_scale_buffer:
                     kv_size_bytes += get_tensor_size_bytes(index_k_scale_cache)
+            if self.index_k_scale_staging is not None:
+                kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_staging)
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
@@ -787,6 +813,51 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_scale_buffer[indexer_slot]
+
+    def _staging_page_ids(self, device_indices: torch.Tensor) -> torch.Tensor:
+        """Page ids addressed by ``device_indices``, in kv_exchange order.
+
+        ``device_indices`` is a flat token-slot list whose length is a multiple
+        of ``page_size``; the kv_exchange kernel reads one page per stride of
+        ``page_size`` and derives the page from its first token, so the staging
+        scatter must walk exactly the same pages in the same order.
+        """
+        first_token = device_indices.reshape(-1, self.page_size)[:, 0]
+        return torch.div(first_token, self.page_size, rounding_mode="floor")
+
+    def scatter_index_k_scale(self, device_indices: torch.Tensor) -> None:
+        """Page-major staging -> layer-major Indexer scale cache (H2D tail).
+
+        Runs after the kv_exchange H2D has filled ``index_k_scale_staging`` for
+        the loaded pages.  Only the loaded pages are touched, and the resulting
+        ``index_k_scale_buffer`` content is identical to what a per-(layer,
+        page) transfer would have written.
+        """
+        if self.index_k_scale_staging is None or self.index_k_scale_buffer is None:
+            return
+        pages = self._staging_page_ids(device_indices).to(
+            self.index_k_scale_staging.device
+        )
+        # staging[0, pages]: (num_pages, num_indexer_layers, page_size)
+        # buffer[:, pages] : (num_indexer_layers, num_pages, page_size, 1)
+        self.index_k_scale_buffer[:, pages] = (
+            self.index_k_scale_staging[0, pages].permute(1, 0, 2).unsqueeze(-1)
+        )
+
+    def gather_index_k_scale(self, device_indices: torch.Tensor) -> None:
+        """Layer-major Indexer scale cache -> page-major staging (D2H head).
+
+        The inverse of :meth:`scatter_index_k_scale`, run before a D2H
+        kv_exchange so the write-back can read one block per page.
+        """
+        if self.index_k_scale_staging is None or self.index_k_scale_buffer is None:
+            return
+        pages = self._staging_page_ids(device_indices).to(
+            self.index_k_scale_staging.device
+        )
+        self.index_k_scale_staging[0, pages] = (
+            self.index_k_scale_buffer[:, pages].squeeze(-1).permute(1, 0, 2)
+        )
 
     # for disagg
     def get_contiguous_buf_infos(self):

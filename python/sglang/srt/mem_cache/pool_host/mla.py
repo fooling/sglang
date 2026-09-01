@@ -421,6 +421,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         layer_num: int = -1,
         index_k_layer_start: int = 0,
         index_k_layer_num: int = -1,
+        scale_all: bool = True,
     ) -> None:
         """One-shot KV transfer via the Memfabric acc_offload fused AIV kernel.
 
@@ -434,6 +435,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         The layer range arguments restrict the transfer to one layer group
         (layer-group pipelining); the defaults transfer everything.
 
+        ``scale_all`` selects the Indexer FP32 scale component.  When the device
+        pool exposes a page-major staging mirror the scale is not sliced per
+        layer group at all: it is transferred once for the whole load, one block
+        per page covering every Indexer layer, so callers must set scale_all
+        only on the first group of a load (see load_to_device_per_layer).
+
         Requires the host pool to be hybm-backed (SGLANG_HICACHE_IO_ASCENDC
         implies SGLANG_HICACHE_HOST_MEM=hybm) since the kernel de-references
         host pointers directly.
@@ -441,6 +448,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         from memfabric_hybrid import offload
 
         device = device_pool.k_buffer.device
+        # The staging transpose runs on the device and wants the indices where
+        # they already are; keep a handle before the CPU copies below.
+        staging_indices = device_indices
         # The kernel reads the token indices directly from device memory.
         # Upload without a stream sync: a plain .to(device) from pageable
         # memory synchronizes the stream and would serialize the pipeline.
@@ -485,6 +495,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 f"host={self.k_buffer.shape[1]})"
             )
 
+        scale_staging_used = False
         comps = [
             comp_meta(device_pool.k_buffer, self.k_buffer, k_lo, k_hi),
         ]
@@ -503,8 +514,31 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 comps.append(
                     comp_meta(device_index_k, self.index_k_buffer, ik_lo, ik_hi)
                 )
-                device_scale = getattr(device_pool, "index_k_scale_buffer", None)
-                if self.index_k_scale_buffer is not None and device_scale is not None:
+            device_scale = getattr(device_pool, "index_k_scale_buffer", None)
+            if self.index_k_scale_buffer is not None and device_scale is not None:
+                staging = getattr(device_pool, "index_k_scale_staging", None)
+                # The staging block spans every Indexer layer of a page, so its
+                # width only matches the host run when both sides agree on the
+                # layer count.  An MTP draft pool with its own Indexer layout
+                # does not, and falls back to the per-layer component, whose
+                # width is one layer wide and therefore layer-count agnostic.
+                if staging is not None and (
+                    staging.shape[2] == self.index_k_scale_buffer.shape[1]
+                ):
+                    # Page-major staging: one block per page covering every
+                    # Indexer layer (page_size * num_indexer_layers * 4 B)
+                    # instead of one 512 B block per (layer, page).  The host
+                    # scale buffer is page-first, so a page's layers are already
+                    # one contiguous run there and the layer axis collapses to
+                    # [0, 1); the block width comes from the staging tail dims.
+                    # The scale is not sliced per group, hence the scale_all
+                    # gate: only the first group of a load carries it.
+                    if scale_all:
+                        scale_staging_used = True
+                        comps.append(
+                            comp_meta(staging, self.index_k_scale_buffer, 0, 1)
+                        )
+                elif ik_hi > ik_lo:
                     comps.append(
                         comp_meta(
                             device_scale,
@@ -532,6 +566,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             vals.extend(comp)
         
 
+        # D2H reads the page-major staging mirror, so fill it from the
+        # layer-major cache first.  This is enqueued before the drain below,
+        # which is what makes it visible to the host-side copy.
+        if scale_staging_used and direction_value == 2:
+            device_pool.gather_index_k_scale(staging_indices)
+
         # hybm_data_batch_copy executes host-side, bypassing NPU stream
         # ordering.  For D2H (value 2 per the kv_exchange meta layout; 1 is
         # H2D) the device KV rows may still have in-flight writes from compute
@@ -548,6 +588,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ret = offload.kv_exchange_copy(meta, device)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
+
+        # The copy lands in the page-major staging mirror; transpose it into the
+        # layer-major cache the Indexer kernel reads.  kv_exchange_copy is
+        # host-side and has retired by the time it returns, so the pages are
+        # already there and the transpose only has to be ordered ahead of the
+        # complete events the caller records next.
+        if scale_staging_used and direction_value != 2:
+            device_pool.scatter_index_k_scale(staging_indices)
 
     def load_to_device_per_layer(
         self,
@@ -649,6 +697,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     group = self._ascendc_layer_group(device_pool, device_layer_id)
                     if group is not None:
                         layer_start, layer_num, ik_start, ik_num = group
+                        owned_start, _ = self._device_owned_layer_range(device_pool)
                         self._transfer_ascendc_sparse_copy(
                             device_pool,
                             host_indices,
@@ -658,6 +707,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                             layer_num=layer_num,
                             index_k_layer_start=ik_start,
                             index_k_layer_num=ik_num,
+                            # The staging path transfers every Indexer layer's
+                            # scale at once, so it belongs to the first group of
+                            # the load only.  Landing all of it early is safe:
+                            # these device slots are freshly allocated and no
+                            # layer reads them before its complete event.
+                            scale_all=(layer_start == owned_start),
                         )
                     return
                 # memcpy2d layer-group pipelining: at each group boundary

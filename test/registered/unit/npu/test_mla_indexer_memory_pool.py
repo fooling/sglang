@@ -85,7 +85,9 @@ class TestNPUMLAIndexerMemoryPool(CustomTestCase):
         self.assertEqual(pool.get_state_layer_ids(), [10, 12, 15] * 2)
 
         slots = 6
-        expected_bytes = 6 * slots * packed_cache_dim + 3 * slots * (128 + 4)
+        # Per Indexer layer and slot: 128 B of FP8 index K, a 4 B FP32 scale,
+        # and the 4 B page-major staging mirror of that scale.
+        expected_bytes = 6 * slots * packed_cache_dim + 3 * slots * (128 + 4 + 4)
         self.assertEqual(pool.get_kv_size_bytes(), expected_bytes)
 
     def test_rejects_invalid_layer_mappings(self):
