@@ -383,14 +383,16 @@ class TestPackedIndexerCache(CustomTestCase):
         sentinel = torch.zeros(1)
         calls = []
 
+        # 8 heads is below tl.dot's minimum extent, so the Triton kernel
+        # declines this shape and the dispatch has to reach the fallback.
         args = dict(
-            query=torch.zeros(1),
+            query=torch.zeros(2, 8, HEAD_DIM),
             key_with_scale=packed,
-            weights=torch.zeros(1),
-            query_dequant_scale=torch.zeros(1),
-            actual_seq_lengths_query=torch.zeros(1),
-            actual_seq_lengths_key=torch.zeros(1),
-            block_table=torch.zeros(1),
+            weights=torch.zeros(2, 8),
+            query_dequant_scale=torch.zeros(2, 1),
+            actual_seq_lengths_query=torch.tensor([2], dtype=torch.int32),
+            actual_seq_lengths_key=torch.tensor([PAGE_SIZE], dtype=torch.int32),
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
             index_head_dim=HEAD_DIM,
             sparse_count=4,
         )

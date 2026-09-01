@@ -15,10 +15,12 @@ reads the scale inline, the way ``npu_kv_quant_sparse_flash_attention`` already
 does with ``key_quant_mode=2`` -- is what this module dispatches to when one is
 registered.
 
-Until then :func:`unpack_index_k_with_scale` materializes the two views the
-vendor op wants.  That is a copy, and it is the copy the packed layout exists to
-avoid: the fallback is here so the packed cache is testable and runnable, not so
-it is fast.
+When no such op is registered this dispatches to the Triton kernel in
+``sglang/kernels/ops/attention/dsa/packed_indexer_triton.py``, which reads the
+packed page in place -- portable Triton, so a Triton-Ascend build compiles it
+for the AI Core.  Failing that, :func:`unpack_index_k_with_scale` materializes
+the two views the vendor op wants; that is a copy, and it is the copy the packed
+layout exists to avoid, so it is a correctness path rather than a fast one.
 """
 
 from __future__ import annotations
@@ -44,6 +46,22 @@ def native_packed_indexer_op():
     if namespace is None:
         return None
     return getattr(namespace, _NATIVE_OP_NAME, None)
+
+
+def _triton_packed_indexer():
+    """``(supported, topk)`` from the Triton kernel, or None when it will not load.
+
+    Imported lazily: Triton is optional, and on a build without a backend for
+    this device importing it is the failure, not calling it.
+    """
+    try:
+        from sglang.kernels.ops.attention.dsa.packed_indexer_triton import (
+            packed_indexer_supported,
+            packed_indexer_topk,
+        )
+    except Exception:
+        return None
+    return packed_indexer_supported, packed_indexer_topk
 
 
 def unpack_index_k_with_scale(
@@ -121,11 +139,28 @@ def quant_lightning_indexer_packed(
             layout_query,
             sparse_mode,
         )
+    triton_topk = _triton_packed_indexer()
+    if triton_topk is not None and query.ndim == 3:
+        page_size = key_with_scale.shape[1]
+        supported, topk = triton_topk
+        if supported(query.shape[1], index_head_dim, page_size):
+            return topk(
+                cache=key_with_scale,
+                query=query,
+                weights=weights,
+                query_dequant_scale=query_dequant_scale,
+                block_table=block_table,
+                cumulative_seq_lengths_query=actual_seq_lengths_query,
+                seq_lengths_key=actual_seq_lengths_key,
+                index_head_dim=index_head_dim,
+                page_size=page_size,
+                sparse_count=sparse_count,
+            )
     if split_op is None:
         raise RuntimeError(
-            "No packed-cache Indexer op is registered and no split-layout op was "
-            "supplied to fall back to. Register "
-            f"torch.ops.npu.{_NATIVE_OP_NAME}, or run with "
+            "No packed-cache Indexer op is registered, the Triton kernel does "
+            "not cover this shape, and no split-layout op was supplied to fall "
+            f"back to. Register torch.ops.npu.{_NATIVE_OP_NAME}, or run with "
             "SGLANG_NPU_ENABLE_PACKED_INDEXER_CACHE=0."
         )
     key, key_scale = unpack_index_k_with_scale(key_with_scale, index_head_dim)
