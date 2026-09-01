@@ -237,8 +237,7 @@ def ensure_hybm_capacity(total_bytes: int, device_id: int) -> None:
         config.device_id = device_id
         config.reserve_size = reserve
         config.alloc_size = reserve
-        config.flags = offload.OFFLOAD_FLAG_URMA_POOL
-        config.scene = offload.Scene.LOCAL
+        config.scene = offload.Scene.LOCAL_URMA
         assert offload.initialize(config) == 0, "offload.initialize failed"
         _hybm_state.update(
             initialized=True, reserved_bytes=reserve, device_id=device_id

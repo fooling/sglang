@@ -444,15 +444,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # The kernel reads the token indices directly from device memory.
         # Upload without a stream sync: a plain .to(device) from pageable
         # memory synchronizes the stream and would serialize the pipeline.
-        if host_indices.device.type != "npu":
-            host_indices = to_device_no_sync(host_indices, device)
-        if device_indices.device.type != "npu":
-            device_indices = to_device_no_sync(device_indices, device)
+        if host_indices.device.type != "cpu":
+            host_indices = host_indices.cpu()
+        if device_indices.device.type != "cpu":
+            device_indices = device_indices.cpu()
         # The kernel runs on the current (load) stream while the indices were
         # allocated on another stream; keep them alive until the copy retires.
-        stream = torch.npu.current_stream()
-        host_indices.record_stream(stream)
-        device_indices.record_stream(stream)
 
         def comp_meta(dev_t, host_t, lo, hi):
             # dev_t: (layer, page, page_size, [1,] width) layer-first;
@@ -535,36 +532,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             vals.extend(comp)
         
 
-        def _rewrite_host_base_to_dva(vals):
-            _KV_EXCHANGE_META_HEADER = 6
-            _KV_EXCHANGE_META_STRIDE = 9
-            _KV_EXCHANGE_MAX_COMPONENTS = 4
-            _KV_EXCHANGE_HOST_BASE_OFFSET = 1
+        # hybm_data_batch_copy executes host-side, bypassing NPU stream
+        # ordering.  For D2H (value 2 per the kv_exchange meta layout; 1 is
+        # H2D) the device KV rows may still have in-flight writes from compute
+        # streams, so drain the device first.  H2D reads only host memory,
+        # which is always coherent, and its destination rows are guarded by
+        # the complete events the caller records after this returns.
+        if direction_value == 2:
+            torch.npu.synchronize()
 
-            # D2H: copy meta to CPU so we can read/modify the int64 fields.
-            num_components = int(vals[0])
-            if num_components < 0 or num_components > _KV_EXCHANGE_MAX_COMPONENTS:
-                raise ValueError(f"kv_exchange: invalid num_components {num_components} in meta")
-            for c in range(num_components):
-                idx = _KV_EXCHANGE_META_HEADER + _KV_EXCHANGE_META_STRIDE * c + _KV_EXCHANGE_HOST_BASE_OFFSET
-                host_base = int(vals[idx])
-                if host_base == 0:
-                    continue
-                # get_dva_impl = offload.get_dva
-                dva = offload.get_dva(host_base)
-                if dva == 0:
-                    raise ValueError(f"kv_exchange: get_dva failed for host_base 0x{host_base:x}")
-                if dva != host_base:
-                    vals[idx] = dva
-
-            return vals
-
-        vals = _rewrite_host_base_to_dva(vals)
-
-        pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
-        meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
-        meta.copy_(pinned_meta, non_blocking=True)
-        track_pinned_staging(pinned_meta)
+        # The meta stays on the host with plain host_base addresses: the
+        # native side resolves the hybm pool rows itself, so there is no
+        # HVA->DVA rewrite and no device upload of the meta.
+        meta = torch.tensor(vals, dtype=torch.int64)
         ret = offload.kv_exchange_copy(meta, device)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
