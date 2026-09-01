@@ -383,7 +383,6 @@ class TestPackedIndexerCache(CustomTestCase):
         sentinel = torch.zeros(1)
         calls = []
 
-        self.assertIsNone(native_packed_indexer_op())
         args = dict(
             query=torch.zeros(1),
             key_with_scale=packed,
@@ -396,23 +395,32 @@ class TestPackedIndexerCache(CustomTestCase):
             sparse_count=4,
         )
 
-        # No native op and no fallback: say so instead of guessing.
-        with self.assertRaisesRegex(RuntimeError, "No packed-cache Indexer op"):
-            quant_lightning_indexer_packed(**args)
-
-        # Fallback unpacks and hands the vendor op the two contiguous tensors.
         def split_op(**kwargs):
             calls.append(kwargs)
             return sentinel
 
-        self.assertIs(quant_lightning_indexer_packed(**args, split_op=split_op), sentinel)
+        # A shim may already register the op in this environment (CANNON does),
+        # so the no-native cases name an empty namespace rather than assuming one.
+        empty = SimpleNamespace()
+        with mock.patch.object(torch.ops, "npu", empty, create=True):
+            self.assertIsNone(native_packed_indexer_op())
+            # No native op and no fallback: say so instead of guessing.
+            with self.assertRaisesRegex(RuntimeError, "No packed-cache Indexer op"):
+                quant_lightning_indexer_packed(**args)
+            # Fallback unpacks and hands the vendor op two contiguous tensors.
+            self.assertIs(
+                quant_lightning_indexer_packed(**args, split_op=split_op), sentinel
+            )
         self.assertEqual(calls[0]["key"].shape[-1], HEAD_DIM)
         self.assertTrue(calls[0]["key"].is_contiguous())
         self.assertTrue(calls[0]["key_dequant_scale"].is_contiguous())
 
         # A registered native op wins over the fallback.
-        native = SimpleNamespace(**{"npu_quant_lightning_indexer_packed": lambda *a: "native"})
+        native = SimpleNamespace(
+            **{"npu_quant_lightning_indexer_packed": lambda *a: "native"}
+        )
         with mock.patch.object(torch.ops, "npu", native, create=True):
+            self.assertIsNotNone(native_packed_indexer_op())
             self.assertEqual(
                 quant_lightning_indexer_packed(**args, split_op=split_op), "native"
             )
