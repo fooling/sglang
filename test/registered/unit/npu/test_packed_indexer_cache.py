@@ -401,8 +401,8 @@ class TestPackedIndexerCache(CustomTestCase):
             calls.append(kwargs)
             return sentinel
 
-        # A shim may already register the op in this environment (CANNON does),
-        # so the no-native cases name an empty namespace rather than assuming one.
+        # A shim may already register the op in this environment, so the
+        # no-native cases name an empty namespace rather than assuming one.
         empty = SimpleNamespace()
         with mock.patch.object(torch.ops, "npu", empty, create=True):
             self.assertIsNone(native_packed_indexer_op())

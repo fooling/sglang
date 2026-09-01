@@ -23,7 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 try:
-    from sglang.kernels.ops.attention.dsa.packed_indexer_triton import (
+    from sglang.kernels.ops.attention.dsa.packed_indexer_npu import (
         INDEX_K_SCALE_BYTES,
         packed_indexer_supported,
         packed_indexer_topk,

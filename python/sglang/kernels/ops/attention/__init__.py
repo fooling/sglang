@@ -95,6 +95,8 @@ for _mod, _fn in [
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
     ("dsa.cp_split", "dsa_cp_round_robin_split_q_seqs_kernel"),
+    ("dsa.packed_indexer_npu", "packed_indexer_logits"),
+    ("dsa.packed_indexer_npu", "packed_indexer_topk"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
     ("dsv4.rms_normalize_hip", "rms_normalize_triton"),

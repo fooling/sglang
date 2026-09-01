@@ -16,7 +16,7 @@ does with ``key_quant_mode=2`` -- is what this module dispatches to when one is
 registered.
 
 When no such op is registered this dispatches to the Triton kernel in
-``sglang/kernels/ops/attention/dsa/packed_indexer_triton.py``, which reads the
+``sglang/kernels/ops/attention/dsa/packed_indexer_npu.py``, which reads the
 packed page in place -- portable Triton, so a Triton-Ascend build compiles it
 for the AI Core.  Failing that, :func:`unpack_index_k_with_scale` materializes
 the two views the vendor op wants; that is a copy, and it is the copy the packed
@@ -38,8 +38,8 @@ _NATIVE_OP_NAME = "npu_quant_lightning_indexer_packed"
 def native_packed_indexer_op():
     """The registered packed-cache Indexer op, or None when nothing provides it.
 
-    Looked up per call rather than cached at import: the op may be installed by
-    a shim (CANNON registers it on ``torch.ops.npu``) after this module is
+    Looked up per call rather than cached at import: a vendor build or a local
+    shim may register the op on ``torch.ops.npu`` after this module is
     imported.
     """
     namespace = getattr(torch.ops, "npu", None)
@@ -55,7 +55,7 @@ def _triton_packed_indexer():
     this device importing it is the failure, not calling it.
     """
     try:
-        from sglang.kernels.ops.attention.dsa.packed_indexer_triton import (
+        from sglang.kernels.ops.attention.dsa.packed_indexer_npu import (
             packed_indexer_supported,
             packed_indexer_topk,
         )
