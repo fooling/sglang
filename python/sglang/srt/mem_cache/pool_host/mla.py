@@ -461,6 +461,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         from memfabric_hybrid import offload
 
         device = device_pool.k_buffer.device
+        # The unpack after a packed load runs on the device and wants the
+        # indices where they already are; keep a handle before the CPU copies.
+        packed_indices = device_indices
         # The kernel reads the token indices directly from device memory.
         # Upload without a stream sync: a plain .to(device) from pageable
         # memory synchronizes the stream and would serialize the pipeline.
@@ -513,6 +516,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if device_pool.v_buffer.numel() > 0 and self.v_buffer.numel() > 0:
             comps.append(comp_meta(device_pool.v_buffer, self.v_buffer, k_lo, k_hi))
 
+        packed_transfer = False
         device_packed = getattr(device_pool, "index_k_with_scale_buffer", None)
         if self.index_k_with_scale_buffer is not None and device_packed is not None:
             # K and scale share a page, so they are one component: the block is
@@ -526,6 +530,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     index_k_layer_start + index_k_layer_num,
                 )
             if ik_hi > ik_lo:
+                packed_transfer = True
                 comps.append(
                     comp_meta(device_packed, self.index_k_with_scale_buffer, ik_lo, ik_hi)
                 )
@@ -568,6 +573,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             vals.extend(comp)
         
 
+        # D2H sends the packed scratch, and nothing keeps it current between
+        # transfers, so build the pages first.  Enqueued before the drain below,
+        # which is what makes it visible to the host-side copy.
+        if packed_transfer and direction_value == 2:
+            device_pool.pack_index_pages(packed_indices)
+
         # hybm_data_batch_copy executes host-side, bypassing NPU stream
         # ordering.  For D2H (value 2 per the kv_exchange meta layout; 1 is
         # H2D) the device KV rows may still have in-flight writes from compute
@@ -584,6 +595,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ret = offload.kv_exchange_copy(meta, device)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
+
+        # The load landed in the packed scratch, which no Indexer op reads.
+        # Publish it into the split buffers before the caller records the
+        # complete events that let a layer read them.
+        if packed_transfer and direction_value != 2:
+            device_pool.unpack_index_pages(packed_indices)
 
     def load_to_device_per_layer(
         self,

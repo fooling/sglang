@@ -6,9 +6,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import ScatterMode
-from sglang.srt.layers.attention.dsa.packed_indexer import (
-    quant_lightning_indexer_packed,
-)
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -399,25 +396,16 @@ class DSANPUIndexerMixin:
                 torch.npu.current_stream(),
             )
 
-        packed_indexer_cache = getattr(kv_pool, "packed_indexer_cache", False)
         if use_quant_lightning_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k,
                 self._npu_hadamard_128,
                 kv_pool.dtype,
             )
-            if packed_indexer_cache:
-                # K and its scale share a page; one call writes both halves.
-                kv_pool.set_index_k_with_scale_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, k_scale
-                )
-            else:
-                kv_pool.set_index_k_scale_buffer(
-                    layer_id, forward_batch.out_cache_loc, k_scale
-                )
-                kv_pool.set_index_k_buffer(layer_id, forward_batch.out_cache_loc, k)
-        else:
-            kv_pool.set_index_k_buffer(layer_id, forward_batch.out_cache_loc, k)
+            kv_pool.set_index_k_scale_buffer(
+                layer_id, forward_batch.out_cache_loc, k_scale
+            )
+        kv_pool.set_index_k_buffer(layer_id, forward_batch.out_cache_loc, k)
         query_tokens_per_request = (
             get_attn_backend().speculative_num_draft_tokens
             if (
@@ -496,13 +484,9 @@ class DSANPUIndexerMixin:
                     get_attn_backend().forward_metadata.actual_seq_lengths_q
                 )
 
-        past_key_states_scale = None
-        if packed_indexer_cache:
-            past_key_states = kv_pool.get_index_k_with_scale_buffer(layer_id)
-        else:
-            past_key_states = kv_pool.get_index_k_buffer(layer_id)
-            if use_quant_lightning_indexer:
-                past_key_states_scale = kv_pool.get_index_k_scale_buffer(layer_id)
+        past_key_states = kv_pool.get_index_k_buffer(layer_id)
+        if use_quant_lightning_indexer:
+            past_key_states_scale = kv_pool.get_index_k_scale_buffer(layer_id)
 
         if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
@@ -551,38 +535,24 @@ class DSANPUIndexerMixin:
                     self._npu_hadamard_128,
                     kv_pool.dtype,
                 )
-                seq_lengths_query = actual_seq_lengths_q.to(torch.int32)
-                seq_lengths_key = actual_seq_lengths_kv.to(k.device).to(torch.int32)
-                if packed_indexer_cache:
-                    topk_indices = quant_lightning_indexer_packed(
-                        query=indexer_query,
-                        key_with_scale=past_key_states,
-                        weights=indexer_weights,
-                        query_dequant_scale=indexer_query_scale,
-                        actual_seq_lengths_query=seq_lengths_query,
-                        actual_seq_lengths_key=seq_lengths_key,
-                        block_table=block_table,
-                        index_head_dim=kv_pool.index_head_dim,
-                        sparse_count=self.index_topk,
-                        split_op=torch_npu.npu_quant_lightning_indexer,
-                    )
-                else:
-                    topk_indices = torch_npu.npu_quant_lightning_indexer(
-                        query=indexer_query,
-                        key=past_key_states,
-                        weights=indexer_weights,
-                        query_dequant_scale=indexer_query_scale,
-                        key_dequant_scale=past_key_states_scale,
-                        actual_seq_lengths_query=seq_lengths_query,
-                        actual_seq_lengths_key=seq_lengths_key,
-                        block_table=block_table,
-                        layout_query="TND",
-                        layout_key="PA_BSND",
-                        sparse_count=self.index_topk,
-                        sparse_mode=3,
-                        query_quant_mode=0,
-                        key_quant_mode=0,
-                    )
+                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                    query=indexer_query,
+                    key=past_key_states,
+                    weights=indexer_weights,
+                    query_dequant_scale=indexer_query_scale,
+                    key_dequant_scale=past_key_states_scale,
+                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
+                        torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                )
             else:
                 topk_indices = torch_npu.npu_lightning_indexer(
                     query=indexer_query,

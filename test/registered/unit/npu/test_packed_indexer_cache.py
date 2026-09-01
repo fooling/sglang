@@ -1,12 +1,17 @@
-"""Packed DSA Indexer cache: FP8 K and its FP32 scale share a page.
+"""Packed DSA Indexer cache as a HiCache transfer format.
 
 The split layout gives the HiCache transfer two components per Indexer layer --
 page_size * index_head_dim bytes of K and page_size * 4 bytes of scale -- which
 is two DMA blocks per (layer, page).  Packing them into one page makes it one
-block.  These tests check that the packed page holds exactly what the two split
-buffers held, that the transfer carries one component instead of two, and that
-every path that cannot read the packed layout fails loudly rather than quietly
-reading the wrong bytes.
+block, at the cost of a layout no Indexer op reads.
+
+This variant does not ask the op to read it.  The split buffers stay and remain
+the only truth; the packed page is transfer scratch that a load lands in and a
+write-back is built from.  The model code is untouched -- writes go where they
+always went.  These tests pin that the transfer carries one component instead of
+two, that a loaded page reaches the split buffers with the bytes the split
+transfer would have delivered, and that a write-back sends what the split
+buffers hold.
 """
 
 import contextlib
@@ -21,11 +26,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-from sglang.srt.layers.attention.dsa.packed_indexer import (
-    native_packed_indexer_op,
-    quant_lightning_indexer_packed,
-    unpack_index_k_with_scale,
-)
 from sglang.srt.mem_cache.pool_host import mla as mla_mod
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -43,6 +43,32 @@ SCALE_BYTES = 4
 
 META_HEADER = 6
 META_STRIDE = 9
+
+
+def unpack_index_k_with_scale(packed, head_dim):
+    """Split one layer's packed cache into contiguous K and scale tensors.
+
+    Written here rather than imported: this variant deliberately has no unpack
+    helper on the call path, so the test needs its own reading of the layout to
+    check the pool's against.
+    """
+    page_num, page_size = packed.shape[0], packed.shape[1]
+    row = head_dim + SCALE_BYTES
+    flat = packed.reshape(page_num, page_size * row)
+    k_bytes = page_size * head_dim
+    key = (
+        flat[:, :k_bytes]
+        .reshape(page_num, page_size, 1, head_dim)
+        .contiguous()
+        .view(torch.float8_e4m3fn)
+    )
+    scale = (
+        flat[:, k_bytes:]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(page_num, page_size, 1)
+    )
+    return key, scale
 
 
 class _Direction(enum.Enum):
@@ -219,8 +245,9 @@ class TestPackedIndexerCache(CustomTestCase):
     def test_packed_page_is_k_then_scale(self):
         pool, _ = _make_pools(packed=True)
         self.assertTrue(pool.packed_indexer_cache)
-        self.assertIsNone(pool.index_k_buffer)
-        self.assertIsNone(pool.index_k_scale_buffer)
+        # Both representations exist: the op still reads the split pair.
+        self.assertIsNotNone(pool.index_k_buffer)
+        self.assertIsNotNone(pool.index_k_scale_buffer)
         self.assertEqual(
             pool.index_k_with_scale_buffer.shape,
             (NUM_INDEXER_LAYERS, DEVICE_PAGES + 1, PAGE_SIZE, 1, HEAD_DIM + SCALE_BYTES),
@@ -230,30 +257,36 @@ class TestPackedIndexerCache(CustomTestCase):
         page_bytes = pool.index_k_with_scale_buffer[0].stride(0)
         self.assertEqual(page_bytes, self.packed_width)
 
-    def test_packed_write_matches_the_split_writes(self):
+    def test_writes_do_not_touch_the_scratch(self):
+        """The model code is unchanged, so a write lands in the split buffers
+        only; the packed page is built when a transfer needs it."""
         loc, key, scale = _sample_writes()
-        split_pool, _ = _make_pools(packed=False)
+        pool, _ = _make_pools(packed=True)
+        before = pool.index_k_with_scale_buffer.clone()
         with _torch_scatter_nd_update():
-            split_pool.set_index_k_buffer(2, loc, key)
-            split_pool.set_index_k_scale_buffer(2, loc, scale)
+            pool.set_index_k_buffer(2, loc, key)
+            pool.set_index_k_scale_buffer(2, loc, scale)
 
-        packed_pool, _ = _make_pools(packed=True)
-        packed_pool.set_index_k_with_scale_buffer(2, loc, key, scale)
-
-        got_key, got_scale = unpack_index_k_with_scale(
-            packed_pool.get_index_k_with_scale_buffer(2), HEAD_DIM
-        )
+        pages, offsets = loc // PAGE_SIZE, loc % PAGE_SIZE
         torch.testing.assert_close(
-            got_key.float(), split_pool.get_index_k_buffer(2).float(), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            got_scale,
-            split_pool.get_index_k_scale_buffer(2).reshape(got_scale.shape),
+            pool.get_index_k_buffer(2)[pages, offsets, 0].float(),
+            key.float(),
             rtol=0,
             atol=0,
         )
-        # And something was actually written.
-        self.assertGreater(float(got_scale.abs().sum()), 0.0)
+        self.assertTrue(torch.equal(pool.index_k_with_scale_buffer, before))
+
+        # pack_index_pages builds it, and then it holds what was written.
+        pool.pack_index_pages(_page_indices(sorted(set(pages.tolist()))))
+        packed_key, packed_scale = unpack_index_k_with_scale(
+            pool.get_index_k_with_scale_buffer(2), HEAD_DIM
+        )
+        torch.testing.assert_close(
+            packed_key[pages, offsets, 0].float(), key.float(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            packed_scale[pages, offsets, 0], scale, rtol=0, atol=0
+        )
 
     def test_transfer_carries_one_component_instead_of_two(self):
         split_pool, split_host = _make_pools(packed=False)
@@ -329,33 +362,121 @@ class TestPackedIndexerCache(CustomTestCase):
                 atol=0,
             )
 
-    def test_disagg_region_count_halves(self):
+    def test_a_load_reaches_the_buffers_the_op_reads(self):
+        """The point of the variant: a packed load is published into the split
+        buffers, so the Indexer op sees the same bytes it would have seen from a
+        split transfer without ever being told about the packed page."""
+        split_pool, split_host = _make_pools(packed=False)
+        packed_pool, packed_host = _make_pools(packed=True)
+        for layer in range(NUM_INDEXER_LAYERS):
+            for page in range(split_host.index_k_buffer.shape[0]):
+                k = torch.arange(PAGE_SIZE * HEAD_DIM, dtype=torch.int64)
+                k = ((k + layer * 7 + page * 13) % 251).to(torch.uint8)
+                s = ((torch.arange(PAGE_SIZE * SCALE_BYTES) + page) % 251).to(
+                    torch.uint8
+                )
+                split_host.index_k_buffer[page, layer].view(torch.uint8).reshape(
+                    -1
+                ).copy_(k)
+                split_host.index_k_scale_buffer[page, layer].view(
+                    torch.uint8
+                ).reshape(-1).copy_(s)
+                packed_host.index_k_with_scale_buffer[page, layer].reshape(-1).copy_(
+                    torch.cat([k, s])
+                )
+
+        before = packed_pool.index_k_buffer.clone()
+        self._run(split_pool, split_host, _Direction.H2D)
+        self._run(packed_pool, packed_host, _Direction.H2D)
+
+        for layer_id in INDEXER_LAYER_IDS:
+            torch.testing.assert_close(
+                packed_pool.get_index_k_buffer(layer_id).view(torch.uint8),
+                split_pool.get_index_k_buffer(layer_id).view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                packed_pool.get_index_k_scale_buffer(layer_id),
+                split_pool.get_index_k_scale_buffer(layer_id),
+                rtol=0,
+                atol=0,
+            )
+        # The unpack really ran; an unpublished load would have left these alone.
+        self.assertFalse(torch.equal(packed_pool.index_k_buffer, before))
+        # And only the loaded pages moved.
+        untouched = [p for p in range(DEVICE_PAGES + 1) if p not in self.device_pages]
+        torch.testing.assert_close(
+            packed_pool.index_k_buffer[:, untouched],
+            before[:, untouched],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_disagg_keeps_the_split_regions(self):
         split_pool, _ = _make_pools(packed=False)
         packed_pool, _ = _make_pools(packed=True)
 
+        # Unchanged on purpose: a page arriving over RDMA is used directly, with
+        # no unpack step to run afterwards, so disagg keeps the split pair.
         self.assertEqual(
-            len(split_pool.get_state_buf_infos()[0]), 2 * NUM_INDEXER_LAYERS
-        )
-        self.assertEqual(len(packed_pool.get_state_buf_infos()[0]), NUM_INDEXER_LAYERS)
-        self.assertEqual(
-            packed_pool.get_state_layer_ids(), list(INDEXER_LAYER_IDS)
+            len(packed_pool.get_state_buf_infos()[0]), 2 * NUM_INDEXER_LAYERS
         )
         self.assertEqual(
-            len(split_pool.get_contiguous_buf_infos()[0])
-            - len(packed_pool.get_contiguous_buf_infos()[0]),
-            NUM_INDEXER_LAYERS,
+            len(packed_pool.get_contiguous_buf_infos()[0]),
+            len(split_pool.get_contiguous_buf_infos()[0]),
         )
         self.assertEqual(
             len(packed_pool.get_kv_layer_ids()),
             len(packed_pool.get_contiguous_buf_infos()[0]),
         )
 
-    def test_split_accessors_refuse_the_packed_cache(self):
-        pool, _ = _make_pools(packed=True)
-        with self.assertRaisesRegex(RuntimeError, "get_index_k_with_scale_buffer"):
-            pool.get_index_k_buffer(2)
-        with self.assertRaisesRegex(RuntimeError, "get_index_k_with_scale_buffer"):
-            pool.get_index_k_scale_buffer(2)
+    def test_packed_scratch_is_charged_to_memory(self):
+        split_pool, _ = _make_pools(packed=False)
+        packed_pool, _ = _make_pools(packed=True)
+        page_num = DEVICE_PAGES + 1
+        scratch = page_num * PAGE_SIZE * NUM_INDEXER_LAYERS * (HEAD_DIM + SCALE_BYTES)
+        self.assertEqual(
+            packed_pool.get_kv_size_bytes() - split_pool.get_kv_size_bytes(), scratch
+        )
+
+    def test_write_back_sends_what_the_split_buffers_hold(self):
+        """D2H packs from the split buffers, so a write-back carries them even
+        though nothing kept the scratch current."""
+        split_pool, split_host = _make_pools(packed=False)
+        packed_pool, packed_host = _make_pools(packed=True)
+        for pool in (split_pool, packed_pool):
+            flat = pool.index_k_buffer.view(torch.uint8).reshape(-1)
+            flat.copy_((torch.arange(flat.numel(), dtype=torch.int64) % 251).to(torch.uint8))
+            flat = pool.index_k_scale_buffer.reshape(-1)
+            flat.copy_(torch.arange(flat.numel(), dtype=torch.float32) * 0.5)
+
+        self._run(split_pool, split_host, _Direction.D2H)
+        self._run(packed_pool, packed_host, _Direction.D2H)
+
+        for page in self.host_pages:
+            for layer in range(NUM_INDEXER_LAYERS):
+                packed_page = packed_host.index_k_with_scale_buffer[page, layer]
+                key, scale = (
+                    split_host.index_k_buffer[page, layer],
+                    split_host.index_k_scale_buffer[page, layer],
+                )
+                k_bytes = PAGE_SIZE * HEAD_DIM
+                torch.testing.assert_close(
+                    packed_page.reshape(-1)[:k_bytes],
+                    key.view(torch.uint8).reshape(-1),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    packed_page.reshape(-1)[k_bytes:].contiguous().view(torch.float32),
+                    scale.reshape(-1),
+                    rtol=0,
+                    atol=0,
+                )
+        self.assertGreater(
+            float(packed_host.index_k_with_scale_buffer.abs().sum()), 0.0
+        )
 
     def test_paths_that_cannot_read_the_packed_page_fail_loudly(self):
         pool, host = _make_pools(packed=True)
@@ -373,48 +494,6 @@ class TestPackedIndexerCache(CustomTestCase):
         ):
             host.load_to_device_per_layer(
                 pool, self.host_indices, self.device_indices, 0, "kernel_ascend"
-            )
-
-    def test_dispatch_prefers_a_registered_packed_op(self):
-        pool, _ = _make_pools(packed=True)
-        loc, key, scale = _sample_writes()
-        pool.set_index_k_with_scale_buffer(2, loc, key, scale)
-        packed = pool.get_index_k_with_scale_buffer(2)
-        sentinel = torch.zeros(1)
-        calls = []
-
-        self.assertIsNone(native_packed_indexer_op())
-        args = dict(
-            query=torch.zeros(1),
-            key_with_scale=packed,
-            weights=torch.zeros(1),
-            query_dequant_scale=torch.zeros(1),
-            actual_seq_lengths_query=torch.zeros(1),
-            actual_seq_lengths_key=torch.zeros(1),
-            block_table=torch.zeros(1),
-            index_head_dim=HEAD_DIM,
-            sparse_count=4,
-        )
-
-        # No native op and no fallback: say so instead of guessing.
-        with self.assertRaisesRegex(RuntimeError, "No packed-cache Indexer op"):
-            quant_lightning_indexer_packed(**args)
-
-        # Fallback unpacks and hands the vendor op the two contiguous tensors.
-        def split_op(**kwargs):
-            calls.append(kwargs)
-            return sentinel
-
-        self.assertIs(quant_lightning_indexer_packed(**args, split_op=split_op), sentinel)
-        self.assertEqual(calls[0]["key"].shape[-1], HEAD_DIM)
-        self.assertTrue(calls[0]["key"].is_contiguous())
-        self.assertTrue(calls[0]["key_dequant_scale"].is_contiguous())
-
-        # A registered native op wins over the fallback.
-        native = SimpleNamespace(**{"npu_quant_lightning_indexer_packed": lambda *a: "native"})
-        with mock.patch.object(torch.ops, "npu", native, create=True):
-            self.assertEqual(
-                quant_lightning_indexer_packed(**args, split_op=split_op), "native"
             )
 
     def _run(self, device_pool, host_pool, direction):

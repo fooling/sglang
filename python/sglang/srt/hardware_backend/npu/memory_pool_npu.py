@@ -674,12 +674,31 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_with_scale_buffer = None
             if self.index_head_dim is not None:
                 if self.packed_indexer_cache:
-                    # One page holds page_size * index_head_dim bytes of FP8 K
-                    # followed by page_size * 4 bytes of FP32 scale -- the layout
-                    # fp8_paged_mqa_logits_torch reads (see
-                    # sglang/srt/layers/attention/dsv4/indexer.py).  The trailing
-                    # dim only sizes the page; the split is at the byte offset
-                    # page_size * index_head_dim, not per token.
+                    # The transfer format.  One page holds page_size *
+                    # index_head_dim bytes of FP8 K followed by page_size * 4
+                    # bytes of FP32 scale -- the layout fp8_paged_mqa_logits_torch
+                    # reads (see sglang/srt/layers/attention/dsv4/indexer.py).
+                    # The trailing dim only sizes the page; the split is at the
+                    # byte offset page_size * index_head_dim, not per token.
+                    #
+                    # It does not replace the split buffers below, and it holds
+                    # no truth of its own: it is scratch that a transfer lands in
+                    # or is filled from.  The Indexer op takes key and
+                    # key_dequant_scale as two contiguous PA_ND tensors, and a
+                    # packed page cannot be one of those without the op reading a
+                    # page pitch it is not documented to read, so the split
+                    # buffers stay and the op keeps seeing exactly what it sees
+                    # today.  H2D lands here and is unpacked into them; D2H is
+                    # packed from them.  That pack/unpack is the price of the
+                    # layout, and being one call per transfer is what makes a
+                    # profile able to name it.
+                    #
+                    # Sized to the whole pool because kv_exchange addresses every
+                    # component with one shared index array, so scratch has to be
+                    # reachable at real page ids.  A smaller ring would need the
+                    # Indexer component split into its own launch with compact
+                    # indices; that is an optimization, not something validating
+                    # the layout needs.
                     self.index_k_with_scale_buffer = torch.zeros(
                         (
                             self.num_indexer_layers,
@@ -691,29 +710,28 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         dtype=torch.uint8,
                         device=self.device,
                     )
-                else:
-                    self.index_k_buffer = torch.zeros(
+                self.index_k_buffer = torch.zeros(
+                    (
+                        self.num_indexer_layers,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.index_head_dim,
+                    ),
+                    dtype=self.k_store_dtype,
+                    device=self.device,
+                )
+                if self.enable_npu_quant_lightning_indexer:
+                    self.index_k_scale_buffer = torch.zeros(
                         (
                             self.num_indexer_layers,
                             self.size // self.page_size + 1,
                             self.page_size,
                             1,
-                            self.index_head_dim,
                         ),
-                        dtype=self.k_store_dtype,
+                        dtype=torch.float32,
                         device=self.device,
                     )
-                    if self.enable_npu_quant_lightning_indexer:
-                        self.index_k_scale_buffer = torch.zeros(
-                            (
-                                self.num_indexer_layers,
-                                self.size // self.page_size + 1,
-                                self.page_size,
-                                1,
-                            ),
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
 
         self._finalize_allocation_log(size)
 
@@ -728,21 +746,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 f"Indexer layers: {self.indexer_layer_ids}"
             ) from exc
 
-    def _indexer_cache_buffers(self) -> list:
-        """Per-layer Indexer cache buffers, in the order transfer paths list them.
+    def _indexer_state_buffers(self) -> list:
+        """Per-layer Indexer buffers as every consumer outside HiCache sees them.
 
-        Packed mode has one buffer per Indexer layer -- a page carries its FP8 K
-        rows and their FP32 scales together.  The split layout has the K buffer
-        for every layer and then, when the quantized Indexer is on, the scale
-        buffer for every layer.
+        Always the split pair, because that is what the Indexer op reads and
+        what the disagg transfer has to deliver: a page arriving over RDMA is
+        used directly, with no unpack step to run afterwards.  Packed mode adds
+        a second representation for HiCache; it does not replace this one.
         """
         if self.index_head_dim is None:
             return []
-        if self.packed_indexer_cache:
-            return [
-                self.index_k_with_scale_buffer[i]
-                for i in range(self.num_indexer_layers)
-            ]
         buffers = [self.index_k_buffer[i] for i in range(self.num_indexer_layers)]
         if self.index_k_scale_buffer is not None:
             buffers += [
@@ -751,11 +764,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return buffers
 
     def _indexer_cache_layer_ids(self) -> list:
-        """Logical layer ids aligned with :meth:`_indexer_cache_buffers`."""
+        """Logical layer ids aligned with :meth:`_indexer_state_buffers`."""
         if self.index_head_dim is None:
             return []
         layer_ids = list(self.indexer_layer_ids)
-        if not self.packed_indexer_cache and self.index_k_scale_buffer is not None:
+        if self.index_k_scale_buffer is not None:
             layer_ids = layer_ids * 2
         return layer_ids
 
@@ -767,8 +780,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(k_cache)
         for v_cache in self.v_buffer:
             kv_size_bytes += get_tensor_size_bytes(v_cache)
-        for indexer_cache in self._indexer_cache_buffers():
+        for indexer_cache in self._indexer_state_buffers():
             kv_size_bytes += get_tensor_size_bytes(indexer_cache)
+        # The packed transfer mirror is a second copy of the same content; its
+        # bytes are the standing memory price of the packed HiCache path.
+        if self.index_k_with_scale_buffer is not None:
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_with_scale_buffer)
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
@@ -781,7 +798,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_state_buf_infos(self):
-        buffers = self._indexer_cache_buffers()
+        buffers = self._indexer_state_buffers()
         if not buffers:
             return [], [], []
         return (
@@ -808,13 +825,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_index_k_buffer(self, layer_id: int):
         indexer_slot = self._get_indexer_slot(layer_id)
-        if self.index_k_buffer is None:
-            raise RuntimeError(
-                "Indexer K rows share a page with their scales in the packed "
-                "cache; use get_index_k_with_scale_buffer(). Slicing the K half "
-                "out would give a non-contiguous page stride, which is the "
-                "reason the packed layout needs its own Indexer op."
-            )
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
@@ -824,11 +834,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_index_k_scale_buffer(self, layer_id: int):
         indexer_slot = self._get_indexer_slot(layer_id)
-        if self.packed_indexer_cache:
-            raise RuntimeError(
-                "Indexer scales share a page with their K rows in the packed "
-                "cache; use get_index_k_with_scale_buffer()."
-            )
         if self.index_k_scale_buffer is None:
             raise RuntimeError(
                 "Indexer scale cache is unavailable because the quantized "
@@ -873,7 +878,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_item_lens += [
                 self.v_buffer[i][0].nbytes for i in range(self.layer_num)
             ]
-        indexer_caches = self._indexer_cache_buffers()
+        indexer_caches = self._indexer_state_buffers()
         kv_data_ptrs += [buf.data_ptr() for buf in indexer_caches]
         kv_data_lens += [buf.nbytes for buf in indexer_caches]
         kv_item_lens += [buf[0].nbytes for buf in indexer_caches]
@@ -1042,41 +1047,70 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         return k_view, scale_view
 
-    def set_index_k_with_scale_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-        index_k_scale: torch.Tensor,
-    ) -> None:
-        """Write FP8 Indexer K and its FP32 scale into one packed page.
+    def _loaded_page_ids(self, device_indices: torch.Tensor) -> torch.Tensor:
+        """Page ids addressed by ``device_indices``, in kv_exchange order.
 
-        The halves are written separately because they sit at different offsets
-        inside the page.  CUDA folds the same two writes into one kernel
-        (``fused_store_index_k_cache``); Ascend wants the same eventually, and
-        until then this pays two scatters for what the transfer path then moves
-        as one block.
+        ``device_indices`` is a flat token-slot list whose length is a multiple
+        of ``page_size``; the kv_exchange kernel reads one page per stride of
+        ``page_size`` and derives the page from its first token.
         """
-        indexer_slot = self._get_indexer_slot(layer_id)
+        first_token = device_indices.reshape(-1, self.page_size)[:, 0]
+        return torch.div(first_token, self.page_size, rounding_mode="floor")
+
+    def unpack_index_pages(self, device_indices: torch.Tensor) -> None:
+        """Publish freshly loaded packed pages into the split Indexer buffers.
+
+        A HiCache load lands in the packed scratch, which no Indexer op reads.
+        This copies the loaded pages' two halves into the buffers the op does
+        read.  One call per load rather than per Indexer call: that is where the
+        cost belongs, and where a profile will find it.
+        """
         if self.index_k_with_scale_buffer is None:
-            raise RuntimeError(
-                "The packed Indexer cache is disabled; set "
-                "SGLANG_NPU_ENABLE_PACKED_INDEXER_CACHE=1 to enable it"
+            return
+        pages = self._loaded_page_ids(device_indices).to(
+            self.index_k_with_scale_buffer.device
+        )
+        for indexer_slot in range(self.num_indexer_layers):
+            k_view, scale_view = self._packed_indexer_page_views(indexer_slot)
+            self.index_k_buffer[indexer_slot][pages] = (
+                k_view[pages]
+                .reshape(-1, self.page_size, 1, self.index_head_dim)
+                .view(self.k_store_dtype)
             )
-        k_view, scale_view = self._packed_indexer_page_views(indexer_slot)
+            if self.index_k_scale_buffer is not None:
+                self.index_k_scale_buffer[indexer_slot][pages] = (
+                    scale_view[pages]
+                    .contiguous()
+                    .view(torch.float32)
+                    .reshape(-1, self.page_size, 1)
+                )
 
-        loc = loc.reshape(-1)
-        pages = torch.div(loc, self.page_size, rounding_mode="floor")
-        offsets = loc - pages * self.page_size
+    def pack_index_pages(self, device_indices: torch.Tensor) -> None:
+        """Fill the packed scratch from the split buffers, ahead of a write-back.
 
-        if index_k.element_size() != 1:
-            index_k = index_k.to(self.dtype)
-        k_view[pages, offsets] = (
-            index_k.reshape(-1, self.index_head_dim).contiguous().view(torch.uint8)
+        The mirror of :meth:`unpack_index_pages`.  Nothing keeps the scratch
+        current between transfers -- it holds no truth -- so a D2H has to build
+        the pages it is about to send.
+        """
+        if self.index_k_with_scale_buffer is None:
+            return
+        pages = self._loaded_page_ids(device_indices).to(
+            self.index_k_with_scale_buffer.device
         )
-        scale_view[pages, offsets] = (
-            index_k_scale.to(torch.float32).reshape(-1, 1).contiguous().view(torch.uint8)
-        )
+        for indexer_slot in range(self.num_indexer_layers):
+            k_view, scale_view = self._packed_indexer_page_views(indexer_slot)
+            k_view[pages] = (
+                self.index_k_buffer[indexer_slot][pages]
+                .reshape(-1, self.page_size, self.index_head_dim)
+                .view(torch.uint8)
+            )
+            if self.index_k_scale_buffer is not None:
+                scale_view[pages] = (
+                    self.index_k_scale_buffer[indexer_slot][pages]
+                    .reshape(-1, self.page_size, 1)
+                    .contiguous()
+                    .view(torch.uint8)
+                )
 
     def set_index_k_scale_buffer(
         self,
