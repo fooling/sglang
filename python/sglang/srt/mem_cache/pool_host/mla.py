@@ -286,7 +286,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 allocator=self.allocator,
             )
             self.index_k_buffer = None
-            if self.device_pool.index_head_dim is not None:
+            self.index_k_scale_buffer = None
+            # Mirror of the packed Indexer cache: FP8 K rows and their FP32
+            # scales share a page, so the two mirrors below collapse into one
+            # and a page moves in a single transfer block per Indexer layer.
+            self.index_k_with_scale_buffer = None
+            device_packed = getattr(
+                self.device_pool, "index_k_with_scale_buffer", None
+            )
+            if device_packed is not None:
+                self.index_k_with_scale_buffer = alloc_func(
+                    (*indexer_dims, device_packed.shape[-1]),
+                    dtype=torch.uint8,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+            elif self.device_pool.index_head_dim is not None:
                 self.index_k_buffer = alloc_func(
                     (*indexer_dims, self.device_pool.index_head_dim),
                     dtype=self.dtype,
@@ -294,18 +310,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
                 )
-            # Host-side mirror of the NPU quantized-Indexer FP32 scale cache
-            # (see NPUMLATokenToKVPool.index_k_scale_buffer). Only present when
-            # the device pool carries one (FP8 DSA + npu_quant_lightning_indexer).
-            self.index_k_scale_buffer = None
-            if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
-                self.index_k_scale_buffer = alloc_func(
-                    (*indexer_dims, 1),
-                    dtype=torch.float32,
-                    device=self.device,
-                    pin_memory=self.pin_memory,
-                    allocator=self.allocator,
-                )
+                # Host-side mirror of the NPU quantized-Indexer FP32 scale cache
+                # (see NPUMLATokenToKVPool.index_k_scale_buffer). Only present
+                # when the device pool carries one (FP8 DSA +
+                # npu_quant_lightning_indexer).
+                if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
+                    self.index_k_scale_buffer = alloc_func(
+                        (*indexer_dims, 1),
+                        dtype=torch.float32,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
             return self.k_buffer
@@ -390,7 +406,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         index_k_layer_start, index_k_layer_num = 0, -1
         indexer_layer_ids = getattr(device_pool, "indexer_layer_ids", None)
-        if indexer_layer_ids and self.index_k_buffer is not None:
+        has_indexer_mirror = (
+            self.index_k_buffer is not None
+            or self.index_k_with_scale_buffer is not None
+        )
+        if indexer_layer_ids and has_indexer_mirror:
             # indexer_layer_ids holds absolute layer ids (PP global space);
             # the owned range above is in the pool-local layer space, so
             # convert before matching.  The ids are sorted, so the covered
@@ -493,6 +513,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if device_pool.v_buffer.numel() > 0 and self.v_buffer.numel() > 0:
             comps.append(comp_meta(device_pool.v_buffer, self.v_buffer, k_lo, k_hi))
 
+        device_packed = getattr(device_pool, "index_k_with_scale_buffer", None)
+        if self.index_k_with_scale_buffer is not None and device_packed is not None:
+            # K and scale share a page, so they are one component: the block is
+            # page_size * (index_head_dim + 4) bytes instead of two blocks of
+            # page_size * index_head_dim and page_size * 4.
+            if index_k_layer_num < 0:
+                ik_lo, ik_hi = 0, self.index_k_with_scale_buffer.shape[1]
+            else:
+                ik_lo, ik_hi = (
+                    index_k_layer_start,
+                    index_k_layer_start + index_k_layer_num,
+                )
+            if ik_hi > ik_lo:
+                comps.append(
+                    comp_meta(device_packed, self.index_k_with_scale_buffer, ik_lo, ik_hi)
+                )
         device_index_k = getattr(device_pool, "index_k_buffer", None)
         if self.index_k_buffer is not None and device_index_k is not None:
             if index_k_layer_num < 0:
@@ -668,6 +704,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # gate compute at group granularity, letting later groups' DMA
                 # overlap the current group's compute — the same pipelining as
                 # the AscendC path above.
+                if self.index_k_with_scale_buffer is not None:
+                    raise RuntimeError(
+                        "The packed Indexer cache needs the AscendC kv_exchange "
+                        "path (SGLANG_HICACHE_IO_ASCENDC); transfer_kv_dim_exchange "
+                        "takes separate index_k and index_k_scale buffers."
+                    )
                 group = self._ascendc_layer_group(device_pool, device_layer_id)
                 if group is not None:
                     layer_start, layer_num, ik_start, ik_num = group
@@ -882,6 +924,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         TransferDirection.D2H,
                     )
                     return
+                if self.index_k_with_scale_buffer is not None:
+                    raise RuntimeError(
+                        "The packed Indexer cache needs the AscendC kv_exchange "
+                        "path (SGLANG_HICACHE_IO_ASCENDC); transfer_kv_dim_exchange "
+                        "takes separate index_k and index_k_scale buffers."
+                    )
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
@@ -971,6 +1019,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
         if self.layout == "page_first_kv_split":
+            if self.index_k_with_scale_buffer is not None:
+                raise NotImplementedError(
+                    "HiCache L3 zero-copy does not describe the packed Indexer "
+                    "page yet: AscendMemcacheStore counts one component key per "
+                    "page for index_k and one for the scale, which the packed "
+                    "layout merges into one."
+                )
             # TODO (iforgetmyname): merge mla kv
             k_buffer_data_ptr = self.k_buffer.data_ptr()
             v_buffer_data_ptr = self.v_buffer.data_ptr()

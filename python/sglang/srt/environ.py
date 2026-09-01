@@ -663,6 +663,14 @@ class Envs:
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
 
     # NPU
+    # Store the DSA Indexer K cache and its FP32 dequant scale in one packed page
+    # -- page_size*index_head_dim bytes of FP8 K followed by page_size*4 bytes of
+    # FP32 scale -- instead of two separate buffers.  This is the layout
+    # `fp8_paged_mqa_logits_torch` already reads, and it makes a HiCache page move
+    # in one DMA block per Indexer layer instead of two.  Needs an Indexer op that
+    # consumes the packed cache; the vendor `npu_quant_lightning_indexer` wants the
+    # split buffers, so this stays off until such an op is available.
+    SGLANG_NPU_ENABLE_PACKED_INDEXER_CACHE = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Split the GLM/DeepSeek shared expert around the routed MoE communication:
