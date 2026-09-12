@@ -2826,8 +2826,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         positions = get_exec().mamba.mamba_prefill_checkpoint_positions
         if not positions:
             return None
+        # The arg validator may run before page_size resolves and then skips
+        # the grid check; re-check here so an unaligned pin is dropped with a
+        # warning instead of silently failing the chunk-aligned track mask.
+        grid = mamba_checkpoint_grid(self.tree_cache.page_size)
+        aligned = [p for p in positions if p % grid == 0]
+        if len(aligned) != len(positions) and not getattr(
+            self, "_warned_unaligned_pinned_checkpoint", False
+        ):
+            self._warned_unaligned_pinned_checkpoint = True
+            logger.warning(
+                "--mamba-prefill-checkpoint-at positions %s are not multiples of "
+                "the mamba checkpoint grid %d and will be ignored.",
+                [p for p in positions if p % grid != 0],
+                grid,
+            )
         lo = len(req.prefix_indices)
-        hit = [p for p in positions if lo < p < extend_end]
+        hit = [p for p in aligned if lo < p < extend_end]
         return max(hit) if hit else None
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
