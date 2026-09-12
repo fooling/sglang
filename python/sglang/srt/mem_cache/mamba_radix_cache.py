@@ -68,6 +68,9 @@ logger = logging.getLogger(__name__)
 # load this can serialize/stall the scheduler. Gate them off by default; set
 # SGLANG_MAMBA_DEBUG_ASSERTS=1 to re-enable for debugging.
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
+# SGLANG_MAMBA_CKPT_DEBUG=1 logs every checkpoint store / hit and dumps the
+# positions of all tree nodes that carry a Mamba state after each request.
+_MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_MAMBA_CKPT_DEBUG", "0") == "1"
 
 
 class TreeNode:
@@ -642,6 +645,15 @@ class MambaRadixCache(BasePrefixCache):
                 )
             )
             mamba_exist = result.mamba_exist
+            if _MAMBA_CKPT_DEBUG:
+                logger.info(
+                    "[mamba-ckpt] store(finished) rid=%s at=%d slot=%s %s",
+                    req.rid,
+                    cache_len,
+                    mamba_value.tolist(),
+                    "already-present" if mamba_exist else "NEW",
+                )
+                self.debug_dump_mamba_checkpoints()
             if mamba_exist and self.int8_ckpt_pool is not None:
                 # state already cached -> the int8 slot we just allocated is a duplicate
                 self.int8_ckpt_pool.free(mamba_value)
@@ -757,6 +769,14 @@ class MambaRadixCache(BasePrefixCache):
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+        if _MAMBA_CKPT_DEBUG:
+            logger.info(
+                "[mamba-ckpt] store(unfinished) rid=%s at=%d slot=%s %s",
+                req.rid,
+                cache_len,
+                mamba_value_donated.tolist(),
+                "already-present" if mamba_exist else "NEW",
+            )
         if mamba_exist:
             self._free_mamba_value(mamba_value_donated)
 
@@ -1039,6 +1059,32 @@ class MambaRadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def debug_dump_mamba_checkpoints(self) -> None:
+        """Log the token depth of every tree node that carries a Mamba state
+        (SGLANG_MAMBA_CKPT_DEBUG=1). Depth = number of tokens from the root to
+        the end of that node, i.e. the prefix length a hit on it would restore."""
+        entries = []
+        stack = [(self.root_node, 0)]
+        while stack:
+            node, depth = stack.pop()
+            for child in node.children.values():
+                d = depth + len(child.key)
+                if child.mamba_value is not None:
+                    entries.append(
+                        (d, child.id, child.mamba_value.tolist(), child.mamba_lock_ref)
+                    )
+                stack.append((child, d))
+        entries.sort()
+        logger.info(
+            "[mamba-ckpt] tree: %d state(s) | %s",
+            len(entries),
+            ", ".join(
+                f"@{d} node={nid} slot={slot} lock={lock}"
+                for d, nid, slot, lock in entries
+            )
+            or "(none)",
+        )
+
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.req_to_token_pool.mamba_allocator.alloc(1)
@@ -1190,6 +1236,23 @@ class MambaRadixCache(BasePrefixCache):
                 req.kv.mamba_pool_idx = dst_index[0]
             req.kv.mamba_cow_src_index = last_node.mamba_value
             req.kv.mamba_needs_clear = False
+
+        if _MAMBA_CKPT_DEBUG:
+            kv_matched = sum(len(v) for v in value)
+            logger.info(
+                "[mamba-ckpt] match rid=%s kv_matched=%d state_matched=%d %s branching=%s node=%s slot=%s",
+                getattr(req, "rid", None),
+                kv_matched,
+                best_value_len,
+                "HIT" if best_value_len > 0 else "MISS",
+                mamba_branching_seqlen,
+                last_node.id,
+                (
+                    last_node.mamba_value.tolist()
+                    if last_node.mamba_value is not None
+                    else None
+                ),
+            )
 
         value = value[:best_value_len]
         if value:
