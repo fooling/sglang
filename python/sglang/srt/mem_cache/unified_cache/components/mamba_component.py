@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -54,6 +56,14 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+logger = logging.getLogger(__name__)
+
+# SGLANG_MAMBA_CKPT_DEBUG=1 logs every checkpoint store / hit and dumps the
+# tree's Mamba states after each finished request. Same switch and line
+# format as mamba_radix_cache.py; this is the component the default
+# UnifiedRadixCache actually routes through.
+_MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_MAMBA_CKPT_DEBUG", "0") == "1"
 
 
 class MambaComponent(TreeComponent):
@@ -180,6 +190,23 @@ class MambaComponent(TreeComponent):
         if self.has_host_value_only(last_node):
             result = result._replace(
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
+            )
+
+        if _MAMBA_CKPT_DEBUG:
+            mamba_value = (
+                last_node.component_data[self.component_type].value
+                if last_node is not None
+                else None
+            )
+            logger.info(
+                "[mamba-ckpt] match rid=%s kv_matched=%d state_matched=%d %s branching=%s node=%s slot=%s",
+                params.req.rid if params.req is not None else None,
+                result.full_kv_hit_length,
+                mamba_boundary_len,
+                "HIT" if mamba_boundary_len > 0 else "MISS",
+                branching_seqlen,
+                last_node.id if last_node is not None else None,
+                mamba_value.tolist() if mamba_value is not None else None,
             )
 
         return result._replace(mamba_branching_seqlen=branching_seqlen)
@@ -612,6 +639,8 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        if _MAMBA_CKPT_DEBUG:
+            self._debug_log_store(req, is_finished, insert_result, insert_params)
         if is_finished:
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist
@@ -648,6 +677,54 @@ class MambaComponent(TreeComponent):
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.kv.mamba_last_track_seqlen = None
+
+    def _debug_log_store(
+        self,
+        req: Req,
+        is_finished: bool,
+        insert_result: Optional[InsertResult],
+        insert_params: Optional[InsertParams],
+    ) -> None:
+        mamba_value = insert_params.mamba_value if insert_params is not None else None
+        if insert_result is None or mamba_value is None:
+            status = "skipped"
+        elif insert_result.mamba_exist:
+            status = "already-present"
+        else:
+            status = "NEW"
+        logger.info(
+            "[mamba-ckpt] store(%s) rid=%s at=%s slot=%s %s",
+            "finished" if is_finished else "unfinished",
+            req.rid,
+            req.kv.mamba_last_track_seqlen,
+            mamba_value.tolist() if mamba_value is not None else None,
+            status,
+        )
+        if is_finished:
+            self.debug_dump_mamba_checkpoints()
+
+    def debug_dump_mamba_checkpoints(self) -> None:
+        """Log every node holding a Mamba state, sorted by depth in tokens
+        (SGLANG_MAMBA_CKPT_DEBUG=1)."""
+        ct = self.component_type
+        entries = []
+        stack = [(self.cache.tree_core.root_node, 0)]
+        while stack:
+            node, depth = stack.pop()
+            depth += len(node.key)
+            data = node.component_data[ct]
+            if data.value is not None:
+                entries.append((depth, node.id, data.value.tolist(), data.lock_ref))
+            stack.extend((child, depth) for child in node.children.values())
+        entries.sort()
+        logger.info(
+            "[mamba-ckpt] tree: %d state(s) | %s",
+            len(entries),
+            ", ".join(
+                f"@{depth} node={node_id} slot={slot} lock={lock}"
+                for depth, node_id, slot, lock in entries
+            ),
+        )
 
     def build_external_linker_transfer(
         self,
