@@ -403,8 +403,11 @@ class MambaComponent(TreeComponent):
             )
             if evict_depths:
                 survivors = []
+                decayed = []
+                max_band_step = decay_floor // decay_base if decay_floor > 0 else None
                 for node in holders:
-                    if depths[node.id] in evict_depths and not _protected(node):
+                    node_depth = depths[node.id]
+                    if node_depth in evict_depths and not _protected(node):
                         self.tree_core._evict_component_and_detach_lru(
                             node,
                             self,
@@ -416,8 +419,21 @@ class MambaComponent(TreeComponent):
                         self.tree_core._cascade_evict(
                             node, self, tracker, device_frees, host_frees
                         )
+                        if _MAMBA_CKPT_DEBUG:
+                            age = tail_depth - node_depth
+                            step = 1 << ((age // decay_base).bit_length() - 1)
+                            if max_band_step is not None:
+                                step = min(step, max_band_step)
+                            decayed.append((node_depth, age, step))
                     else:
                         survivors.append(node)
+                if _MAMBA_CKPT_DEBUG and decayed:
+                    logger.info(
+                        "[mamba-ckpt] decay tail=%d evicted=%s kept=%s",
+                        tail_depth,
+                        decayed,
+                        [depths[n.id] for n in survivors],
+                    )
 
         if cap < 0:
             return

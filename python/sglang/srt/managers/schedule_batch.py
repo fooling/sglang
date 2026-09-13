@@ -55,6 +55,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import os
 import re
 import sys
 from array import array
@@ -160,6 +161,11 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
+
+# SGLANG_MAMBA_CKPT_DEBUG=1 prints where Mamba prefix checkpoints are planned
+# (see also mamba_component.py, which logs the store/match/tree side and the
+# per-path decay/cap eviction).
+_MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_MAMBA_CKPT_DEBUG", "0") == "1"
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -2752,6 +2758,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv.mamba_next_track_idx
         ].item()
         mamba_track_seqlen = -1
+        mamba_track_seqlen_aligned = None
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
             # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
@@ -2807,6 +2814,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+
+        if _MAMBA_CKPT_DEBUG:
+            if not mask:
+                source = "none (extend shorter than checkpoint_grid)"
+            elif (
+                req.mamba_branching_seqlen is not None
+                and mamba_track_seqlen_aligned == req.mamba_branching_seqlen
+            ):
+                source = "branching"
+            else:
+                source = "extend_end"
+            logger.info(
+                "[mamba-ckpt] plan rid=%s prefix_len=%d extend_len=%d -> "
+                "track_at=%s source=%s (branching=%s force_h=%s slot=%s)",
+                req.rid,
+                len(req.prefix_indices),
+                req.extend_range.length,
+                mamba_track_seqlen_aligned,
+                source,
+                req.mamba_branching_seqlen,
+                bool(mask and mamba_track_seqlen != mamba_track_seqlen_aligned),
+                track_index,
+            )
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
