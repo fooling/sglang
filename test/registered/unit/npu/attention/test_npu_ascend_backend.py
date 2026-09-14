@@ -841,5 +841,78 @@ class TestDcpDecodeHeadPadding(unittest.TestCase):
             self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
 
 
+class TestDcpDraftLayout(unittest.TestCase):
+    """Under DCP the replicated draft pool (page size P * c, virtual locs) is
+    attended as dcp=1 with the physical page size P."""
+
+    def test_draft_worker_is_dcp1(self):
+        self.assertEqual(AscendAttnBackend._dcp_layout(True, 8, 3), (1, 0))
+        self.assertEqual(AscendAttnBackend._dcp_layout(False, 8, 3), (8, 3))
+        self.assertEqual(AscendAttnBackend._dcp_layout(True, 1, 0), (1, 0))
+        self.assertEqual(AscendAttnBackend._dcp_layout(False, 1, 0), (1, 0))
+        # NZ is only rejected for a DCP draft.
+        self.assertEqual(
+            AscendAttnBackend._dcp_layout(False, 8, 3, kv_is_nz=True), (8, 3)
+        )
+        with self.assertRaises(NotImplementedError):
+            AscendAttnBackend._dcp_layout(True, 8, 3, kv_is_nz=True)
+
+    def test_p_page_view_reads_virtual_locs(self):
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        P, c, H, D = 4, 3, 2, 5
+        stride = P * c
+        seq_lens = [1, 13, 30, 12]
+        num_pages = sum((n + stride - 1) // stride for n in seq_lens) + 2
+        allocator = PagedTokenToKVPoolAllocator(
+            size=num_pages * stride,
+            page_size=stride,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=object(),
+            need_sort=False,
+        )
+        g = torch.Generator().manual_seed(0)
+        allocator.free_pages = allocator.free_pages[
+            torch.randperm(len(allocator.free_pages), generator=g)
+        ]
+        max_len = (max(seq_lens) + stride - 1) // stride * stride
+        req_to_token = torch.zeros(len(seq_lens), max_len, dtype=torch.int64)
+        # NPUMHATokenToKVPool buffer built with pool_page_size = P * c.
+        k_buffer = torch.zeros(num_pages * stride // stride + 1, stride, H, D)
+        values = []
+        for i, n in enumerate(seq_lens):
+            need = (n + stride - 1) // stride * stride
+            req_to_token[i, :need] = allocator.alloc(need)
+            vals = torch.randn(n, H, D, generator=g)
+            k_buffer.view(-1, H, D)[req_to_token[i, :n]] = vals
+            values.append(vals)
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.page_size = P
+        backend.dcp_size = 1
+        # Plain dcp=1 metadata / K/V view of the draft backend.
+        block_tables = req_to_token[:, ::P] // P
+        k_cache = k_buffer.view(-1, backend.page_size, H * D)
+        for i, n in enumerate(seq_lens):
+            pages = block_tables[i, : (n + P - 1) // P]
+            rows = k_cache[pages].reshape(-1, H, D)[:n]
+            self.assertTrue(torch.equal(rows, values[i]), i)
+
+    def test_graph_block_tables_use_physical_page_size(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.dcp_size = 1
+        backend.page_size = 4
+        backend.max_context_len = 64
+        backend.speculative_num_draft_tokens = 8
+        backend.device = "cpu"
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.init_cuda_graph_state(max_bs=3, max_num_tokens=24)
+        self.assertEqual(
+            backend.graph_metadata["block_tables"].shape, (3, (64 + 3 + 8) // 4)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

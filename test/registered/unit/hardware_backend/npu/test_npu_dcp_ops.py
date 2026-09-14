@@ -30,13 +30,16 @@ from sglang.srt.hardware_backend.npu.dcp.ops import (
     dcp_merge_a2a_npu,
     dcp_merge_a2a_vllm,
     dcp_merge_ag_rs,
+    dcp_merge_with_lse,
     dcp_physical_write_loc,
     dcp_prefix_chunk_plan,
+    dcp_verify_history_local_lens,
     lse_combine,
     mla_decode_with_lse_torch,
     npu_attention_update,
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -175,6 +178,29 @@ class TestLocalSeqLens(CustomTestCase):
                 ref = [sum(1 for p in range(n) if p % c == r) for n in lens]
                 self.assertEqual(as_list, ref)
                 self.assertEqual(as_tensor, ref)
+
+
+class TestVerifyHistoryLocalLens(CustomTestCase):
+    def test_list_and_tensor(self):
+        seq_lens = [0, 1, 7, 8, 9, 10, 17, 100, 3]
+        for c, w in [(2, 8), (3, 4), (8, 8), (4, 1)]:
+            for r in range(c):
+                got = dcp_verify_history_local_lens(seq_lens, w, c, r)
+                t = dcp_verify_history_local_lens(torch.tensor(seq_lens), w, c, r)
+                self.assertEqual(t.tolist(), got)
+                expect = [
+                    sum(1 for p in range(max(n - w, 0)) if p % c == r)
+                    for n in seq_lens
+                ]
+                self.assertEqual(got, expect, (c, w, r))
+            # Every history token is counted on exactly one rank.
+            totals = [
+                sum(col)
+                for col in zip(
+                    *[dcp_verify_history_local_lens(seq_lens, w, c, r) for r in range(c)]
+                )
+            ]
+            self.assertEqual(totals, [max(n - w, 0) for n in seq_lens])
 
 
 class TestLayout(CustomTestCase):
@@ -410,6 +436,126 @@ class TestChunkedPrefixExactness(CustomTestCase):
                     self.assertLess(err, 1e-5, (seed, i, r))
 
 
+def _mla_attn_with_lse(q_nope, q_rope, kv, kr, scale, causal):
+    """q_* [T, H, d], kv [S, Dc], kr [S, Dr] -> (lse [T, H], out [T, H, Dc]).
+
+    causal: query i sees keys [: S - T + i + 1] (bottom-right aligned)."""
+    t, s = q_nope.shape[0], kv.shape[0]
+    scores = (
+        torch.einsum("thd,sd->ths", q_nope, kv) + torch.einsum("thd,sd->ths", q_rope, kr)
+    ) * scale
+    if causal:
+        allowed = torch.arange(s)[None, :] <= torch.arange(t)[:, None] + (s - t)
+        scores = scores.masked_fill(~allowed[:, None, :], -math.inf)
+    return torch.logsumexp(scores, dim=-1), torch.softmax(scores, dim=-1) @ kv
+
+
+class TestVerifySplitExactness(CustomTestCase):
+    """DSPARK target verify under DCP: per rank, history (all heads x local KV
+    shard before the window, no mask) merged across ranks with its LSE, then
+    current (own heads x the window's own K/V, causal) merged locally ==
+    single-rank causal attention over prefix + window."""
+
+    D_C, D_R, H = 12, 4, 2  # H heads per rank
+
+    def _run(self, c, page_size, prefix_lens, w, merge_impl, fia_sentinel, seed):
+        g = torch.Generator().manual_seed(seed)
+        bsz = len(prefix_lens)
+        heads = self.H * c
+        scale = 1.0 / math.sqrt(self.D_C + self.D_R)
+        seq_lens = [n + w for n in prefix_lens]  # includes the verify window
+        kv = [torch.randn(n, self.D_C, generator=g) for n in seq_lens]
+        kr = [torch.randn(n, self.D_R, generator=g) for n in seq_lens]
+        q_nope = torch.randn(bsz * w, heads, self.D_C, generator=g)
+        q_rope = torch.randn(bsz * w, heads, self.D_R, generator=g)
+        req_to_token, num_pages = _build_layout(seq_lens, page_size, c, seed)
+        block_table = dcp_block_tables(req_to_token, max(seq_lens), page_size, c)
+        saw_empty = [False]
+
+        def rank_fn(r, group):
+            # Owner-filtered write of prefix AND window tokens (the verify KV is
+            # written before attention).
+            c_kv = torch.zeros(num_pages * page_size, 1, self.D_C)
+            k_rope = torch.zeros(num_pages * page_size, 1, self.D_R)
+            for i, n in enumerate(seq_lens):
+                loc = dcp_physical_write_loc(req_to_token[i, :n].long(), c, r)
+                mine = req_to_token[i, :n].long() % c == r
+                c_kv[loc[mine], 0] = kv[i][mine]
+                k_rope[loc[mine], 0] = kr[i][mine]
+            hist_lens = dcp_verify_history_local_lens(seq_lens, w, c, r)
+            saw_empty[0] |= any(
+                n == 0 and p > 0 for n, p in zip(hist_lens, prefix_lens)
+            )
+            # History: every query token of request i reads request i's shard.
+            hist_out, hist_lse = mla_decode_with_lse_torch(
+                q_nope,
+                q_rope,
+                c_kv.view(num_pages, page_size, 1, self.D_C),
+                k_rope.view(num_pages, page_size, 1, self.D_R),
+                block_table.repeat_interleave(w, dim=0),
+                [n for n in hist_lens for _ in range(w)],
+                scale,
+            )
+            if fia_sentinel:
+                empty = torch.isneginf(hist_lse)
+                hist_lse = torch.where(empty, torch.full_like(hist_lse, math.inf), hist_lse)
+                hist_out = torch.where(
+                    empty[..., None], torch.full_like(hist_out, float("nan")), hist_out
+                )
+            hist_out, hist_lse = dcp_merge_with_lse(
+                hist_out, hist_lse, group, "a2a" if merge_impl != "ag_rs" else "ag_rs",
+                merge_impl,
+            )
+            # Current: this rank's heads x the window's own K/V, causal.
+            sl = slice(r * self.H, (r + 1) * self.H)
+            outs = []
+            for i in range(bsz):
+                tok = slice(i * w, (i + 1) * w)
+                cur_lse, cur_out = _mla_attn_with_lse(
+                    q_nope[tok, sl], q_rope[tok, sl], kv[i][-w:], kr[i][-w:], scale, True
+                )
+                merged = npu_attention_update(
+                    [hist_lse[tok].reshape(-1), cur_lse.reshape(-1)],
+                    [
+                        hist_out[tok].reshape(-1, self.D_C),
+                        cur_out.reshape(-1, self.D_C),
+                    ],
+                )
+                outs.append(merged.view(w, self.H, self.D_C))
+            return torch.cat(outs)
+
+        with patch.object(dcp_ops, "_attention_update_op", attention_update_reference):
+            per_rank = _run_ranks(c, rank_fn)
+        for i in range(bsz):
+            tok = slice(i * w, (i + 1) * w)
+            _, ref = _mla_attn_with_lse(
+                q_nope[tok], q_rope[tok], kv[i], kr[i], scale, True
+            )
+            for r in range(c):
+                got = per_rank[r][tok]
+                exp = ref[:, r * self.H : (r + 1) * self.H]
+                self.assertLess((got - exp).abs().max().item(), 1e-5, (seed, i, r))
+        return saw_empty[0]
+
+    def test_exact(self):
+        cases = [
+            # (c, page_size, prefix_lens, w)
+            (2, 4, [0, 1, 9, 30], 3),
+            (4, 2, [2, 0, 17, 5], 8),
+            (3, 1, [1, 40], 4),
+            (2, 8, [100], 1),
+        ]
+        for seed, (c, page_size, prefix_lens, w) in enumerate(cases):
+            for merge_impl in ("npu", "vllm", "torch", "ag_rs"):
+                saw_empty = self._run(
+                    c, page_size, prefix_lens, w, merge_impl, False, seed
+                )
+                if min(p for p in prefix_lens if p > 0) < c:
+                    self.assertTrue(saw_empty)
+            # FIA's +inf / NaN sentinel for an empty shard.
+            self._run(c, page_size, prefix_lens, w, "npu", True, seed)
+
+
 class TestExactness(CustomTestCase):
     """Single-rank full softmax attention == c local shards + lse_combine."""
 
@@ -589,6 +735,119 @@ class TestMerge(CustomTestCase):
         self.assertTrue(torch.all(torch.isfinite(got)))
         self.assertTrue(torch.all(got[3] == 0))
         self.assertLess((got - expect).abs().max().item(), 1e-5)
+
+    def test_attention_update_return_lse(self):
+        g = torch.Generator().manual_seed(8)
+        n, t, d = 3, 9, 4
+        outs = torch.randn(n, t, d, generator=g)
+        lses = torch.randn(n, t, generator=g) * 2
+        lses[0, 0] = math.inf  # empty local KV (FIA sentinel)
+        outs[0, 0] = float("nan")
+        lses[1, 1] = -math.inf
+        lses[2, 2] = float("nan")
+        lses[:, 3] = math.inf  # no valid shard
+        outs[:, 3] = float("nan")
+        with patch.object(dcp_ops, "_attention_update_op", attention_update_reference):
+            out_only = npu_attention_update(list(lses), list(outs))
+            got, got_lse = npu_attention_update(list(lses), list(outs), return_lse=True)
+        self.assertTrue(torch.equal(got, out_only))
+        self.assertEqual(got_lse.shape, (t,))
+        self.assertEqual(got_lse.dtype, torch.float32)
+        valid = torch.isfinite(lses)
+        expect_lse = torch.logsumexp(
+            torch.where(valid, lses, torch.full_like(lses, -math.inf)), dim=0
+        )
+        self.assertTrue(torch.isneginf(got_lse[3]))
+        keep = torch.arange(t) != 3
+        self.assertLess((got_lse[keep] - expect_lse[keep]).abs().max().item(), 1e-5)
+        # Merging the merged result again is associative.
+        with patch.object(dcp_ops, "_attention_update_op", attention_update_reference):
+            a_out, a_lse = npu_attention_update(
+                list(lses[:2]), list(outs[:2]), return_lse=True
+            )
+            two = npu_attention_update([a_lse, lses[2]], [a_out, outs[2]])
+        self.assertLess((two - got).abs().max().item(), 1e-5)
+
+    def test_merges_return_lse(self):
+        n, bsz, h, d = 4, 3, 2, 16
+        merges = dict(
+            npu=dcp_merge_a2a_npu,
+            vllm=dcp_merge_a2a_vllm,
+            torch=dcp_merge_a2a,
+            ag_rs=dcp_merge_ag_rs,
+        )
+        outs, lses = self._inputs(n, bsz, h, d, torch.float32, seed=4)
+        lses[2][1] = math.inf
+        outs[2][1] = float("nan")
+        # Every rank empty for (request 2, head 0).
+        for r in range(n):
+            lses[r][2, 0] = math.inf
+        stacked = torch.stack(lses)
+        valid = torch.isfinite(stacked)
+        ref_lse = torch.logsumexp(
+            torch.where(valid, stacked, torch.full_like(stacked, -math.inf)), dim=0
+        )
+        with patch.object(dcp_ops, "_attention_update_op", attention_update_reference):
+            for name, merge in merges.items():
+                plain = _run_ranks(n, lambda r, grp: merge(outs[r], lses[r], grp))
+                with_lse = _run_ranks(
+                    n,
+                    lambda r, grp: merge(outs[r], lses[r], grp, return_lse=True),
+                )
+                if name != "ag_rs":
+                    for r in range(n):
+                        self.assertTrue(torch.equal(with_lse[r][0], plain[r]), name)
+                for r in range(n):
+                    got_out, got_lse = with_lse[r]
+                    self.assertEqual(got_lse.shape, (bsz, h), name)
+                    exp = ref_lse[:, r * h : (r + 1) * h]
+                    finite = torch.isfinite(exp)
+                    self.assertTrue(
+                        torch.equal(torch.isneginf(got_lse), ~finite), name
+                    )
+                    diff = (got_lse[finite] - exp[finite]).abs().max().item()
+                    self.assertLess(diff, 1e-4, name)
+                    if name != "ag_rs":
+                        self.assertTrue(torch.all(torch.isfinite(got_out)), name)
+                # base 2 input -> natural-log output
+                lses2 = [l / math.log(2.0) for l in lses]
+                b2 = _run_ranks(
+                    n,
+                    lambda r, grp: merge(
+                        outs[r], lses2[r], grp, base_e=False, return_lse=True
+                    ),
+                )
+                for r in range(n):
+                    exp = with_lse[r][1]
+                    finite = torch.isfinite(exp)
+                    diff = (b2[r][1][finite] - exp[finite]).abs().max().item()
+                    self.assertLess(diff, 1e-4, name)
+
+    def test_merge_with_lse_selects_path(self):
+        calls = []
+
+        def fake(name):
+            def f(out, lse, group, base_e=True, return_lse=False):
+                calls.append((name, return_lse))
+                return out, lse
+
+            return f
+
+        out, lse = torch.zeros(1, 2, 3), torch.zeros(1, 2)
+        with patch.object(dcp_ops, "dcp_merge_a2a_npu", fake("npu")), patch.object(
+            dcp_ops, "dcp_merge_a2a_vllm", fake("vllm")
+        ), patch.object(dcp_ops, "dcp_merge_a2a", fake("torch")), patch.object(
+            dcp_ops, "dcp_merge_ag_rs", fake("ag_rs")
+        ):
+            for impl in ("npu", "vllm", "torch"):
+                dcp_ops.dcp_merge_with_lse(out, lse, None, "a2a", impl)
+            dcp_ops.dcp_merge_with_lse(out, lse, None, "ag_rs", "npu")
+            with self.assertRaises(ValueError):
+                dcp_ops.dcp_merge_with_lse(out, lse, None, "a2a", "bogus")
+        self.assertEqual(
+            calls,
+            [("npu", True), ("vllm", True), ("torch", True), ("ag_rs", True)],
+        )
 
     def test_a2a_vllm_matches_combine(self):
         n, bsz, h, d = 4, 3, 2, 16
@@ -820,6 +1079,12 @@ class TestDcpTargetBackendInit(CustomTestCase):
         # DCP off: no allocator requirement.
         _, plain, _ = _real_ascend_backend(dcp_size=1, allocator_page_size=None)
         self.assertEqual(plain.dcp_size, 1)
+        # The replicated DSPARK draft attends with the dcp=1 layout (physical
+        # page P over the virtual locs), so it is not held to P * dcp.
+        _, draft, _ = _real_ascend_backend(
+            dcp_size=4, allocator_page_size=None, is_draft_worker=True
+        )
+        self.assertEqual((draft.dcp_size, draft.dcp_rank), (1, 0))
 
     def test_eager_decode_block_table_width_from_host_lens(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -1047,6 +1312,228 @@ class TestAscendBackendChunkedPrefix(CustomTestCase):
             self.assertLess((per_rank[r] - ref).abs().max().item(), 1e-5)
 
 
+def _fake_fia_v1_tnd_paged(
+    query, key, value, *, query_rope, key_rope, workspace, out, **kw
+):
+    """FIA v1 .out stand-in for the DCP verify history call: TND query, paged
+    [blocks, 1, P, D] MLA cache, no mask; FIA's +inf LSE / NaN out when a
+    request has no local KV."""
+    assert kw["input_layout"] == "TND" and kw["softmax_lse_flag"]
+    assert kw["sparse_mode"] == 0 and kw["atten_mask"] is None
+    assert kw["num_heads"] == query.shape[1] and workspace == "ws"
+    page_size = kw["block_size"]
+    q_ends = kw["actual_seq_lengths"]
+    kv_lens = kw["actual_seq_lengths_kv"]
+    block_table = kw["block_table"]
+    assert len(q_ends) == len(kv_lens) == block_table.shape[0]
+    out_t, lse_t = out
+    start = 0
+    for i, end in enumerate(q_ends):
+        n = int(kv_lens[i])
+        if n == 0:
+            out_t[start:end] = float("nan")
+            lse_t[start:end] = math.inf
+        else:
+            pages = block_table[i, : (n + page_size - 1) // page_size].long()
+            kv = key[pages].reshape(-1, key.shape[-1])[:n].float()
+            kr = key_rope[pages].reshape(-1, key_rope.shape[-1])[:n].float()
+            lse, o = _mla_attn_with_lse(
+                query[start:end].float(),
+                query_rope[start:end].float(),
+                kv,
+                kr,
+                kw["scale"],
+                False,
+            )
+            out_t[start:end] = o
+            lse_t[start:end] = lse[..., None]
+        start = end
+
+
+def _fake_fias_v2_bnsd(query, key, value, *, query_rope, key_rope, **kw):
+    """FIAS v2 stand-in for the DCP verify current call: BNSD, non-paged K/V
+    of the window, causal; returns (out [B, N, w, D], lse [B, N, w, 1])."""
+    assert kw["input_layout"] == "BNSD" and kw["return_softmax_lse"]
+    assert kw["sparse_mode"] == 3 and kw["atten_mask"] is not None
+    assert "block_table" not in kw
+    b, n, w, d = query.shape
+    assert kw["num_query_heads"] == n
+    assert kw["actual_seq_qlen"] == kw["actual_seq_kvlen"] == [w] * b
+    outs, lses = [], []
+    for i in range(b):
+        lse, o = _mla_attn_with_lse(
+            query[i].transpose(0, 1),
+            query_rope[i].transpose(0, 1),
+            key[i, 0],
+            key_rope[i, 0],
+            kw["softmax_scale"],
+            True,
+        )
+        outs.append(o.transpose(0, 1))
+        lses.append(lse.transpose(0, 1)[..., None])
+    return torch.stack(outs), torch.stack(lses)
+
+
+class TestAscendBackendVerifySplit(CustomTestCase):
+    """AscendAttnBackend.forward_mtp -> _forward_verify_mla_dcp on c simulated
+    ranks (fake FIA v1 / FIAS v2, reference npu_attention_update) == full
+    causal attention over prefix + window, eager (with padding tokens) and
+    graph mode."""
+
+    H, D_C, D_R, PAGE, W = 3, 6, 3, 2, 3
+
+    def _run(self, c, prefix_lens, graph_mode, comm_backend, merge_impl, pad_heads):
+        backend_mod = _import_ascend_backend()
+        g = torch.Generator().manual_seed(11)
+        w, page_size, heads = self.W, self.PAGE, self.H * c
+        bsz = len(prefix_lens)
+        seq_lens = [n + w for n in prefix_lens]
+        kv = [torch.randn(n, self.D_C, generator=g) for n in seq_lens]
+        kr = [torch.randn(n, self.D_R, generator=g) for n in seq_lens]
+        num_pad = 0 if graph_mode else 2
+        total = bsz * w
+        q = torch.randn(total + num_pad, heads, self.D_C, generator=g)
+        q_rope = torch.randn(total + num_pad, heads, self.D_R, generator=g)
+        k = torch.cat([x[-w:] for x in kv] + [torch.zeros(num_pad, self.D_C)])
+        k_rope = torch.cat([x[-w:] for x in kr] + [torch.zeros(num_pad, self.D_R)])
+        scale = 1.0 / math.sqrt(self.D_C + self.D_R)
+        req_to_token, num_pages = _build_layout(seq_lens, page_size, c, seed=11)
+        out_cache_loc = torch.cat(
+            [req_to_token[i, p : p + w] for i, p in enumerate(prefix_lens)]
+            + [torch.zeros(num_pad, dtype=torch.int32)]
+        ).long()
+        block_tables = dcp_block_tables(req_to_token, max(seq_lens), page_size, c)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            tp_k_head_num=1,
+            v_head_dim=self.D_C,
+            scaling=scale,
+        )
+        local = threading.local()
+
+        def rank_fn(r, group):
+            local.group = group
+            c_kv = torch.zeros(num_pages * page_size, 1, self.D_C)
+            c_rope = torch.zeros(num_pages * page_size, 1, self.D_R)
+            # Prefix tokens were cached earlier (owner-filtered).
+            for i, p in enumerate(prefix_lens):
+                v = req_to_token[i, :p].long()
+                mine = v % c == r
+                c_kv[(v // c)[mine], 0] = kv[i][:p][mine]
+                c_rope[(v // c)[mine], 0] = kr[i][:p][mine]
+
+            def set_kv_buffer(_layer, loc, cache_k, cache_v):
+                phys = dcp_physical_write_loc(loc, c, r)
+                mine = (loc >= 0) & (loc % c == r)
+                c_kv[phys[mine]] = cache_k[mine]
+                c_rope[phys[mine]] = cache_v[mine]
+
+            backend = object.__new__(backend_mod.AscendAttnBackend)
+            backend.use_mla = True
+            backend.dcp_size, backend.dcp_rank = c, r
+            backend.tp_q_head_num = self.H
+            backend.dcp_pad_heads = pad_heads
+            backend.kv_lora_rank, backend.qk_rope_head_dim = self.D_C, self.D_R
+            backend.page_size = page_size
+            backend.speculative_num_draft_tokens = w
+            backend.graph_mode = graph_mode
+            backend.mtp_mask = torch.ones(1, dtype=torch.bool)
+            hist = dcp_verify_history_local_lens(seq_lens, w, c, r)
+            if graph_mode:
+                # Captured bs = 5 (one padding request), lists rebound at replay.
+                backend.forward_metadata = SimpleNamespace(
+                    dcp_local_seq_lens_cpu_int=None,
+                    dcp_local_seq_lens_cpu_list=hist,
+                    block_tables=block_tables,
+                )
+            else:
+                backend.forward_metadata = SimpleNamespace(
+                    dcp_local_seq_lens_cpu_int=torch.tensor(hist + [0]),
+                    dcp_local_seq_lens_cpu_list=None,
+                    block_tables=torch.cat(
+                        [block_tables, torch.zeros_like(block_tables[:1])]
+                    ),
+                )
+            backend.token_to_kv_pool = SimpleNamespace(
+                set_kv_buffer=set_kv_buffer,
+                get_kv_buffer=lambda _: (c_kv, c_rope),
+            )
+            forward_batch = SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_target_verify=lambda: True, is_draft_extend_v2=lambda: False
+                ),
+                out_cache_loc=out_cache_loc,
+                num_token_non_padded_cpu=None if graph_mode else total,
+            )
+            return backend.forward_mtp(
+                q.reshape(q.shape[0], -1),
+                k,
+                None,
+                layer,
+                forward_batch,
+                True,
+                q_rope=q_rope.reshape(q.shape[0], -1),
+                k_rope=k_rope,
+            )
+
+        fake_npu = MagicMock()
+        fake_npu._npu_fused_infer_attention_score_get_max_workspace.return_value = "ws"
+        fake_npu.npu_fused_infer_attention_score.out.side_effect = (
+            _fake_fia_v1_tnd_paged
+        )
+        fake_npu.npu_fused_infer_attention_score_v2.side_effect = _fake_fias_v2_bnsd
+        with patch.object(
+            dcp_ops, "_attention_update_op", attention_update_reference
+        ), patch.object(backend_mod, "is_fia_nz", return_value=False), patch.object(
+            backend_mod, "torch_npu", fake_npu
+        ), patch.object(
+            backend_mod,
+            "get_parallel",
+            side_effect=lambda: SimpleNamespace(
+                dcp_group=local.group, dcp_comm_backend=comm_backend
+            ),
+        ), envs.SGLANG_NPU_DCP_MERGE_IMPL.override(merge_impl):
+            per_rank = _run_ranks(c, rank_fn)
+
+        hist_heads = {
+            call.kwargs["num_heads"]
+            for call in fake_npu.npu_fused_infer_attention_score.out.call_args_list
+        }
+        cur_heads = {
+            call.kwargs["num_query_heads"]
+            for call in fake_npu.npu_fused_infer_attention_score_v2.call_args_list
+        }
+        if pad_heads:
+            self.assertEqual(hist_heads, {1 << (heads - 1).bit_length()})
+            self.assertEqual(cur_heads, {4})
+        else:
+            self.assertEqual(hist_heads, {heads})
+            self.assertEqual(cur_heads, {self.H})
+        for r in range(c):
+            got = per_rank[r]
+            self.assertEqual(got.shape, (total + num_pad, self.H * self.D_C))
+            if num_pad:
+                self.assertTrue(torch.all(got[total:] == 0))
+            got = got[:total].view(bsz, w, self.H, self.D_C)
+            for i in range(bsz):
+                tok = slice(i * w, (i + 1) * w)
+                _, ref = _mla_attn_with_lse(
+                    q[tok], q_rope[tok], kv[i], kr[i], scale, True
+                )
+                exp = ref[:, r * self.H : (r + 1) * self.H]
+                err = (got[i] - exp).abs().max().item()
+                self.assertLess(err, 1e-5, (graph_mode, merge_impl, i, r))
+
+    def test_eager(self):
+        for merge_impl, comm in (("npu", "a2a"), ("vllm", "a2a"), ("torch", "ag_rs")):
+            self._run(2, [0, 1, 7, 12], False, comm, merge_impl, pad_heads=True)
+        self._run(3, [2, 0, 9], False, "a2a", "npu", pad_heads=False)
+
+    def test_graph_mode(self):
+        self._run(2, [0, 1, 7, 12], True, "a2a", "npu", pad_heads=True)
+
+
 class TestEnvDefaults(CustomTestCase):
     def test_defaults(self):
         self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "npu")
@@ -1096,6 +1583,102 @@ class TestEnvDefaults(CustomTestCase):
         self.assertEqual(calls, ["npu", "vllm", "torch", "ag_rs"])
 
 
+class TestMlaNpuVerifyDispatch(CustomTestCase):
+    """forward_mla_core_npu: DCP target verify calls the full-head DCP layer
+    and takes its already merged output; decode keeps the module merge."""
+
+    def _module(self):
+        mocked = {
+            name: MagicMock()
+            for name in (
+                "torch_npu",
+                "sgl_kernel_npu",
+                "sgl_kernel_npu.norm",
+                "sgl_kernel_npu.norm.fused_split_qk_norm",
+            )
+            if name not in sys.modules
+        }
+        with patch.dict(sys.modules, mocked):
+            from sglang.srt.hardware_backend.npu.modules import (
+                deepseek_v2_attention_mla_npu as mla_npu,
+            )
+        return mla_npu
+
+    def test_gating(self):
+        mla_npu = self._module()
+
+        def batch(mode):
+            return SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_decode=lambda: mode == "decode",
+                    is_target_verify=lambda: mode == "verify",
+                )
+            )
+
+        for enabled in (False, True):
+            with patch.object(
+                mla_npu,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=enabled),
+            ):
+                for mode in ("decode", "verify", "extend"):
+                    self.assertEqual(
+                        mla_npu._is_npu_dcp_mla_decode(batch(mode)),
+                        enabled and mode == "decode",
+                    )
+                    self.assertEqual(
+                        mla_npu._is_npu_dcp_mla_verify(batch(mode)),
+                        enabled and mode == "verify",
+                    )
+
+    def test_core_dispatch(self):
+        mla_npu = self._module()
+        heads, c, d = 2, 4, 3
+
+        def run(mode):
+            m = SimpleNamespace(
+                num_local_heads=heads,
+                kv_lora_rank=d,
+                v_head_dim=d,
+                w_vc=torch.zeros(heads, d, d),
+                o_proj=lambda x: (x, None),
+                attn_mqa=MagicMock(return_value=torch.zeros(5, heads * d)),
+                attn_mqa_for_dcp_decode=MagicMock(
+                    return_value=(
+                        (torch.zeros(5, heads * c * d), torch.zeros(5, heads * c))
+                        if mode == "decode"
+                        else torch.zeros(5, heads * d)
+                    )
+                ),
+            )
+            fb = SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_decode=lambda: mode == "decode",
+                    is_target_verify=lambda: mode == "verify",
+                )
+            )
+            merge = MagicMock(return_value=torch.zeros(5, heads, d))
+            parallel = SimpleNamespace(dcp_enabled=True, attn_dcp_size=c)
+            with patch.object(mla_npu, "get_parallel", return_value=parallel), patch.object(
+                mla_npu, "_npu_dcp_merge_mla_decode", merge
+            ):
+                mla_npu.forward_mla_core_npu(
+                    m, "q_pe", "k_pe", "q_nope", "k_nope", fb, None, None, None
+                )
+            return m, merge
+
+        m, merge = run("verify")
+        m.attn_mqa_for_dcp_decode.assert_called_once()
+        args, kwargs = m.attn_mqa_for_dcp_decode.call_args
+        self.assertEqual(args[:3], ("q_nope", "k_nope", "k_nope"))
+        self.assertEqual(kwargs, dict(q_rope="q_pe", k_rope="k_pe"))
+        m.attn_mqa.assert_not_called()
+        merge.assert_not_called()
+        m, merge = run("decode")
+        m.attn_mqa_for_dcp_decode.assert_called_once()
+        merge.assert_called_once()
+
+
 class TestKimiK3NpuDcpConfig(CustomTestCase):
     @staticmethod
     def _server_args(**kwargs):
@@ -1104,6 +1687,7 @@ class TestKimiK3NpuDcpConfig(CustomTestCase):
             dcp_comm_backend="ag_rs",
             dcp_replicate_q_proj=None,
             speculative_algorithm=None,
+            speculative_eagle_topk=None,
             enable_hierarchical_cache=False,
             disaggregation_mode="null",
             attention_backend=None,
@@ -1144,9 +1728,33 @@ class TestKimiK3NpuDcpConfig(CustomTestCase):
             self._resolve(dcp_replicate_q_proj=True), {"dcp_comm_backend": "a2a"}
         )
 
+    def test_dspark_allowed_with_static_ragged_verify(self):
+        expect = {"dcp_replicate_q_proj": True, "dcp_comm_backend": "a2a"}
+        self.assertEqual(self._resolve(speculative_algorithm="DSPARK"), expect)
+        self.assertEqual(
+            self._resolve(speculative_algorithm="DSPARK", speculative_eagle_topk=1),
+            expect,
+        )
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            self.assertEqual(self._resolve(speculative_algorithm="DSPARK"), expect)
+
+    def test_dspark_rejections(self):
+        for mode in ("compact", "cap-accept"):
+            with envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+                with self.assertRaisesRegex(ValueError, "RAGGED_VERIFY_MODE"):
+                    self._resolve(speculative_algorithm="DSPARK")
+        with self.assertRaisesRegex(ValueError, "speculative_eagle_topk"):
+            self._resolve(speculative_algorithm="DSPARK", speculative_eagle_topk=4)
+        for algo in ("EAGLE", "EAGLE3", "NGRAM", "DFLASH", "STANDALONE"):
+            with self.assertRaisesRegex(ValueError, "only speculative_algorithm"):
+                self._resolve(speculative_algorithm=algo)
+        # Other rejections still apply with DSPARK on.
+        with self.assertRaises(ValueError):
+            self._resolve(speculative_algorithm="DSPARK", dcp_comm_backend="fi_a2a")
+
     def test_rejections(self):
         rejected = [
-            dict(speculative_algorithm="DSPARK"),
+            dict(speculative_algorithm="EAGLE"),
             dict(enable_hierarchical_cache=True),
             dict(disaggregation_mode="decode"),
             dict(dcp_comm_backend="fi_a2a"),
@@ -1177,6 +1785,224 @@ class TestKimiK3NpuDcpConfig(CustomTestCase):
 
     def test_dcp_disabled_is_untouched(self):
         self.assertEqual(self._resolve(dcp_size=1), {})
+
+
+
+class TestDsparkWithoutDcp(CustomTestCase):
+    """DSPARK with DCP off (dcp_size == 1) keeps every original non-DCP path:
+    Ascend target / draft backends, K3 overrides, the MLA NPU module."""
+
+    PAGE, W, HEADS, D_C, D_R = 4, 3, 8, 6, 2
+
+    def _backend(self, is_draft_worker, fias_v2=False):
+        backend_mod = _import_ascend_backend()
+        cls = backend_mod.AscendAttnBackend
+        req_to_token = torch.arange(2 * 64, dtype=torch.int32).view(2, 64) + 8
+        model_runner = SimpleNamespace(
+            device="cpu",
+            page_size=self.PAGE,
+            model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
+                attention_arch=backend_mod.AttentionArch.MLA,
+                kv_lora_rank=self.D_C,
+                qk_rope_head_dim=self.D_R,
+                qk_nope_head_dim=self.D_C,
+                hf_config=SimpleNamespace(
+                    architectures=["KimiK3ForConditionalGeneration"]
+                ),
+                context_len=64,
+                num_attention_heads=self.HEADS,
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            token_to_kv_pool=object(),
+            spec_algorithm=SimpleNamespace(
+                is_dspark=lambda: True,
+                get_num_tokens_per_req_for_target_verify=lambda n, is_draft_worker: n,
+            ),
+            is_draft_worker=is_draft_worker,
+            is_hybrid_swa=False,
+            server_args=None,
+            ps=SimpleNamespace(attn_cp_size=1),
+        )
+        parallel = SimpleNamespace(attn_tp_size=1, attn_dcp_size=1, attn_dcp_rank=0)
+        real_tensor = torch.tensor
+
+        def cpu_tensor(*args, **kwargs):
+            kwargs.pop("device", None)
+            return real_tensor(*args, **kwargs)
+
+        with patch.object(torch, "tensor", cpu_tensor), patch.object(
+            backend_mod, "get_parallel", return_value=parallel
+        ), patch.object(
+            backend_mod,
+            "get_spec",
+            return_value=SimpleNamespace(speculative_num_draft_tokens=self.W),
+        ), patch.object(
+            backend_mod,
+            "get_flags",
+            return_value=SimpleNamespace(
+                capture=SimpleNamespace(enable_torch_compile=False)
+            ),
+        ), patch.object(
+            backend_mod, "AscendAttnMaskBuilder", MagicMock()
+        ), patch.object(
+            backend_mod, "AscendTorchNativeAttnBackend", MagicMock()
+        ), patch.object(
+            backend_mod, "DllmConfig", MagicMock(from_server_args=lambda _: None)
+        ), patch.object(
+            backend_mod, "is_fia_nz", return_value=False
+        ), envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(fias_v2):
+            backend = cls(model_runner)
+        return backend_mod, backend, model_runner
+
+    def test_target_backend_keeps_plain_layout_and_verify(self):
+        for fias_v2 in (False, True):
+            backend_mod, backend, mr = self._backend(False, fias_v2)
+            self.assertEqual((backend.dcp_size, backend.dcp_rank), (1, 0))
+            self.assertFalse(backend.dcp_replicated_draft)
+            self.assertFalse(backend.dcp_pad_heads)
+            self.assertEqual(backend.page_size, self.PAGE)
+            self.assertEqual(backend.use_fias_v2_bsnd, fias_v2)
+
+            seq_lens = [5, 13]  # DSPARK: CPU lens already count the window
+            fb = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=2,
+                seq_lens=torch.tensor(seq_lens),
+                seq_lens_cpu=torch.tensor(seq_lens),
+                spec_info=SimpleNamespace(draft_token_num=self.W),
+                spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
+                req_pool_indices=torch.tensor([1, 0]),
+                extend_seq_lens=None,
+                out_cache_loc=None,
+                num_token_non_padded_cpu=2 * self.W,
+            )
+            boom = MagicMock(side_effect=AssertionError("DCP path used"))
+            with patch.object(backend_mod, "dcp_block_tables", boom), patch.object(
+                backend_mod, "dcp_verify_history_local_lens", boom
+            ), patch.object(backend_mod, "dcp_local_seq_lens", boom):
+                backend.init_forward_metadata(fb)
+            md = backend.forward_metadata
+            seq_max = max(seq_lens) + self.W
+            expect = (
+                mr.req_to_token_pool.req_to_token[[1, 0], :seq_max][:, :: self.PAGE]
+                // self.PAGE
+            )
+            self.assertTrue(torch.equal(md.block_tables, expect))
+            self.assertEqual(md.seq_lens_cpu_int.tolist(), seq_lens)
+            self.assertIsNone(md.dcp_local_seq_lens_cpu_int)
+
+            num_pages = 64 // self.PAGE + 4
+            backend.token_to_kv_pool = SimpleNamespace(
+                get_kv_buffer=lambda _: (
+                    torch.zeros(num_pages * self.PAGE, 1, self.D_C),
+                    torch.zeros(num_pages * self.PAGE, 1, self.D_R),
+                )
+            )
+            fake_npu = MagicMock()
+            fake_npu.npu_fused_infer_attention_score_v2.side_effect = (
+                lambda q, *a, **kw: (torch.zeros_like(q), None)
+            )
+            layer = SimpleNamespace(
+                layer_id=0,
+                tp_q_head_num=self.HEADS,
+                tp_k_head_num=1,
+                tp_v_head_num=1,
+                v_head_dim=self.D_C,
+                scaling=1.0,
+            )
+            T = 2 * self.W
+            with patch.object(backend_mod, "torch_npu", fake_npu), patch.object(
+                backend_mod, "is_fia_nz", return_value=False
+            ), patch.object(
+                backend_mod.AscendAttnBackend, "_forward_verify_mla_dcp", boom
+            ):
+                out = backend.forward_mtp(
+                    torch.zeros(T, self.HEADS * self.D_C),
+                    torch.zeros(T, self.D_C),
+                    None,
+                    layer,
+                    fb,
+                    False,
+                    q_rope=torch.zeros(T, self.HEADS * self.D_R),
+                    k_rope=torch.zeros(T, self.D_R),
+                )
+            self.assertEqual(out.shape, (T, self.HEADS * self.D_C))
+            if fias_v2:
+                call = fake_npu.npu_fused_infer_attention_score_v2.call_args
+                self.assertEqual(call.kwargs["actual_seq_kvlen"], seq_lens)
+                self.assertEqual(call.kwargs["num_query_heads"], self.HEADS)
+            else:
+                call = fake_npu.npu_fused_infer_attention_score.out.call_args
+                self.assertEqual(call.kwargs["actual_seq_lengths_kv"], seq_lens)
+                self.assertEqual(call.kwargs["num_heads"], self.HEADS)
+            self.assertEqual(call.kwargs["block_size"], self.PAGE)
+            self.assertTrue(torch.equal(call.kwargs["block_table"], expect))
+
+    def test_draft_backend_is_plain_dcp1(self):
+        _, backend, _ = self._backend(True)
+        self.assertEqual((backend.dcp_size, backend.dcp_rank), (1, 0))
+        self.assertEqual(backend.page_size, self.PAGE)
+        self.assertFalse(backend.dcp_replicated_draft)
+        self.assertFalse(backend.dcp_pad_heads)
+
+    def test_k3_overrides_untouched(self):
+        boom = MagicMock(side_effect=AssertionError("NPU DCP resolver called"))
+        with patch.object(kimi_k3_overrides, "_resolve_kimi_k3_npu_dcp", boom):
+            for topk in (None, 1):
+                self.assertEqual(
+                    TestKimiK3NpuDcpConfig()._resolve(
+                        dcp_size=1,
+                        speculative_algorithm="DSPARK",
+                        speculative_eagle_topk=topk,
+                    ),
+                    {},
+                )
+            # A ragged mode the DCP resolver rejects is not rejected at dcp=1.
+            with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+                self.assertEqual(
+                    TestKimiK3NpuDcpConfig()._resolve(
+                        dcp_size=1, speculative_algorithm="DSPARK"
+                    ),
+                    {},
+                )
+        boom.assert_not_called()
+
+    def test_mla_npu_target_verify_uses_plain_attn_mqa(self):
+        mla_npu = TestMlaNpuVerifyDispatch()._module()
+        heads, d = 2, 3
+        for mode in ("verify", "decode"):
+            m = SimpleNamespace(
+                num_local_heads=heads,
+                kv_lora_rank=d,
+                v_head_dim=d,
+                w_vc=torch.zeros(heads, d, d),
+                o_proj=lambda x: (x, None),
+                attn_mqa=MagicMock(return_value=torch.zeros(5, heads * d)),
+                attn_mqa_for_dcp_decode=MagicMock(
+                    side_effect=AssertionError("DCP attention used")
+                ),
+            )
+            fb = SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_decode=lambda: mode == "decode",
+                    is_target_verify=lambda: mode == "verify",
+                )
+            )
+            merge = MagicMock(side_effect=AssertionError("DCP merge used"))
+            parallel = SimpleNamespace(dcp_enabled=False, attn_dcp_size=1)
+            with patch.object(
+                mla_npu, "get_parallel", return_value=parallel
+            ), patch.object(mla_npu, "_npu_dcp_merge_mla_decode", merge):
+                self.assertFalse(mla_npu._is_npu_dcp_mla_verify(fb))
+                self.assertFalse(mla_npu._is_npu_dcp_mla_decode(fb))
+                mla_npu.forward_mla_core_npu(
+                    m, "q_pe", "k_pe", "q_nope", "k_nope", fb, None, None, None
+                )
+            m.attn_mqa.assert_called_once_with(
+                "q_nope", "k_nope", "k_nope", fb, q_rope="q_pe", k_rope="k_pe"
+            )
+            m.attn_mqa_for_dcp_decode.assert_not_called()
 
 
 if __name__ == "__main__":
