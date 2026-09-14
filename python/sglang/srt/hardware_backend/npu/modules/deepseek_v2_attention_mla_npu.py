@@ -171,6 +171,15 @@ def _is_npu_dcp_mla_decode(forward_batch: "ForwardBatch") -> bool:
     return get_parallel().dcp_enabled and forward_batch.forward_mode.is_decode()
 
 
+def _is_npu_dcp_mla_verify(forward_batch: "ForwardBatch") -> bool:
+    # DSPARK target verify: the backend splits history (sharded KV, merged
+    # across DCP ranks inside AscendAttnBackend._forward_verify_mla_dcp) and
+    # current (the window's own K/V) and returns this rank's merged heads.
+    return (
+        get_parallel().dcp_enabled and forward_batch.forward_mode.is_target_verify()
+    )
+
+
 def _npu_dcp_merge_mla_decode(
     attn_output: torch.Tensor, lse: torch.Tensor
 ) -> torch.Tensor:
@@ -236,12 +245,15 @@ def forward_mla_prepare_npu(
         topk_indices = None
     else:
         q_lora = None
-        dcp_decode = _is_npu_dcp_mla_decode(forward_batch)
+        # DCP decode and target verify attend with all num_heads * dcp heads.
+        dcp_full_heads = _is_npu_dcp_mla_decode(
+            forward_batch
+        ) or _is_npu_dcp_mla_verify(forward_batch)
         # --dcp-replicate-q-proj: project full-head Q from the pre-gathered
         # weights (model_runner._prepare_replicated_q_proj) instead of the
         # per-layer Q all-gather; layers without them keep the all-gather.
         q_replicate_active = (
-            dcp_decode
+            dcp_full_heads
             and m.q_b_proj_qrep_weight is not None
             and m.w_kc_qrep is not None
         )
@@ -330,7 +342,7 @@ def forward_mla_prepare_npu(
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if dcp_decode and not q_replicate_active:
+        if dcp_full_heads and not q_replicate_active:
             # [B, H, *] -> [B, H * dcp, *]: every DCP rank attends with all heads.
             # NPU-DCP: verify on device: HCCL all_gather inside a captured NPU graph.
             q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
@@ -394,6 +406,18 @@ def forward_mla_core_npu(
         # NPU-DCP: verify on device: LSE merge vs SGLANG_NPU_DCP_ATTN_IMPL=torch
         # layer by layer (ag_rs: HCCL all_gather + reduce_scatter in graph).
         attn_output = _npu_dcp_merge_mla_decode(attn_output, lse)
+    elif _is_npu_dcp_mla_verify(forward_batch):
+        # Full-head Q + this window's own latent / rope K; the backend returns
+        # this rank's heads with history and current already merged
+        # ([B * w, H * kv_lora_rank]).
+        attn_output = m.attn_mqa_for_dcp_decode(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+        )
     else:
         attn_output = m.attn_mqa(
             q_nope_out,
