@@ -895,6 +895,24 @@ class Envs:
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # MLA decode-context-parallel local attention: "fia" (FIA with
+    # softmax_lse_flag) or "torch" (eager-only reference implementation).
+    SGLANG_NPU_DCP_ATTN_IMPL = EnvStr("fia")
+    # Whether the local DCP attention LSE is a natural log (else base 2).
+    SGLANG_NPU_DCP_LSE_BASE_E = EnvBool(True)
+    # DCP a2a LSE merge: "npu" (out in model dtype + fp32 LSE packed as
+    # trailing columns in one all_to_all_single, merged with
+    # torch_npu.npu_attention_update), "vllm" (fp32 [H, D+1, B]
+    # all_to_all_single + npu_attention_update, as vllm-ascend) or "torch"
+    # (same packing as "npu" + pure-torch lse_combine). ag_rs is unaffected.
+    SGLANG_NPU_DCP_MERGE_IMPL = EnvStr("npu")
+    # Pad the DCP decode FIA query heads (num_heads * dcp_size) to a power of
+    # 2 (MLA FIA documents N in {32, 64, 128}). Set to 0 to pass the unpadded
+    # head count, as vllm-ascend does.
+    SGLANG_NPU_DCP_PAD_HEADS = EnvBool(True)
+    # Global prefix tokens all-gathered per chunk when an MLA extend attends
+    # to a DCP-sharded prefix (chunks merged with npu_attention_update).
+    SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS = EnvInt(65536)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)

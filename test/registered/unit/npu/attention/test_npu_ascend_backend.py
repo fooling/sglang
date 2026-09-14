@@ -4,6 +4,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
+import unittest.mock
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -158,6 +159,9 @@ class TestForwardMetadata(unittest.TestCase):
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
+            "prefix_npages",
+            "dcp_local_seq_lens_cpu_int",
+            "dcp_local_seq_lens_cpu_list",
         }
         self.assertEqual(names, expected)
 
@@ -760,6 +764,81 @@ class TestCommonTemplate(unittest.TestCase):
         backend.common_template(forward_batch, call_fn)
         for call in call_fn.call_args_list:
             self.assertIs(call.args[1], forward_batch)
+
+
+class TestDcpDecodeHeadPadding(unittest.TestCase):
+    """_forward_decode_mla_dcp pads FIA heads to a power of 2 by default."""
+
+    B, HEADS, C_DIM, R_DIM, PAGE = 2, 96, 16, 4, 4
+
+    def _run(self, pad_heads):
+        from sglang.srt.hardware_backend.npu.attention import (
+            ascend_backend as backend_mod,
+        )
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.dcp_attn_impl = "fia"
+        backend.dcp_pad_heads = pad_heads
+        backend.dcp_q_head_num_padding = 128 if pad_heads else None
+        backend.graph_mode = False
+        backend.kv_lora_rank = self.C_DIM
+        backend.qk_rope_head_dim = self.R_DIM
+        backend.page_size = self.PAGE
+        backend.forward_metadata = SimpleNamespace(
+            dcp_local_seq_lens_cpu_int=torch.tensor([3, 0], dtype=torch.int32),
+            dcp_local_seq_lens_cpu_list=None,
+            block_tables=torch.zeros(self.B, 1, dtype=torch.int32),
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: torch.zeros(8, 1, self.C_DIM),
+            get_value_buffer=lambda _: torch.zeros(8, 1, self.R_DIM),
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=self.HEADS, tp_k_head_num=1, layer_id=0, scaling=1.0
+        )
+        calls = []
+
+        def fia_out(query, *args, out, **kwargs):
+            calls.append((tuple(query.shape), kwargs["num_heads"]))
+            out[0].copy_(torch.arange(query.shape[2]).view(1, 1, -1, 1))
+            out[1].copy_(torch.arange(query.shape[2]).view(1, -1, 1, 1))
+
+        fake_npu = MagicMock()
+        fake_npu.npu_fused_infer_attention_score.out.side_effect = fia_out
+        q = torch.randn(self.B, self.HEADS * self.C_DIM)
+        q_rope = torch.randn(self.B, self.HEADS * self.R_DIM)
+        with unittest.mock.patch.object(
+            backend_mod, "torch_npu", fake_npu
+        ), unittest.mock.patch.object(backend_mod, "is_fia_nz", return_value=False):
+            out, lse = backend._forward_decode_mla_dcp(q, q_rope, layer)
+        self.assertEqual(out.shape, (self.B, self.HEADS * self.C_DIM))
+        self.assertEqual(lse.shape, (self.B, self.HEADS))
+        head_ids = torch.arange(self.HEADS).float()
+        self.assertTrue(torch.equal(lse, head_ids.expand(self.B, -1)))
+        self.assertTrue(
+            torch.equal(
+                out.view(self.B, self.HEADS, self.C_DIM)[..., 0],
+                head_ids.expand(self.B, -1),
+            )
+        )
+        return calls
+
+    def test_unpadded(self):
+        ((shape, num_heads),) = self._run(pad_heads=False)
+        self.assertEqual(num_heads, self.HEADS)
+        self.assertEqual(shape, (self.B, 1, self.HEADS, self.C_DIM))
+
+    def test_default_padded(self):
+        ((shape, num_heads),) = self._run(pad_heads=True)
+        self.assertEqual(num_heads, 128)
+        self.assertEqual(shape, (self.B, 1, 128, self.C_DIM))
+
+    def test_env_default(self):
+        from sglang.srt.environ import envs
+
+        self.assertTrue(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
+        with envs.SGLANG_NPU_DCP_PAD_HEADS.override(False):
+            self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
 
 
 if __name__ == "__main__":

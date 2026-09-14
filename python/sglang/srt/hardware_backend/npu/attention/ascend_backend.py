@@ -25,6 +25,14 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.dcp.ops import (
+    dcp_block_tables,
+    dcp_gather_chunk_rows,
+    dcp_local_seq_lens,
+    dcp_prefix_chunk_plan,
+    mla_decode_with_lse_torch,
+    npu_attention_update,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -108,6 +116,12 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+    # per-request page counts of flatten_prefix_block_tables (DCP only)
+    prefix_npages: Optional[List[int]] = None
+
+    # decode context parallel (DCP): KV lengths held by this rank
+    dcp_local_seq_lens_cpu_int: Optional[torch.Tensor] = None
+    dcp_local_seq_lens_cpu_list: Optional[List[int]] = None
 
 
 class AscendAttnMaskBuilder:
@@ -400,6 +414,41 @@ class AscendAttnBackend(AttentionBackend):
                     self.q_head_num_padding = num
                     break
 
+        # decode context parallel (DCP): KV is sharded by pos % dcp_size, block
+        # tables stride page_size * dcp_size, MLA decode runs full-head queries.
+        self.dcp_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_q_head_num_padding = None
+        self.dcp_pad_heads = False
+        if self.dcp_size > 1:
+            if self.is_hybrid_swa:
+                raise NotImplementedError(
+                    "Decode context parallel is not supported with hybrid SWA "
+                    "on the Ascend attention backend."
+                )
+            self._check_dcp_allocator_page_size(
+                getattr(model_runner, "token_to_kv_pool_allocator", None)
+            )
+            self.dcp_attn_impl = envs.SGLANG_NPU_DCP_ATTN_IMPL.get()
+            if self.dcp_attn_impl not in ("fia", "torch"):
+                raise ValueError(
+                    "SGLANG_NPU_DCP_ATTN_IMPL must be 'fia' or 'torch', got "
+                    f"{self.dcp_attn_impl!r}."
+                )
+            # Pad num_heads * dcp_size to a power of 2 for FIA by default;
+            # SGLANG_NPU_DCP_PAD_HEADS=0 passes it unpadded (as vllm-ascend).
+            self.dcp_pad_heads = envs.SGLANG_NPU_DCP_PAD_HEADS.get()
+            self.dcp_prefix_chunk_tokens = envs.SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS.get()
+            if self.dcp_prefix_chunk_tokens <= 0:
+                raise ValueError(
+                    "SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS must be positive, got "
+                    f"{self.dcp_prefix_chunk_tokens}."
+                )
+            if self.dcp_pad_heads and self.q_head_num_padding is not None:
+                self.dcp_q_head_num_padding = next_power_of_2(
+                    self.tp_q_head_num * self.dcp_size
+                )
+
         # dllm model config
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = False
@@ -415,6 +464,21 @@ class AscendAttnBackend(AttentionBackend):
             and layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
         )
+
+    def _check_dcp_allocator_page_size(self, allocator) -> None:
+        """The DCP target layout (pool write loc // dcp_size, block-table stride
+        page_size * dcp_size, local lengths) only holds if the token-to-KV
+        allocator hands out virtual locs in pages of page_size * dcp_size."""
+        expected = self.page_size * self.dcp_size
+        actual = getattr(allocator, "page_size", None)
+        if actual != expected:
+            raise RuntimeError(
+                "Decode context parallel on the Ascend backend requires the "
+                "token-to-KV allocator to be widened to page_size * dcp_size "
+                f"= {self.page_size} * {self.dcp_size} = {expected}, got "
+                f"{type(allocator).__name__} with page_size={actual}. Check "
+                "KVCacheConfigurator._build_token_to_kv_pool_allocator."
+            )
 
     @staticmethod
     def _can_use_tnd(layer: RadixAttention) -> bool:
@@ -475,12 +539,30 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             seq_lens_max += self.speculative_step_id + 1
-        self.forward_metadata.block_tables = (
-            self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, :seq_lens_max
-            ][:, :: self.page_size]
-            // self.page_size
-        )
+        if self.dcp_size > 1:
+            if isinstance(seq_lens_max, torch.Tensor):
+                # Slice width from the host lengths (no device sync), with the
+                # same spec step adjustment; the local FIA lengths below come
+                # from seq_lens_cpu too. Target verify is already a host int.
+                seq_lens_max = int(forward_batch.seq_lens_cpu.max()) + (
+                    self.speculative_step_id + 1
+                    if forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.spec_info is not None
+                    else 0
+                )
+            self.forward_metadata.block_tables = dcp_block_tables(
+                self.req_to_token_pool.req_to_token[forward_batch.req_pool_indices],
+                seq_lens_max,
+                self.page_size,
+                self.dcp_size,
+            )
+        else:
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max
+                ][:, :: self.page_size]
+                // self.page_size
+            )
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -523,6 +605,11 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+
+        if self.dcp_size > 1 and forward_batch.forward_mode.is_decode_or_idle():
+            self.forward_metadata.dcp_local_seq_lens_cpu_int = dcp_local_seq_lens(
+                self.forward_metadata.seq_lens_cpu_int, self.dcp_size, self.dcp_rank
+            )
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -568,12 +655,20 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.flatten_prefix_block_tables = torch.empty(
                 0, dtype=torch.int32
             ).to(self.device)
+            # Under DCP a virtual page of page_size * dcp_size tokens maps to
+            # physical page of the same id on every rank.
+            block_stride = self.page_size * self.dcp_size
+            if self.dcp_size > 1:
+                self.forward_metadata.prefix_npages = [
+                    (seq_len + block_stride - 1) // block_stride
+                    for seq_len in seq_prefix_lens
+                ]
             for req_idx, seq_len in zip(
                 forward_batch.req_pool_indices.tolist(), seq_prefix_lens
             ):
                 req_indices = self.req_to_token_pool.req_to_token[req_idx]
                 req_prefix_block_tables = (
-                    req_indices[:seq_len][:: self.page_size] // self.page_size
+                    req_indices[:seq_len][::block_stride] // block_stride
                 )
                 self.forward_metadata.flatten_prefix_block_tables = torch.cat(
                     (
@@ -592,6 +687,11 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.dcp_size > 1 and self.dcp_attn_impl == "torch":
+            raise ValueError(
+                "SGLANG_NPU_DCP_ATTN_IMPL=torch is an eager-only reference; "
+                "run with --disable-cuda-graph or use the default 'fia'."
+            )
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -657,6 +757,12 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
+        if self.dcp_size > 1:
+            # metadata.seq_lens stays global; FIA reads this rank's KV lengths,
+            # rebound at replay by NPUGraphRunner.execute.
+            metadata.dcp_local_seq_lens_cpu_list = dcp_local_seq_lens(
+                metadata.seq_lens_cpu_list, self.dcp_size, self.dcp_rank
+            )
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -706,6 +812,24 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=dtype,
                 device=seq_lens.device,
             )
+        if (
+            self.dcp_q_head_num_padding is not None
+            and self.dcp_q_head_num_padding > self.tp_q_head_num * self.dcp_size
+        ):
+            dtype = self.model_dtype if self.model_dtype is not None else torch.bfloat16
+            dcp_padding_heads = (
+                self.dcp_q_head_num_padding - self.tp_q_head_num * self.dcp_size
+            )
+            metadata.dcp_nope_padding = torch.zeros(
+                [bs, 1, dcp_padding_heads, self.kv_lora_rank],
+                dtype=dtype,
+                device=seq_lens.device,
+            )
+            metadata.dcp_rope_padding = torch.zeros(
+                [bs, 1, dcp_padding_heads, self.qk_rope_head_dim],
+                dtype=dtype,
+                device=seq_lens.device,
+            )
         self.graph_metadata[bs] = metadata
         return metadata
 
@@ -737,7 +861,9 @@ class AscendAttnBackend(AttentionBackend):
             max_len += self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
-        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        # Under DCP one block is a virtual page of page_size * dcp_size tokens.
+        block_stride = self.page_size * self.dcp_size
+        max_seq_pages = (max_len + block_stride - 1) // block_stride
 
         if self.is_hybrid_swa:
             full_page_locs = self.req_to_token[
@@ -764,8 +890,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_mask[:bs, 0, :].copy_(mask)
             metadata.swa_mask[bs:, :, :].fill_(True)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
+            self.req_to_token[req_pool_indices[:bs], 0:max_len:block_stride]
+            // block_stride
         )
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
@@ -1866,6 +1992,8 @@ class AscendAttnBackend(AttentionBackend):
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
             # we use the FIA kernel for computation.
             q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            if self.dcp_size > 1:
+                return self._forward_extend_mla_prefix_dcp(q, k, v, layer)
 
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -2037,6 +2165,123 @@ class AscendAttnBackend(AttentionBackend):
                     )
 
         return attn_output
+
+    def _forward_extend_mla_prefix_dcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        """MLA extend with a DCP-sharded prefix, chunked like vllm-ascend's
+        ``_compute_prefill_context``.
+
+        Per request, each global prefix chunk is all-gathered from the DCP ranks
+        and attended without a mask (prefix precedes every current token); the
+        current tokens attend to themselves causally. The partials are merged
+        with npu_attention_update, so at most one chunk of prefix KV is
+        materialised per layer. q [T, H, qk_head_dim], k [T, Hk, qk_head_dim],
+        v [T, Hk, v_head_dim]; returns [T, H * v_head_dim].
+        """
+        metadata = self.forward_metadata
+        num_heads = layer.tp_q_head_num
+        v_head_dim = layer.v_head_dim
+        dcp_group = get_parallel().dcp_group
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        kv_lora_rank = k_buffer.shape[-1]
+        assert layer.kv_b_proj is not None
+
+        def fia(query, key, value, causal):
+            kwargs = (
+                dict(atten_mask=self.fia_mask, sparse_mode=3, next_tokens=0)
+                if causal
+                else dict(atten_mask=None, sparse_mode=0)
+            )
+            # NPU-DCP: verify on device: BSND FIA with softmax_lse_flag=True
+            # returns (out [1, q_len, H, D], lse [1, H, q_len, 1] float32,
+            # natural log) for both the unmasked prefix-chunk call and the
+            # causal (sparse_mode=3) current call with q_len == kv_len.
+            out, lse = torch.ops.npu.npu_fused_infer_attention_score(
+                query[None],
+                key[None].contiguous(),
+                value[None].contiguous(),
+                num_heads=num_heads,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                scale=layer.scaling,
+                softmax_lse_flag=True,
+                **kwargs,
+            )
+            q_len = query.shape[0]
+            # [1, H, q_len, 1] -> [q_len * H], token-major like out.
+            lse = lse.view(1, num_heads, q_len).transpose(1, 2).reshape(-1)
+            return lse, out.reshape(q_len * num_heads, v_head_dim)
+
+        attn_output = torch.empty(
+            (q.size(0), num_heads, v_head_dim), device=q.device, dtype=q.dtype
+        )
+        q_len_offset = 0
+        page_offset = 0
+        # Requests and chunks in batch order: identical collectives on every rank.
+        for q_len, prefix_len, npages in zip(
+            metadata.extend_seq_lens_cpu_int.tolist(),
+            metadata.prefix_lens.tolist(),
+            metadata.prefix_npages,
+        ):
+            q_slice = q[q_len_offset : q_len_offset + q_len]
+            lse_list, out_list = [], []
+            for chunk in dcp_prefix_chunk_plan(
+                prefix_len,
+                self.dcp_prefix_chunk_tokens,
+                self.page_size,
+                self.dcp_size,
+            ):
+                first = page_offset + chunk.first_page
+                block_ids = metadata.flatten_prefix_block_tables[
+                    first : first + chunk.num_pages
+                ]
+                local_pages = torch.cat(
+                    [
+                        gather_mla_cache_pages(k_buffer, block_ids, is_nz=is_fia_nz()),
+                        gather_mla_cache_pages(v_buffer, block_ids, is_nz=is_fia_nz()),
+                    ],
+                    dim=-1,
+                )
+                rows = dcp_gather_chunk_rows(
+                    local_pages,
+                    chunk.row_offset,
+                    chunk.end - chunk.start,
+                    dcp_group,
+                )
+                kv_cached, k_rope_cached = rows.split(
+                    [kv_lora_rank, rows.shape[-1] - kv_lora_rank], dim=-1
+                )
+                kv = layer.kv_b_proj(kv_cached)[0].view(
+                    -1, layer.tp_k_head_num, self.qk_nope_head_dim + v_head_dim
+                )
+                k_nope, v_pre = kv.split([self.qk_nope_head_dim, v_head_dim], dim=-1)
+                k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
+                k_pre = torch.cat([k_nope, k_rope], dim=-1)
+                chunk_lse, chunk_out = fia(q_slice, k_pre, v_pre, causal=False)
+                lse_list.append(chunk_lse)
+                out_list.append(chunk_out)
+
+            k_cur = k[q_len_offset : q_len_offset + q_len]
+            v_cur = v[q_len_offset : q_len_offset + q_len]
+            cur_lse, cur_out = fia(q_slice, k_cur, v_cur, causal=True)
+            lse_list.append(cur_lse)
+            out_list.append(cur_out)
+            if len(out_list) == 1:
+                merged = cur_out
+            else:
+                merged = npu_attention_update(lse_list, out_list)
+            attn_output[q_len_offset : q_len_offset + q_len] = merged.view(
+                q_len, num_heads, v_head_dim
+            ).to(q.dtype)
+            q_len_offset += q_len
+            page_offset += npages
+        return attn_output.view(-1, num_heads * v_head_dim)
 
     def forward_dllm(
         self,
@@ -2434,6 +2679,146 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output
 
+    def _is_mla_dcp_decode_layer(self, layer: RadixAttention) -> bool:
+        # attn_mqa_for_dcp_decode carries tp_q_head_num * dcp_size heads.
+        return (
+            self.dcp_size > 1
+            and self.use_mla
+            and layer.tp_q_head_num == self.tp_q_head_num * self.dcp_size
+        )
+
+    def _forward_decode_mla_dcp(
+        self,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        layer: RadixAttention,
+    ):
+        """MLA decode over this rank's DCP KV shard with full-head queries.
+
+        Returns (output [B, H * kv_lora_rank], lse [B, H] float32) for the
+        cross-rank LSE merge in forward_mla_core_npu.
+        """
+        metadata = self.forward_metadata
+        num_heads = layer.tp_q_head_num
+        if metadata.dcp_local_seq_lens_cpu_int is not None:
+            actual_seq_len_kv = metadata.dcp_local_seq_lens_cpu_int.tolist()
+        else:
+            actual_seq_len_kv = metadata.dcp_local_seq_lens_cpu_list
+        c_kv = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_rope = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        q_nope = q.view(-1, 1, num_heads, self.kv_lora_rank)
+        q_rope = q_rope.view(-1, 1, num_heads, self.qk_rope_head_dim)
+        bs = q_nope.shape[0]
+
+        if self.dcp_attn_impl == "torch":
+            # Eager reference: read the pages named by the block table in
+            # logical order and run softmax attention per request.
+            block_ids = metadata.block_tables.flatten()
+            output, lse = mla_decode_with_lse_torch(
+                q_nope[:, 0],
+                q_rope[:, 0],
+                gather_mla_cache_pages(c_kv, block_ids, is_nz=is_fia_nz()),
+                gather_mla_cache_pages(k_rope, block_ids, is_nz=is_fia_nz()),
+                torch.arange(block_ids.numel(), device=block_ids.device).view(
+                    metadata.block_tables.shape
+                ),
+                actual_seq_len_kv,
+                layer.scaling,
+            )
+            return output.reshape(-1, num_heads * self.kv_lora_rank), lse
+
+        if is_fia_nz():
+            k_rope_cache = _reshape_kv_for_fia_nz(
+                k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+            )
+            c_kv_cache = _reshape_kv_for_fia_nz(
+                c_kv, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
+            )
+        else:
+            k_rope_cache = k_rope.view(
+                -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
+            )
+            c_kv_cache = c_kv.view(
+                -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
+            )
+
+        if self.dcp_pad_heads:
+            num_heads_padded = self.dcp_q_head_num_padding or next_power_of_2(num_heads)
+        else:
+            # NPU-DCP: verify on device (SGLANG_NPU_DCP_PAD_HEADS=0): torch_npu
+            # 2.10.0 documents N in {32, 64, 128} for MLA (query_rope) FIA;
+            # vllm-ascend #16362 runs 96 heads on A5.
+            num_heads_padded = num_heads
+        if num_heads_padded > num_heads:
+            # The FIA kernel only supports head counts that are powers of 2.
+            if self.graph_mode:
+                nope_padding = metadata.dcp_nope_padding
+                rope_padding = metadata.dcp_rope_padding
+            else:
+                padding_heads = num_heads_padded - num_heads
+                nope_padding = q_nope.new_zeros(
+                    [bs, 1, padding_heads, self.kv_lora_rank]
+                )
+                rope_padding = q_rope.new_zeros(
+                    [bs, 1, padding_heads, self.qk_rope_head_dim]
+                )
+            q_nope = torch.cat([q_nope, nope_padding], dim=2)
+            q_rope = torch.cat([q_rope, rope_padding], dim=2)
+        q_nope = q_nope.contiguous()
+        q_rope = q_rope.contiguous()
+
+        # NPU-DCP: verify on device: FIA accepts softmax_lse_flag together with
+        # query_rope/key_rope + block_table (BSND), and a request whose local KV
+        # length is 0 yields lse=-inf (or NaN) rather than an error.
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            query_rope=q_rope,
+            key_rope=k_rope_cache,
+            num_heads=num_heads_padded,
+            num_key_value_heads=layer.tp_k_head_num,
+            block_table=metadata.block_tables,
+            block_size=self.page_size,
+            input_layout="BSND",
+            scale=layer.scaling,
+            actual_seq_lengths_kv=actual_seq_len_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
+            softmax_lse_flag=True,
+        )
+        output = torch.empty_like(q_nope)
+        # NPU-DCP: verify on device: softmax_lse shape [B, N, 1, 1] (BSND,
+        # Q_S=1), dtype float32 and natural-log base (else set
+        # SGLANG_NPU_DCP_LSE_BASE_E=0).
+        softmax_lse = torch.empty(
+            [bs, num_heads_padded, 1, 1], dtype=torch.float32, device=q.device
+        )
+        torch_npu.npu_fused_infer_attention_score.out(
+            q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            query_rope=q_rope,
+            key_rope=k_rope_cache,
+            num_heads=num_heads_padded,
+            num_key_value_heads=layer.tp_k_head_num,
+            block_table=metadata.block_tables,
+            block_size=self.page_size,
+            input_layout="BSND",
+            scale=layer.scaling,
+            actual_seq_lengths_kv=actual_seq_len_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
+            softmax_lse_flag=True,
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+        output = output[:, :, :num_heads, :].reshape(-1, num_heads * self.kv_lora_rank)
+        lse = softmax_lse.view(bs, num_heads_padded)[:, :num_heads].float()
+        return output, lse
+
     def forward_decode_graph(
         self,
         q: torch.Tensor,
@@ -2614,6 +2999,8 @@ class AscendAttnBackend(AttentionBackend):
             )
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
+            if self._is_mla_dcp_decode_layer(layer):
+                return self._forward_decode_mla_dcp(q, q_rope, layer)
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
@@ -2980,6 +3367,8 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
+            if self._is_mla_dcp_decode_layer(layer):
+                return self._forward_decode_mla_dcp(q, q_rope, layer)
             num_tokens = q.shape[0]
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
