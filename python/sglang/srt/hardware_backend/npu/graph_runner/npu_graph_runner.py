@@ -42,7 +42,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dcp.ops import dcp_local_seq_lens
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -266,6 +268,13 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
+                parallel = get_parallel()
+                if parallel.dcp_enabled:
+                    # DCP MLA decode reads only this rank's KV shard (padding
+                    # rows stay 0).
+                    seq_lens = dcp_local_seq_lens(
+                        seq_lens, parallel.attn_dcp_size, parallel.attn_dcp_rank
+                    )
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

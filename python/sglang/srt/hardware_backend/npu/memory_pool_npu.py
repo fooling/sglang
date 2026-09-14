@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dcp.ops import dcp_physical_write_loc
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -12,6 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -714,6 +716,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            # Virtual loc -> this rank's physical slot; tokens owned by other
+            # DCP ranks are written to the reserved slot 0 (static shape).
+            loc = dcp_physical_write_loc(
+                loc, parallel.attn_dcp_size, parallel.attn_dcp_rank
+            )
 
         if cache_v is None:
             cache_k, cache_v = cache_k.split(
@@ -804,7 +813,31 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             out.append(layer_chunks)
         return out
 
+    @staticmethod
+    def _dcp_physical_indices(indices):
+        """Virtual (allocator) locs -> this rank's physical slots under DCP.
+
+        Tokens owned by other DCP ranks map to the reserved pad slot 0, so a
+        backup / restore of the same positions round-trips this rank's shard
+        (slot 0 only ever holds dummy writes)."""
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return indices
+        return dcp_physical_write_loc(
+            torch.as_tensor(indices), parallel.attn_dcp_size, parallel.attn_dcp_rank
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if get_parallel().dcp_enabled:
+            raise NotImplementedError(
+                "NPUMLATokenToKVPool.move_kv_cache is not supported under decode "
+                "context parallel: KV relocation (EAGLE topk > 1 / compact "
+                "verify) is not wired for the DCP-sharded layout."
+            )
+        return super().move_kv_cache(tgt_loc, src_loc)
+
     def get_cpu_copy(self, indices, mamba_indices=None):
+        indices = self._dcp_physical_indices(indices)
         torch.npu.synchronize()
         buf_of_layers = []
         has_ik = self.index_head_dim is not None
@@ -823,6 +856,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        indices = self._dcp_physical_indices(indices)
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None

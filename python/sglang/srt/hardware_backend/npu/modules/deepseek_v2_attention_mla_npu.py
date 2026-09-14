@@ -11,12 +11,20 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.dcp.ops import (
+    dcp_merge_a2a,
+    dcp_merge_a2a_npu,
+    dcp_merge_a2a_vllm,
+    dcp_merge_ag_rs,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -78,6 +86,13 @@ def forward_mha_prepare_npu(
     latent_cache = latent_cache.unsqueeze(1)
 
     if m.use_deepseek_yarn_rope:
+        if get_parallel().dcp_enabled:
+            # npu_kv_rmsnorm_rope_cache writes out_cache_loc directly and would
+            # bypass the DCP owner filter in NPUMLATokenToKVPool.set_kv_buffer.
+            raise NotImplementedError(
+                "Decode context parallel is not supported with the NPU fused "
+                "yarn-rope KV cache write (rope_scaling is set)."
+            )
         B, S = q.shape[0], 1
         cos, sin = m.rotary_emb.get_cos_sin_cache(
             positions, hidden_states.dtype, offsets=None
@@ -152,6 +167,38 @@ def forward_mha_core_npu(
 
 
 # region MLA
+def _is_npu_dcp_mla_decode(forward_batch: "ForwardBatch") -> bool:
+    return get_parallel().dcp_enabled and forward_batch.forward_mode.is_decode()
+
+
+def _npu_dcp_merge_mla_decode(
+    attn_output: torch.Tensor, lse: torch.Tensor
+) -> torch.Tensor:
+    """Merge rank-local [B, H * dcp, D] partials + LSE into this rank's [B, H, D]."""
+    parallel = get_parallel()
+    if parallel.dcp_comm_backend == "a2a":
+        merge_impl = envs.SGLANG_NPU_DCP_MERGE_IMPL.get()
+        if merge_impl == "npu":
+            merge = dcp_merge_a2a_npu
+        elif merge_impl == "vllm":
+            merge = dcp_merge_a2a_vllm
+        elif merge_impl == "torch":
+            merge = dcp_merge_a2a
+        else:
+            raise ValueError(
+                "SGLANG_NPU_DCP_MERGE_IMPL must be 'npu', 'vllm' or 'torch', "
+                f"got {merge_impl!r}."
+            )
+    else:
+        merge = dcp_merge_ag_rs
+    return merge(
+        attn_output.contiguous(),
+        lse.contiguous(),
+        parallel.dcp_group,
+        base_e=envs.SGLANG_NPU_DCP_LSE_BASE_E.get(),
+    )
+
+
 def forward_mla_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -189,6 +236,17 @@ def forward_mla_prepare_npu(
         topk_indices = None
     else:
         q_lora = None
+        dcp_decode = _is_npu_dcp_mla_decode(forward_batch)
+        # --dcp-replicate-q-proj: project full-head Q from the pre-gathered
+        # weights (model_runner._prepare_replicated_q_proj) instead of the
+        # per-layer Q all-gather; layers without them keep the all-gather.
+        q_replicate_active = (
+            dcp_decode
+            and m.q_b_proj_qrep_weight is not None
+            and m.w_kc_qrep is not None
+        )
+        if q_replicate_active:
+            num_q_heads = m.num_local_heads * get_parallel().attn_dcp_size
         if m.q_lora_rank is not None:
             qkv_latent = get_attn_tp_context().fetch_qkv_latent()
             if (
@@ -241,9 +299,21 @@ def forward_mla_prepare_npu(
             if m.use_dsa:
                 q_lora = q
 
-            q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            if q_replicate_active:
+                q = torch.nn.functional.linear(q, m.q_b_proj_qrep_weight).view(
+                    -1, num_q_heads, m.qk_head_dim
+                )
+            else:
+                q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
         else:
-            q = m.q_proj(hidden_states)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            if q_replicate_active:
+                q = torch.nn.functional.linear(
+                    hidden_states, m.q_b_proj_qrep_weight
+                ).view(-1, num_q_heads, m.qk_head_dim)
+            else:
+                q = m.q_proj(hidden_states)[0].view(
+                    -1, m.num_local_heads, m.qk_head_dim
+                )
             latent_cache = m.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : m.kv_lora_rank]
             k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
@@ -251,12 +321,19 @@ def forward_mla_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+        q_nope_out = torch.bmm(
+            q_nope.transpose(0, 1), m.w_kc_qrep if q_replicate_active else m.w_kc
+        )
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+
+        if dcp_decode and not q_replicate_active:
+            # [B, H, *] -> [B, H * dcp, *]: every DCP rank attends with all heads.
+            # NPU-DCP: verify on device: HCCL all_gather inside a captured NPU graph.
+            q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -300,15 +377,33 @@ def forward_mla_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
-        q_nope_out,
-        k_nope,
-        k_nope,
-        forward_batch,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-    )
+    if _is_npu_dcp_mla_decode(forward_batch):
+        # Local attention over this rank's KV shard with all heads, then the
+        # cross-rank LSE merge back to this rank's heads.
+        attn_output, lse = m.attn_mqa_for_dcp_decode(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+        )
+        attn_output = attn_output.view(
+            -1, m.num_local_heads * get_parallel().attn_dcp_size, m.kv_lora_rank
+        )
+        # NPU-DCP: verify on device: LSE merge vs SGLANG_NPU_DCP_ATTN_IMPL=torch
+        # layer by layer (ag_rs: HCCL all_gather + reduce_scatter in graph).
+        attn_output = _npu_dcp_merge_mla_decode(attn_output, lse)
+    else:
+        attn_output = m.attn_mqa(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
