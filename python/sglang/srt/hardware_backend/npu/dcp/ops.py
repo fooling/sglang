@@ -52,6 +52,26 @@ def dcp_local_seq_lens(
     return [int(n) // dcp_size + int(dcp_rank < int(n) % dcp_size) for n in seq_lens]
 
 
+def dcp_verify_history_local_lens(
+    seq_lens_with_w: Union[torch.Tensor, Sequence[int]],
+    w: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> Union[torch.Tensor, List[int]]:
+    """History KV length this rank holds for a target-verify window.
+
+    ``seq_lens_with_w`` already counts the ``w`` verify tokens (written to the
+    cache before attention); history is the global prefix before them,
+    ``max(len - w, 0)`` (0 for idle / graph-padding rows), sharded by the
+    owner rule pos % c == rank.
+    """
+    if isinstance(seq_lens_with_w, torch.Tensor):
+        history = (seq_lens_with_w - w).clamp_min(0)
+    else:
+        history = [max(int(n) - int(w), 0) for n in seq_lens_with_w]
+    return dcp_local_seq_lens(history, dcp_size, dcp_rank)
+
+
 def dcp_interleave_pages(gathered: torch.Tensor, total_len: int) -> torch.Tensor:
     """[c, npages, P, *tail] (rank-major) -> [npages*P*c, *tail][:total_len].
 
@@ -170,15 +190,40 @@ def _dcp_a2a_packed_exchange(out: torch.Tensor, lse: torch.Tensor, group):
     return recv[..., :d], recv.view(torch.float32)[..., d // cols]
 
 
+def lse_logsumexp_valid(lses: torch.Tensor, base_e: bool = True) -> torch.Tensor:
+    """Natural-log merged LSE over dim 0, ignoring invalid (non-finite) shards.
+
+    lses: [N, ...]; an element with no valid shard gets -inf.
+    """
+    lses = lses.float()
+    if not base_e:
+        lses = lses * math.log(2.0)
+    lses = torch.where(torch.isfinite(lses), lses, torch.full_like(lses, -math.inf))
+    return torch.logsumexp(lses, dim=0)
+
+
+def _natural_lse(lse: torch.Tensor, base_e: bool) -> torch.Tensor:
+    lse = lse.float()
+    return lse if base_e else lse * math.log(2.0)
+
+
 def dcp_merge_a2a(
-    out: torch.Tensor, lse: torch.Tensor, group, base_e: bool = True
-) -> torch.Tensor:
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    base_e: bool = True,
+    return_lse: bool = False,
+):
     """A2A merge (packed exchange + pure-torch ``lse_combine``): out [B, N*h, D],
-    lse [B, N*h] -> [B, h, D]."""
+    lse [B, N*h] -> [B, h, D]; with ``return_lse`` also the merged natural-log
+    LSE [B, h] (float32, -inf where no shard is valid)."""
     if group.world_size == 1:
-        return out
+        return (out, _natural_lse(lse, base_e)) if return_lse else out
     recv_out, recv_lse = _dcp_a2a_packed_exchange(out, lse, group)
-    return lse_combine(recv_out, recv_lse, base_e=base_e)
+    merged = lse_combine(recv_out, recv_lse, base_e=base_e)
+    if not return_lse:
+        return merged
+    return merged, lse_logsumexp_valid(recv_lse, base_e=base_e)
 
 
 # Finite stand-in for an invalid LSE (+inf FIA sentinel for an empty local KV,
@@ -217,31 +262,51 @@ def attention_update_reference(
 
 
 def npu_attention_update(
-    lse_list: Sequence[torch.Tensor], out_list: Sequence[torch.Tensor]
-) -> torch.Tensor:
+    lse_list: Sequence[torch.Tensor],
+    out_list: Sequence[torch.Tensor],
+    return_lse: bool = False,
+):
     """Merge partial attentions over disjoint KV: lse_i [T], out_i [T, D] -> [T, D] fp32.
 
     Invalid (non-finite) shard LSEs are sanitised first (vllm-ascend notes FIA
     returns +inf for an empty local KV and only its fused Triton merge skips
     it); an element with no valid shard merges to 0, like ``lse_combine``.
+    With ``return_lse`` (update_type=1) also returns the merged LSE [T]
+    (float32, natural log) = logsumexp over the valid shards, -inf where no
+    shard is valid.
     """
     lses, outs = [], []
+    any_valid = None
     for lse, out in zip(lse_list, out_list):
         lse = lse.float()
         out = out.float()
         valid = torch.isfinite(lse)
+        any_valid = valid if any_valid is None else any_valid | valid
         lses.append(torch.where(valid, lse, lse.new_full((), _INVALID_LSE)))
         outs.append(torch.where(valid.unsqueeze(-1), out, out.new_zeros(())))
-    # NPU-DCP: verify on device: torch_npu.npu_attention_update (update_type=0)
-    # inside a captured NPU graph, and bit-level agreement with lse_combine.
-    out, _ = _attention_update_op(lses, outs, 0)
-    return out
+    if not return_lse:
+        # NPU-DCP: verify on device: torch_npu.npu_attention_update (update_type=0)
+        # inside a captured NPU graph, and bit-level agreement with lse_combine.
+        out, _ = _attention_update_op(lses, outs, 0)
+        return out
+    # NPU-DCP: verify on device: torch_npu.npu_attention_update(update_type=1)
+    # returns the merged lse as float32 [T] (natural log, same shape as each
+    # input lse) next to out [T, D], also inside a captured NPU graph.
+    out, lse = _attention_update_op(lses, outs, 1)
+    lse = lse.float().reshape(any_valid.shape)
+    lse = torch.where(any_valid, lse, lse.new_full((), -math.inf))
+    return out, lse
 
 
 def dcp_merge_a2a_vllm(
-    out: torch.Tensor, lse: torch.Tensor, group, base_e: bool = True
-) -> torch.Tensor:
-    """vllm-ascend style A2A merge: out [B, N*h, D], lse [B, N*h] -> [B, h, D].
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    base_e: bool = True,
+    return_lse: bool = False,
+):
+    """vllm-ascend style A2A merge: out [B, N*h, D], lse [B, N*h] -> [B, h, D]
+    (with ``return_lse`` also the merged natural-log LSE [B, h] float32).
 
     Mirrors ``_process_attn_out_lse`` + ``_npu_attention_update``: fp32
     ``cat(out, lse)`` permuted to [N*h, D+1, B], one all_to_all_single (chunk
@@ -250,7 +315,7 @@ def dcp_merge_a2a_vllm(
     """
     n = group.world_size
     if n == 1:
-        return out
+        return (out, _natural_lse(lse, base_e)) if return_lse else out
     out_dtype = out.dtype
     b, heads, d = out.shape
     assert heads % n == 0, f"num_heads ({heads}) must be divisible by dcp ({n})"
@@ -269,15 +334,24 @@ def dcp_merge_a2a_vllm(
     merged = npu_attention_update(
         list(lses.reshape(n, b * h).unbind(0)),
         list(outs.reshape(n, b * h, d).unbind(0)),
+        return_lse=return_lse,
     )
+    if return_lse:
+        merged, merged_lse = merged
+        return merged.view(b, h, d).to(out_dtype), merged_lse.view(b, h)
     return merged.view(b, h, d).to(out_dtype)
 
 
 def dcp_merge_a2a_npu(
-    out: torch.Tensor, lse: torch.Tensor, group, base_e: bool = True
-) -> torch.Tensor:
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    base_e: bool = True,
+    return_lse: bool = False,
+):
     """A2A merge (packed exchange + ``npu_attention_update``): out [B, N*h, D],
-    lse [B, N*h] -> [B, h, D].
+    lse [B, N*h] -> [B, h, D] (with ``return_lse`` also the merged natural-log
+    LSE [B, h] float32).
 
     Same single all_to_all_single as ``dcp_merge_a2a`` (out in model dtype,
     fp32 LSE packed as trailing columns); the received shards are cast to
@@ -285,7 +359,7 @@ def dcp_merge_a2a_npu(
     """
     n = group.world_size
     if n == 1:
-        return out
+        return (out, _natural_lse(lse, base_e)) if return_lse else out
     out_dtype = out.dtype
     b, heads, d = out.shape
     h = heads // n
@@ -296,21 +370,32 @@ def dcp_merge_a2a_npu(
     merged = npu_attention_update(
         list(recv_lse.reshape(n, b * h).unbind(0)),
         list(recv_out.float().reshape(n, b * h, d).unbind(0)),
+        return_lse=return_lse,
     )
+    if return_lse:
+        merged, merged_lse = merged
+        return merged.view(b, h, d).to(out_dtype), merged_lse.view(b, h)
     return merged.view(b, h, d).to(out_dtype)
 
 
 def dcp_merge_ag_rs(
-    out: torch.Tensor, lse: torch.Tensor, group, base_e: bool = True
-) -> torch.Tensor:
-    """AG+RS merge: out [B, N*h, D], lse [B, N*h] -> [B, h, D]."""
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    base_e: bool = True,
+    return_lse: bool = False,
+):
+    """AG+RS merge: out [B, N*h, D], lse [B, N*h] -> [B, h, D] (with
+    ``return_lse`` also the merged natural-log LSE [B, h] float32)."""
     n = group.world_size
     if n == 1:
-        return out
+        return (out, _natural_lse(lse, base_e)) if return_lse else out
     b, heads, d = out.shape
     lse = lse.float().contiguous()
     lses = group.all_gather(lse, dim=0).view(n, b, heads)
-    lses = torch.where(torch.isnan(lses), torch.full_like(lses, -math.inf), lses)
+    # NaN and FIA's +inf empty-shard sentinel both mean "no local KV".
+    invalid = torch.isnan(lses) | torch.isposinf(lses)
+    lses = torch.where(invalid, torch.full_like(lses, -math.inf), lses)
     lse = lses[group.rank_in_group]
     if base_e:
         global_lse = torch.logsumexp(lses, dim=0)
@@ -322,7 +407,41 @@ def dcp_merge_ag_rs(
     corrected = torch.nan_to_num(out.float(), nan=0.0, posinf=0.0, neginf=0.0)
     # Reduce in fp32 like cp_lse_ag_out_rs_mla, then cast back.
     corrected = (corrected * scale.unsqueeze(-1)).contiguous()
-    return group.reduce_scatter_along_dim(corrected, dim=1).to(out.dtype)
+    merged = group.reduce_scatter_along_dim(corrected, dim=1).to(out.dtype)
+    if not return_lse:
+        return merged
+    h = heads // n
+    rank = group.rank_in_group
+    merged_lse = lse_logsumexp_valid(lses[:, :, rank * h : (rank + 1) * h], base_e)
+    return merged, merged_lse
+
+
+def dcp_merge_with_lse(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    comm_backend: str,
+    merge_impl: str,
+    base_e: bool = True,
+):
+    """Cross-rank merge that also returns the merged LSE.
+
+    out [B, N*h, D], lse [B, N*h] -> (out [B, h, D], lse [B, h] float32 natural
+    log, -inf where no rank holds KV). ``comm_backend`` 'a2a' selects by
+    ``merge_impl`` ('npu' / 'vllm' / 'torch', as SGLANG_NPU_DCP_MERGE_IMPL);
+    anything else uses AG+RS.
+    """
+    if comm_backend == "a2a":
+        merges = dict(npu=dcp_merge_a2a_npu, vllm=dcp_merge_a2a_vllm, torch=dcp_merge_a2a)
+        if merge_impl not in merges:
+            raise ValueError(
+                "SGLANG_NPU_DCP_MERGE_IMPL must be 'npu', 'vllm' or 'torch', "
+                f"got {merge_impl!r}."
+            )
+        merge = merges[merge_impl]
+    else:
+        merge = dcp_merge_ag_rs
+    return merge(out, lse, group, base_e=base_e, return_lse=True)
 
 
 def mla_decode_with_lse_torch(

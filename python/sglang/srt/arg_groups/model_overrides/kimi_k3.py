@@ -52,13 +52,38 @@ def _resolve_kimi_k3_npu_dcp(cfg: Any, hf_config: Any = None) -> dict:
       --dcp-size N --no-dcp-replicate-q-proj --dcp-comm-backend a2a
                                                               -> Q AG + a2a
       --dcp-size N --no-dcp-replicate-q-proj                  -> Q AG + LSE AG + RS
+
+    Speculative decoding: only DSPARK (linear chain, static ragged verify).
+    Target verify splits attention into history (all heads over this rank's KV
+    shard, LSE-merged across ranks) + current (this rank's heads over the
+    verify window's own K/V); the draft model keeps its replicated KV pool.
     """
     if cfg.speculative_algorithm is not None:
-        raise ValueError(
-            "Kimi-K3 DCP on NPU does not support speculative decoding yet: "
-            "target verify needs a causal mask over global KV positions "
-            f"(got speculative_algorithm={cfg.speculative_algorithm!r})."
+        if cfg.speculative_algorithm != "DSPARK":
+            raise ValueError(
+                "Kimi-K3 DCP on NPU supports only speculative_algorithm "
+                "'DSPARK' (history/current split target verify); got "
+                f"{cfg.speculative_algorithm!r}."
+            )
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
         )
+
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "Kimi-K3 DCP + DSPARK on NPU requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static: the split verify assumes a "
+                "fixed window of speculative_num_draft_tokens per request "
+                f"(got {ragged_mode.value!r})."
+            )
+        topk = cfg.speculative_eagle_topk
+        if topk not in (None, 1):
+            raise ValueError(
+                "Kimi-K3 DCP + DSPARK on NPU requires a linear draft chain "
+                f"(speculative_eagle_topk in (None, 1)), got {topk!r}."
+            )
     if hf_config is not None:
         from sglang.srt.configs.model_config import is_deepseek_dsa
 

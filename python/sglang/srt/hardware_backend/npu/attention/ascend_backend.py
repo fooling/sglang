@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -29,7 +30,9 @@ from sglang.srt.hardware_backend.npu.dcp.ops import (
     dcp_block_tables,
     dcp_gather_chunk_rows,
     dcp_local_seq_lens,
+    dcp_merge_with_lse,
     dcp_prefix_chunk_plan,
+    dcp_verify_history_local_lens,
     mla_decode_with_lse_torch,
     npu_attention_update,
 )
@@ -119,7 +122,8 @@ class ForwardMetadata:
     # per-request page counts of flatten_prefix_block_tables (DCP only)
     prefix_npages: Optional[List[int]] = None
 
-    # decode context parallel (DCP): KV lengths held by this rank
+    # decode context parallel (DCP): KV lengths this rank's DCP FIA reads --
+    # decode: all cached tokens; target verify: the history before the window
     dcp_local_seq_lens_cpu_int: Optional[torch.Tensor] = None
     dcp_local_seq_lens_cpu_list: Optional[List[int]] = None
 
@@ -416,8 +420,15 @@ class AscendAttnBackend(AttentionBackend):
 
         # decode context parallel (DCP): KV is sharded by pos % dcp_size, block
         # tables stride page_size * dcp_size, MLA decode runs full-head queries.
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_size, self.dcp_rank = self._dcp_layout(
+            model_runner.is_draft_worker,
+            get_parallel().attn_dcp_size,
+            get_parallel().attn_dcp_rank,
+            kv_is_nz=self.use_mla and is_fia_nz(),
+        )
+        self.dcp_replicated_draft = (
+            model_runner.is_draft_worker and get_parallel().attn_dcp_size > 1
+        )
         self.dcp_q_head_num_padding = None
         self.dcp_pad_heads = False
         if self.dcp_size > 1:
@@ -457,6 +468,36 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = model_runner.ps.attn_cp_size
+
+    @staticmethod
+    def _dcp_layout(
+        is_draft_worker: bool,
+        dcp_size: int,
+        dcp_rank: int,
+        kv_is_nz: bool = False,
+    ):
+        """(dcp_size, dcp_rank) this backend attends with.
+
+        The DCP target shards KV by position. The draft KV pool is replicated
+        instead: it indexes the shared allocator's virtual locs raw and is
+        built with page size P * dcp_size (KVCacheConfigurator.pool_page_size),
+        i.e. a contiguous token-major [pages, P * c, H, D] buffer. Flat slot
+        page * P * c + off equals (page * c + off // P) * P + off % P, so the
+        draft backend keeps the physical page size P and the plain dcp=1 path
+        (block table req_to_token[:, ::P] // P, K/V views (-1, P, ...),
+        block_size=P) reads it correctly; FIA PageAttention caps block_size at
+        512, so P * c (e.g. 1024) could not be passed directly.
+        """
+        if dcp_size > 1 and is_draft_worker:
+            if kv_is_nz:
+                # NZ tiles are not token-major, so the P * c -> P page split
+                # above does not hold.
+                raise NotImplementedError(
+                    "DCP + speculative decoding does not support an FIA NZ "
+                    "(SGLANG_USE_FIA_NZ=1) draft MLA KV layout on NPU."
+                )
+            return 1, 0
+        return dcp_size, dcp_rank
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -610,6 +651,18 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.dcp_local_seq_lens_cpu_int = dcp_local_seq_lens(
                 self.forward_metadata.seq_lens_cpu_int, self.dcp_size, self.dcp_rank
             )
+        elif self.dcp_size > 1 and forward_batch.forward_mode.is_target_verify():
+            # seq_lens_cpu_int counts the verify window (DSPARK publishes it on
+            # CPU; other algorithms add it above); the history FIA reads only
+            # this rank's shard of the prefix before the window.
+            self.forward_metadata.dcp_local_seq_lens_cpu_int = (
+                dcp_verify_history_local_lens(
+                    self.forward_metadata.seq_lens_cpu_int,
+                    spec_tokens_per_req,
+                    self.dcp_size,
+                    self.dcp_rank,
+                )
+            )
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -759,7 +812,10 @@ class AscendAttnBackend(AttentionBackend):
         metadata.seq_lens = seq_lens
         if self.dcp_size > 1:
             # metadata.seq_lens stays global; FIA reads this rank's KV lengths,
-            # rebound at replay by NPUGraphRunner.execute.
+            # rebound at replay by NPUGraphRunner.execute. For target verify
+            # these are the history lengths (the captured seq_lens exclude the
+            # window) read by the history FIA v1 (actual_seq_lengths_kv); the
+            # current FIAS v2 call bakes actual_seq_kvlen=[w]*bs at capture.
             metadata.dcp_local_seq_lens_cpu_list = dcp_local_seq_lens(
                 metadata.seq_lens_cpu_list, self.dcp_size, self.dcp_rank
             )
@@ -2378,6 +2434,14 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self._is_mla_dcp_decode_layer(layer)
+        ):
+            return self._forward_verify_mla_dcp(
+                q, q_rope, k, k_rope, layer, forward_batch
+            )
+
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -2686,6 +2750,232 @@ class AscendAttnBackend(AttentionBackend):
             and self.use_mla
             and layer.tp_q_head_num == self.tp_q_head_num * self.dcp_size
         )
+
+    def _dcp_fia_heads(self, num_heads: int) -> int:
+        """FIA query head count for a DCP split call (SGLANG_NPU_DCP_PAD_HEADS)."""
+        return next_power_of_2(num_heads) if self.dcp_pad_heads else num_heads
+
+    def _forward_verify_mla_dcp(
+        self,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """DSPARK target verify under DCP: history + current split per rank.
+
+        q / q_rope carry all tp_q_head_num = H * dcp heads for the B * w verify
+        tokens; k / k_rope are the window's own latent / rope keys (written to
+        the cache with the DCP owner filter before this call).
+
+        1. history: FIA v1 (TND, as vllm-ascend's split decode and this
+           backend's non-DCP MLA verify), all heads x this rank's paged KV
+           shard of the prefix before the window, no mask (sparse_mode=0:
+           every history token precedes every query), softmax_lse_flag=True;
+           merged across DCP ranks with its LSE (dcp_merge_with_lse, same comm
+           backend / SGLANG_NPU_DCP_MERGE_IMPL as decode) -> H heads.
+        2. current: FIAS v2 (BNSD, as the DSPARK FIAS v2 verify), this rank's
+           head slice x the window's own K/V, causal (mtp_mask, sparse_mode=3),
+           actual_seq_qlen = actual_seq_kvlen = [w] * B, LSE returned.
+        3. local merge of the two with npu_attention_update.
+
+        Graph replay rebinds only the history FIA v1 ``actual_seq_lengths_kv``
+        (NPUGraphRunner.execute); the current lengths are constant.
+        Returns [B * w (padded), H * kv_lora_rank].
+        """
+        metadata = self.forward_metadata
+        w = self.speculative_num_draft_tokens
+        num_heads = layer.tp_q_head_num
+        local_heads = num_heads // self.dcp_size
+        kv_heads = layer.tp_k_head_num
+        q_nope = q.view(-1, num_heads, self.kv_lora_rank)
+        q_rope = q_rope.view(-1, num_heads, self.qk_rope_head_dim)
+        k_nope = k.view(-1, kv_heads, self.kv_lora_rank)
+        k_rope = k_rope.view(-1, kv_heads, self.qk_rope_head_dim)
+        num_token_padding = q_nope.shape[0]
+        if not self.graph_mode:
+            num_real = forward_batch.num_token_non_padded_cpu
+            q_nope, q_rope = q_nope[:num_real], q_rope[:num_real]
+            k_nope, k_rope = k_nope[:num_real], k_rope[:num_real]
+        num_tokens = q_nope.shape[0]
+        assert num_tokens % w == 0, (
+            f"DCP target verify requires a fixed window of {w} tokens per "
+            f"request, got {num_tokens} tokens"
+        )
+        bs = num_tokens // w
+        if metadata.dcp_local_seq_lens_cpu_int is not None:
+            history_lens = metadata.dcp_local_seq_lens_cpu_int.tolist()
+        else:
+            history_lens = metadata.dcp_local_seq_lens_cpu_list
+        block_table = metadata.block_tables
+        if not self.graph_mode:
+            # FIA TND needs block_table rows == len(actual_seq_lengths).
+            history_lens = history_lens[:bs]
+            block_table = block_table[:bs]
+
+        if bs == 0:
+            attn_output = q_nope.new_zeros(0, local_heads * self.kv_lora_rank)
+        else:
+            attn_output = self._forward_verify_mla_dcp_split(
+                q_nope, q_rope, k_nope, k_rope, layer, w, history_lens, block_table
+            ).to(q.dtype)
+        if not self.graph_mode and num_token_padding != num_tokens:
+            attn_output = torch.cat(
+                [
+                    attn_output,
+                    attn_output.new_zeros(
+                        num_token_padding - num_tokens, *attn_output.shape[1:]
+                    ),
+                ],
+                dim=0,
+            )
+        return attn_output
+
+    def _forward_verify_mla_dcp_split(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        w: int,
+        history_lens: List[int],
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        """q_* [T, H * dcp, *], k_* [T, 1, *] -> float32 [T, H * kv_lora_rank]."""
+        num_tokens, num_heads, d_c = q_nope.shape
+        d_r = q_rope.shape[-1]
+        bs = num_tokens // w
+        local_heads = num_heads // self.dcp_size
+        kv_heads = layer.tp_k_head_num
+        base_e = envs.SGLANG_NPU_DCP_LSE_BASE_E.get()
+
+        def pad_heads(x, heads):
+            # [T, N, D] -> [T, heads, D], zero padding heads sliced off below.
+            if heads > x.shape[1]:
+                pad = x.new_zeros(x.shape[0], heads - x.shape[1], x.shape[2])
+                x = torch.cat([x, pad], dim=1)
+            return x.contiguous()
+
+        # 1. history: all heads x this rank's KV shard before the window.
+        c_kv, k_rope_buf = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if is_fia_nz():
+            k_rope_cache = _reshape_kv_for_fia_nz(
+                k_rope_buf, kv_heads, d_r, self.page_size
+            )
+            c_kv_cache = _reshape_kv_for_fia_nz(c_kv, kv_heads, d_c, self.page_size)
+        else:
+            k_rope_cache = k_rope_buf.view(-1, kv_heads, self.page_size, d_r)
+            c_kv_cache = c_kv.view(-1, kv_heads, self.page_size, d_c)
+        hist_heads = self._dcp_fia_heads(num_heads)
+        hist_q_nope = pad_heads(q_nope, hist_heads)
+        hist_q_rope = pad_heads(q_rope, hist_heads)
+        # NPU-DCP: verify on device: FIA v1 with query_rope/key_rope + paged
+        # block_table, Q_S = w > 1 per request (TND) and no mask
+        # (atten_mask=None, sparse_mode=0). torch_npu 2.10.0 documents Q_S > 1
+        # as needing sparse_mode 3/4 + mask; vllm-ascend #16362 runs exactly
+        # this on A5. Fallback: an all-attend mask with sparse_mode=4 or fully
+        # open pre/next_tokens. Also check LSE [T, N, 1] float32 natural log,
+        # and +inf (or -inf) LSE for a request whose local history length is 0.
+        history_kwargs = dict(
+            query_rope=hist_q_rope,
+            key_rope=k_rope_cache,
+            num_heads=hist_heads,
+            num_key_value_heads=kv_heads,
+            input_layout="TND",
+            scale=layer.scaling,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            block_table=block_table,
+            block_size=self.page_size,
+            atten_mask=None,
+            sparse_mode=0,
+            actual_seq_lengths=list(range(w, num_tokens + 1, w)),
+            actual_seq_lengths_kv=history_lens,
+            softmax_lse_flag=True,
+        )
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            hist_q_nope, c_kv_cache, c_kv_cache, **history_kwargs
+        )
+        hist_out = torch.empty_like(hist_q_nope)
+        hist_lse = torch.empty(
+            [num_tokens, hist_heads, 1], dtype=torch.float32, device=q_nope.device
+        )
+        torch_npu.npu_fused_infer_attention_score.out(
+            hist_q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            **history_kwargs,
+            workspace=workspace,
+            out=[hist_out, hist_lse],
+        )
+        hist_out = hist_out[:, :num_heads]
+        hist_lse = hist_lse.view(num_tokens, hist_heads)[:, :num_heads]
+        parallel = get_parallel()
+        # [T, H * dcp, D] -> ([T, H, D] model dtype, [T, H] float32 natural log)
+        hist_out, hist_lse = dcp_merge_with_lse(
+            hist_out.contiguous(),
+            hist_lse.contiguous(),
+            parallel.dcp_group,
+            parallel.dcp_comm_backend,
+            envs.SGLANG_NPU_DCP_MERGE_IMPL.get(),
+            base_e=base_e,
+        )
+
+        # 2. current: this rank's heads x the window's own K/V, causal.
+        head_start = self.dcp_rank * local_heads
+        cur_heads = self._dcp_fia_heads(local_heads)
+
+        def to_bnsd(x):
+            # [T, N, D] -> [B, N, w, D]
+            return x.view(bs, w, x.shape[1], x.shape[2]).transpose(1, 2).contiguous()
+
+        own = slice(head_start, head_start + local_heads)
+        cur_q_nope = to_bnsd(pad_heads(q_nope[:, own], cur_heads))
+        cur_q_rope = to_bnsd(pad_heads(q_rope[:, own], cur_heads))
+        cur_k_nope = to_bnsd(k_nope)
+        cur_k_rope = to_bnsd(k_rope)
+        # NPU-DCP: verify on device: FIAS v2 MLA (query_rope/key_rope) with a
+        # non-paged BNSD key of w tokens (no block_table), sparse_mode=3 +
+        # mtp_mask, and return_softmax_lse=True returning LSE [B, N, w, 1]
+        # float32 natural log. Fallback: FIA v1 TND as vllm-ascend's current
+        # call, which then needs its own graph update entry (it would share
+        # the actual_seq_lengths_kv update key with the history call).
+        cur_out, cur_lse = torch_npu.npu_fused_infer_attention_score_v2(
+            cur_q_nope,
+            cur_k_nope,
+            cur_k_nope,
+            query_rope=cur_q_rope,
+            key_rope=cur_k_rope,
+            num_query_heads=cur_heads,
+            num_key_value_heads=kv_heads,
+            input_layout="BNSD",
+            softmax_scale=layer.scaling,
+            sparse_mode=3,
+            atten_mask=self.mtp_mask,
+            actual_seq_qlen=[w] * bs,
+            actual_seq_kvlen=[w] * bs,
+            pre_tokens=FULL_ATTENTION_WINDOW,
+            next_tokens=0,
+            return_softmax_lse=True,
+        )
+        # [B, N, w, D] / [B, N, w, 1] -> token-major [T, N, D] / [T, N]
+        cur_out = cur_out.transpose(1, 2).reshape(num_tokens, cur_heads, d_c)
+        cur_lse = cur_lse.reshape(bs, cur_heads, w).transpose(1, 2)
+        cur_out = cur_out[:, :local_heads]
+        cur_lse = cur_lse.reshape(num_tokens, cur_heads)[:, :local_heads].float()
+        if not base_e:
+            cur_lse = cur_lse * math.log(2.0)
+
+        # 3. local merge (no collective): the history part already covers
+        # every rank's shard, the current window is counted once here.
+        merged = npu_attention_update(
+            [hist_lse.reshape(-1), cur_lse.reshape(-1)],
+            [hist_out.reshape(-1, d_c), cur_out.reshape(-1, d_c)],
+        )
+        return merged.view(num_tokens, local_heads * d_c)
 
     def _forward_decode_mla_dcp(
         self,
@@ -3504,6 +3794,10 @@ class AscendAttnBackend(AttentionBackend):
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         num_block, block_size, _, _ = k_cache.shape
+        if self.dcp_replicated_draft:
+            # The replicated draft pool pages by page_size * attn_dcp_size;
+            # attend with the physical page size (see _dcp_layout).
+            num_block, block_size = -1, self.page_size
         key = k_cache.view(num_block, block_size, -1)
         value = v_cache.view(num_block, block_size, -1)
 
