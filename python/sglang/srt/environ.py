@@ -895,6 +895,31 @@ class Envs:
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # MLA decode-context-parallel local attention: "fia" (FIA with
+    # softmax_lse_flag) or "torch" (eager-only reference implementation).
+    SGLANG_NPU_DCP_ATTN_IMPL = EnvStr("fia")
+    # Whether FIA returns the DCP attention LSE as a natural log (else base 2;
+    # the backend converts it to a natural log before any merge).
+    SGLANG_NPU_DCP_LSE_BASE_E = EnvBool(True)
+    # DCP a2a LSE merge: "npu" (out in model dtype + fp32 LSE packed as
+    # trailing columns in one all_to_all_single, merged with
+    # torch_npu.npu_attention_update), "vllm" (fp32 [H, D+1, B]
+    # all_to_all_single + npu_attention_update, as vllm-ascend) or "torch"
+    # (same packing as "npu" + pure-torch lse_combine). ag_rs is unaffected.
+    SGLANG_NPU_DCP_MERGE_IMPL = EnvStr("npu")
+    # Cast attention outputs to float32 before torch_npu.npu_attention_update
+    # in the "npu" merge and the local prefix / verify merges. Off by default:
+    # the op merges bf16 outputs (LSE stays float32) to the same bf16 values
+    # as fp32-then-cast, without the two casts.
+    SGLANG_NPU_DCP_MERGE_FP32 = EnvBool(False)
+    # Pad the DCP FIA query heads (num_heads * dcp_size, and the verify window's
+    # local heads) to a power of 2 (MLA FIA documents N in {32, 64, 128}). Off
+    # by default: the unpadded head count goes to FIA as in vllm-ascend
+    # (e.g. 96 heads on A5); set to 1 to pad.
+    SGLANG_NPU_DCP_PAD_HEADS = EnvBool(False)
+    # Global prefix tokens all-gathered per chunk when an MLA extend attends
+    # to a DCP-sharded prefix (chunks merged with npu_attention_update).
+    SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS = EnvInt(65536)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
