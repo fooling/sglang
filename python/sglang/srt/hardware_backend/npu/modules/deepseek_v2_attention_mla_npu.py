@@ -185,11 +185,19 @@ def _npu_dcp_merge_mla_decode(
 ) -> torch.Tensor:
     """Merge rank-local [B, H * dcp, D] partials + LSE into this rank's [B, H, D]."""
     parallel = get_parallel()
+    base_e = envs.SGLANG_NPU_DCP_LSE_BASE_E.get()
     if parallel.dcp_comm_backend == "a2a":
         merge_impl = envs.SGLANG_NPU_DCP_MERGE_IMPL.get()
         if merge_impl == "npu":
-            merge = dcp_merge_a2a_npu
-        elif merge_impl == "vllm":
+            # The packed exchange takes the padded FIA head slices as they are.
+            return dcp_merge_a2a_npu(
+                attn_output,
+                lse,
+                parallel.dcp_group,
+                base_e=base_e,
+                merge_fp32=envs.SGLANG_NPU_DCP_MERGE_FP32.get(),
+            )
+        if merge_impl == "vllm":
             merge = dcp_merge_a2a_vllm
         elif merge_impl == "torch":
             merge = dcp_merge_a2a
@@ -204,7 +212,7 @@ def _npu_dcp_merge_mla_decode(
         attn_output.contiguous(),
         lse.contiguous(),
         parallel.dcp_group,
-        base_e=envs.SGLANG_NPU_DCP_LSE_BASE_E.get(),
+        base_e=base_e,
     )
 
 
@@ -400,7 +408,7 @@ def forward_mla_core_npu(
             q_rope=q_pe,
             k_rope=k_pe,
         )
-        attn_output = attn_output.view(
+        attn_output = attn_output.reshape(
             -1, m.num_local_heads * get_parallel().attn_dcp_size, m.kv_lora_rank
         )
         # NPU-DCP: verify on device: LSE merge vs SGLANG_NPU_DCP_ATTN_IMPL=torch

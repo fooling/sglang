@@ -446,8 +446,8 @@ class AscendAttnBackend(AttentionBackend):
                     "SGLANG_NPU_DCP_ATTN_IMPL must be 'fia' or 'torch', got "
                     f"{self.dcp_attn_impl!r}."
                 )
-            # Pad num_heads * dcp_size to a power of 2 for FIA by default;
-            # SGLANG_NPU_DCP_PAD_HEADS=0 passes it unpadded (as vllm-ascend).
+            # FIA gets num_heads * dcp_size unpadded by default (as vllm-ascend);
+            # SGLANG_NPU_DCP_PAD_HEADS=1 pads it to a power of 2.
             self.dcp_pad_heads = envs.SGLANG_NPU_DCP_PAD_HEADS.get()
             self.dcp_prefix_chunk_tokens = envs.SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS.get()
             if self.dcp_prefix_chunk_tokens <= 0:
@@ -2246,6 +2246,7 @@ class AscendAttnBackend(AttentionBackend):
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         kv_lora_rank = k_buffer.shape[-1]
+        merge_fp32 = envs.SGLANG_NPU_DCP_MERGE_FP32.get()
         assert layer.kv_b_proj is not None
 
         def fia(query, key, value, causal):
@@ -2331,7 +2332,11 @@ class AscendAttnBackend(AttentionBackend):
             if len(out_list) == 1:
                 merged = cur_out
             else:
-                merged = npu_attention_update(lse_list, out_list)
+                # Every partial attends to a non-empty all-gathered chunk (or to
+                # itself), so the outputs are finite: sanitise the LSEs only.
+                merged = npu_attention_update(
+                    lse_list, out_list, merge_fp32=merge_fp32, mask_out=False
+                )
             attn_output[q_len_offset : q_len_offset + q_len] = merged.view(
                 q_len, num_heads, v_head_dim
             ).to(q.dtype)
@@ -2914,14 +2919,17 @@ class AscendAttnBackend(AttentionBackend):
         hist_out = hist_out[:, :num_heads]
         hist_lse = hist_lse.view(num_tokens, hist_heads)[:, :num_heads]
         parallel = get_parallel()
-        # [T, H * dcp, D] -> ([T, H, D] model dtype, [T, H] float32 natural log)
+        merge_fp32 = envs.SGLANG_NPU_DCP_MERGE_FP32.get()
+        # [T, H * dcp, D] -> ([T, H, D] model dtype, [T, H] float32 natural log);
+        # the merges pack / cast the padded head slices without a contiguous copy.
         hist_out, hist_lse = dcp_merge_with_lse(
-            hist_out.contiguous(),
-            hist_lse.contiguous(),
+            hist_out,
+            hist_lse,
             parallel.dcp_group,
             parallel.dcp_comm_backend,
             envs.SGLANG_NPU_DCP_MERGE_IMPL.get(),
             base_e=base_e,
+            merge_fp32=merge_fp32,
         )
 
         # 2. current: this rank's heads x the window's own K/V, causal.
@@ -2965,15 +2973,20 @@ class AscendAttnBackend(AttentionBackend):
         cur_out = cur_out.transpose(1, 2).reshape(num_tokens, cur_heads, d_c)
         cur_lse = cur_lse.reshape(bs, cur_heads, w).transpose(1, 2)
         cur_out = cur_out[:, :local_heads]
-        cur_lse = cur_lse.reshape(num_tokens, cur_heads)[:, :local_heads].float()
+        cur_lse = cur_lse.reshape(num_tokens, cur_heads)[:, :local_heads]
         if not base_e:
             cur_lse = cur_lse * math.log(2.0)
 
         # 3. local merge (no collective): the history part already covers
-        # every rank's shard, the current window is counted once here.
+        # every rank's shard, the current window is counted once here. Both
+        # outputs are finite (history invalid shards were zeroed by the
+        # cross-rank merge, the window always attends to itself), so only the
+        # LSEs are sanitised.
         merged = npu_attention_update(
-            [hist_lse.reshape(-1), cur_lse.reshape(-1)],
-            [hist_out.reshape(-1, d_c), cur_out.reshape(-1, d_c)],
+            [hist_lse, cur_lse],
+            [hist_out, cur_out],
+            merge_fp32=merge_fp32,
+            mask_out=False,
         )
         return merged.view(num_tokens, local_heads * d_c)
 
@@ -2985,8 +2998,10 @@ class AscendAttnBackend(AttentionBackend):
     ):
         """MLA decode over this rank's DCP KV shard with full-head queries.
 
-        Returns (output [B, H * kv_lora_rank], lse [B, H] float32) for the
-        cross-rank LSE merge in forward_mla_core_npu.
+        Returns (output [B, H, kv_lora_rank] or [B, H * kv_lora_rank], lse
+        [B, H] float32) for the cross-rank LSE merge in forward_mla_core_npu.
+        The FIA path returns head slices of the padded outputs as they are: the
+        merge packs them without a contiguous copy.
         """
         metadata = self.forward_metadata
         num_heads = layer.tp_q_head_num
@@ -3035,7 +3050,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.dcp_pad_heads:
             num_heads_padded = self.dcp_q_head_num_padding or next_power_of_2(num_heads)
         else:
-            # NPU-DCP: verify on device (SGLANG_NPU_DCP_PAD_HEADS=0): torch_npu
+            # NPU-DCP: verify on device (default, unpadded): torch_npu
             # 2.10.0 documents N in {32, 64, 128} for MLA (query_rope) FIA;
             # vllm-ascend #16362 runs 96 heads on A5.
             num_heads_padded = num_heads
@@ -3105,8 +3120,8 @@ class AscendAttnBackend(AttentionBackend):
             workspace=workspace,
             out=[output, softmax_lse],
         )
-        output = output[:, :, :num_heads, :].reshape(-1, num_heads * self.kv_lora_rank)
-        lse = softmax_lse.view(bs, num_heads_padded)[:, :num_heads].float()
+        output = output[:, 0, :num_heads]
+        lse = softmax_lse.view(bs, num_heads_padded)[:, :num_heads]
         return output, lse
 
     def forward_decode_graph(

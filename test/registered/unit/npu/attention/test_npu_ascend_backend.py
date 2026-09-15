@@ -811,16 +811,12 @@ class TestDcpDecodeHeadPadding(unittest.TestCase):
             backend_mod, "torch_npu", fake_npu
         ), unittest.mock.patch.object(backend_mod, "is_fia_nz", return_value=False):
             out, lse = backend._forward_decode_mla_dcp(q, q_rope, layer)
-        self.assertEqual(out.shape, (self.B, self.HEADS * self.C_DIM))
+        # Head slices of the padded FIA outputs, merged without a copy.
+        self.assertEqual(out.shape, (self.B, self.HEADS, self.C_DIM))
         self.assertEqual(lse.shape, (self.B, self.HEADS))
         head_ids = torch.arange(self.HEADS).float()
         self.assertTrue(torch.equal(lse, head_ids.expand(self.B, -1)))
-        self.assertTrue(
-            torch.equal(
-                out.view(self.B, self.HEADS, self.C_DIM)[..., 0],
-                head_ids.expand(self.B, -1),
-            )
-        )
+        self.assertTrue(torch.equal(out[..., 0], head_ids.expand(self.B, -1)))
         return calls
 
     def test_unpadded(self):
@@ -828,7 +824,7 @@ class TestDcpDecodeHeadPadding(unittest.TestCase):
         self.assertEqual(num_heads, self.HEADS)
         self.assertEqual(shape, (self.B, 1, self.HEADS, self.C_DIM))
 
-    def test_default_padded(self):
+    def test_padded(self):
         ((shape, num_heads),) = self._run(pad_heads=True)
         self.assertEqual(num_heads, 128)
         self.assertEqual(shape, (self.B, 1, 128, self.C_DIM))
@@ -836,9 +832,9 @@ class TestDcpDecodeHeadPadding(unittest.TestCase):
     def test_env_default(self):
         from sglang.srt.environ import envs
 
-        self.assertTrue(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
-        with envs.SGLANG_NPU_DCP_PAD_HEADS.override(False):
-            self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
+        self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
+        with envs.SGLANG_NPU_DCP_PAD_HEADS.override(True):
+            self.assertTrue(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
 
 
 class TestDcpDraftLayout(unittest.TestCase):
