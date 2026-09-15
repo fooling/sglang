@@ -37,6 +37,7 @@ from sglang.srt.hardware_backend.npu.dcp.ops import (
     lse_combine,
     mla_decode_with_lse_torch,
     npu_attention_update,
+    npu_attention_update_stacked,
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -768,6 +769,109 @@ class TestMerge(CustomTestCase):
             two = npu_attention_update([a_lse, lses[2]], [a_out, outs[2]])
         self.assertLess((two - got).abs().max().item(), 1e-5)
 
+    def _invalid_shards(self, seed, n, t, d):
+        g = torch.Generator().manual_seed(seed)
+        outs = torch.randn(n, t, d, generator=g)
+        lses = torch.randn(n, t, generator=g) * 2
+        lses[0, 0] = math.inf  # FIA sentinel for an empty local KV
+        outs[0, 0] = float("nan")
+        lses[1, 1] = -math.inf
+        lses[2, 2] = float("nan")
+        lses[:, 3] = math.inf  # no valid shard
+        outs[:, 3] = float("nan")
+        return outs, lses
+
+    def test_attention_update_stacked_matches_list(self):
+        n, b, h, d = 3, 4, 2, 5
+        outs, lses = self._invalid_shards(9, n, b * h, d)
+        outs4, lses3 = outs.view(n, b, h, d), lses.view(n, b, h)
+        with patch.object(dcp_ops, "_attention_update_op", attention_update_reference):
+            for return_lse in (False, True):
+                ref = npu_attention_update(
+                    list(lses), list(outs), return_lse=return_lse
+                )
+                got = npu_attention_update_stacked(lses3, outs4, return_lse=return_lse)
+                ref, got = (ref, got) if return_lse else ((ref,), (got,))
+                for r, g_ in zip(ref, got):
+                    self.assertEqual(g_.shape, r.shape)
+                    self.assertTrue(torch.equal(g_, r))
+
+    def test_attention_update_head_slices_and_mask_out(self):
+        # Non-contiguous [T, H] / [T, H, D] head slices flatten like their
+        # contiguous copies; with finite outputs mask_out=False is identical.
+        g = torch.Generator().manual_seed(10)
+        t, pad_h, h, d = 5, 4, 3, 6
+        lses = [torch.randn(t, pad_h, generator=g)[:, :h] for _ in range(2)]
+        outs = [torch.randn(t, pad_h, d, generator=g)[:, :h] for _ in range(2)]
+        lses[0][0, 0] = -math.inf
+        self.assertFalse(lses[1].is_contiguous())
+        with patch.object(dcp_ops, "_attention_update_op", attention_update_reference):
+            ref = npu_attention_update(
+                [l.reshape(-1) for l in lses], [o.reshape(-1, d) for o in outs]
+            )
+            got = npu_attention_update(lses, outs)
+            unmasked = npu_attention_update(lses, outs, mask_out=False)
+        self.assertEqual(got.shape, (t * h, d))
+        self.assertTrue(torch.equal(got, ref))
+        self.assertTrue(torch.equal(unmasked, ref))
+
+    def test_merge_fp32_flag(self):
+        # By default the op gets model-dtype outputs (fp32 LSE); merge_fp32
+        # casts them to float32 first.
+        seen = []
+
+        def spy(lse_list, out_list, update_type=0):
+            seen.append((lse_list[0].dtype, out_list[0].dtype))
+            return attention_update_reference(lse_list, out_list, update_type)
+
+        n, t, d = 2, 3, 4
+        outs = torch.randn(n, t, d).to(torch.bfloat16)
+        lses = torch.randn(n, t)
+        with patch.object(dcp_ops, "_attention_update_op", spy):
+            npu_attention_update(list(lses), list(outs))
+            npu_attention_update(list(lses), list(outs), merge_fp32=True)
+            npu_attention_update_stacked(lses, outs)
+            npu_attention_update_stacked(lses, outs, merge_fp32=True)
+        f32, bf16 = torch.float32, torch.bfloat16
+        self.assertEqual(seen, [(f32, bf16), (f32, f32), (f32, bf16), (f32, f32)])
+
+    def test_merge_a2a_npu_head_slices(self):
+        # Padded FIA outputs are passed as non-contiguous head slices; packing
+        # them must equal packing contiguous copies, for bf16 and fp32 outputs.
+        c, b, heads, pad, d = 4, 3, 8, 12, 6
+        for dtype in (torch.bfloat16, torch.float32):
+            g = torch.Generator().manual_seed(11)
+            padded_out = [
+                torch.randn(b, pad, d, generator=g).to(dtype) for _ in range(c)
+            ]
+            padded_lse = [torch.randn(b, pad, generator=g) for _ in range(c)]
+            padded_lse[1][0, :] = math.inf
+            with patch.object(
+                dcp_ops, "_attention_update_op", attention_update_reference
+            ):
+                ref = _run_ranks(
+                    c,
+                    lambda r, grp: dcp_merge_a2a_npu(
+                        padded_out[r][:, :heads].contiguous(),
+                        padded_lse[r][:, :heads].contiguous(),
+                        grp,
+                        return_lse=True,
+                    ),
+                )
+                got = _run_ranks(
+                    c,
+                    lambda r, grp: dcp_merge_a2a_npu(
+                        padded_out[r][:, :heads],
+                        padded_lse[r][:, :heads],
+                        grp,
+                        return_lse=True,
+                    ),
+                )
+            for r in range(c):
+                self.assertEqual(got[r][0].dtype, dtype)
+                self.assertTrue(torch.equal(got[r][0], ref[r][0]))
+                self.assertTrue(torch.equal(got[r][1], ref[r][1]))
+
     def test_merges_return_lse(self):
         n, bsz, h, d = 4, 3, 2, 16
         merges = dict(
@@ -827,8 +931,8 @@ class TestMerge(CustomTestCase):
         calls = []
 
         def fake(name):
-            def f(out, lse, group, base_e=True, return_lse=False):
-                calls.append((name, return_lse))
+            def f(out, lse, group, base_e=True, return_lse=False, **kw):
+                calls.append((name, return_lse, kw))
                 return out, lse
 
             return f
@@ -846,7 +950,12 @@ class TestMerge(CustomTestCase):
                 dcp_ops.dcp_merge_with_lse(out, lse, None, "a2a", "bogus")
         self.assertEqual(
             calls,
-            [("npu", True), ("vllm", True), ("torch", True), ("ag_rs", True)],
+            [
+                ("npu", True, {"merge_fp32": False}),
+                ("vllm", True, {}),
+                ("torch", True, {}),
+                ("ag_rs", True, {}),
+            ],
         )
 
     def test_a2a_vllm_matches_combine(self):
@@ -1536,7 +1645,8 @@ class TestAscendBackendVerifySplit(CustomTestCase):
 class TestEnvDefaults(CustomTestCase):
     def test_defaults(self):
         self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "npu")
-        self.assertTrue(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
+        self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
+        self.assertFalse(envs.SGLANG_NPU_DCP_MERGE_FP32.get())
         self.assertEqual(envs.SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS.get(), 65536)
 
     def test_merge_impl_selects_path(self):
@@ -1558,7 +1668,7 @@ class TestEnvDefaults(CustomTestCase):
         calls = []
 
         def fake(name):
-            return lambda out, lse, group, base_e=True: calls.append(name)
+            return lambda out, lse, group, base_e=True, **kw: calls.append(name)
 
         parallel = SimpleNamespace(dcp_comm_backend="a2a", dcp_group=None)
         with patch.object(mla_npu, "get_parallel", return_value=parallel), patch.object(

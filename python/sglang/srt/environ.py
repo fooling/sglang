@@ -894,10 +894,16 @@ class Envs:
     # all_to_all_single + npu_attention_update, as vllm-ascend) or "torch"
     # (same packing as "npu" + pure-torch lse_combine). ag_rs is unaffected.
     SGLANG_NPU_DCP_MERGE_IMPL = EnvStr("npu")
-    # Pad the DCP decode FIA query heads (num_heads * dcp_size) to a power of
-    # 2 (MLA FIA documents N in {32, 64, 128}). Set to 0 to pass the unpadded
-    # head count, as vllm-ascend does.
-    SGLANG_NPU_DCP_PAD_HEADS = EnvBool(True)
+    # Cast attention outputs to float32 before torch_npu.npu_attention_update
+    # in the "npu" merge and the local prefix / verify merges. Off by default:
+    # the op merges bf16 outputs (LSE stays float32) to the same bf16 values
+    # as fp32-then-cast, without the two casts.
+    SGLANG_NPU_DCP_MERGE_FP32 = EnvBool(False)
+    # Pad the DCP FIA query heads (num_heads * dcp_size, and the verify window's
+    # local heads) to a power of 2 (MLA FIA documents N in {32, 64, 128}). Off
+    # by default: the unpadded head count goes to FIA as in vllm-ascend
+    # (e.g. 96 heads on A5); set to 1 to pad.
+    SGLANG_NPU_DCP_PAD_HEADS = EnvBool(False)
     # Global prefix tokens all-gathered per chunk when an MLA extend attends
     # to a DCP-sharded prefix (chunks merged with npu_attention_update).
     SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS = EnvInt(65536)
