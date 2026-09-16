@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.hardware_backend.npu.dcp.ops import (
     dcp_merge_a2a,
     dcp_merge_a2a_npu,
+    dcp_merge_a2a_triton,
     dcp_merge_a2a_vllm,
     dcp_merge_ag_rs,
 )
@@ -167,6 +168,34 @@ def forward_mha_core_npu(
 
 
 # region MLA
+def _use_triton_split_qk_norm(m, qkv_latent, forward_batch) -> bool:
+    """Whether the in-tree Triton-Ascend split + q/k RMSNorm kernel applies.
+
+    It replaces ``split`` + two implicit ``contiguous`` + two ``npu_rms_norm``
+    by reading the strided slices of the fused ``qkv_a_proj`` output in place.
+    Off by default (SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON): unlike the vendor
+    fused kernel it keeps the reference arithmetic, but it still has to be
+    checked element-wise against ``npu_rms_norm`` on device first.
+    """
+    if not envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get():
+        return False
+    if qkv_latent.dim() != 2 or qkv_latent.stride(1) != 1:
+        return False
+    if dsa_use_prefill_cp(forward_batch):
+        # This path keeps latent_cache for rebuild_cp_kv_cache.
+        return False
+    for norm in (m.q_a_layernorm, m.kv_a_layernorm):
+        if (
+            not getattr(norm, "has_weight", False)
+            or getattr(norm, "variance_size_override", None) is not None
+            or getattr(norm, "cast_x_before_out_mul", False)
+            or getattr(norm, "override_orig_dtype", None) is not None
+            or norm.weight.dim() != 1
+        ):
+            return False
+    return True
+
+
 def _is_npu_dcp_mla_decode(forward_batch: "ForwardBatch") -> bool:
     return get_parallel().dcp_enabled and forward_batch.forward_mode.is_decode()
 
@@ -188,9 +217,10 @@ def _npu_dcp_merge_mla_decode(
     base_e = envs.SGLANG_NPU_DCP_LSE_BASE_E.get()
     if parallel.dcp_comm_backend == "a2a":
         merge_impl = envs.SGLANG_NPU_DCP_MERGE_IMPL.get()
-        if merge_impl == "npu":
+        if merge_impl in ("npu", "triton"):
             # The packed exchange takes the padded FIA head slices as they are.
-            return dcp_merge_a2a_npu(
+            merge = dcp_merge_a2a_npu if merge_impl == "npu" else dcp_merge_a2a_triton
+            return merge(
                 attn_output,
                 lse,
                 parallel.dcp_group,
@@ -203,8 +233,8 @@ def _npu_dcp_merge_mla_decode(
             merge = dcp_merge_a2a
         else:
             raise ValueError(
-                "SGLANG_NPU_DCP_MERGE_IMPL must be 'npu', 'vllm' or 'torch', "
-                f"got {merge_impl!r}."
+                "SGLANG_NPU_DCP_MERGE_IMPL must be 'npu', 'vllm', 'torch' or "
+                f"'triton', got {merge_impl!r}."
             )
     else:
         merge = dcp_merge_ag_rs
@@ -287,7 +317,22 @@ def forward_mla_prepare_npu(
                 k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
                 k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
             else:
-                if (
+                if _use_triton_split_qk_norm(m, qkv_latent, forward_batch):
+                    from sglang.srt.hardware_backend.npu.triton_ops.split_qk_norm import (
+                        split_qk_rmsnorm,
+                    )
+
+                    q, k_nope, k_pe = split_qk_rmsnorm(
+                        qkv_latent,
+                        m.q_a_layernorm.weight.data,
+                        m.kv_a_layernorm.weight.data,
+                        m.q_lora_rank,
+                        m.kv_lora_rank,
+                        m.qk_rope_head_dim,
+                        m.q_a_layernorm.variance_epsilon,
+                        m.kv_a_layernorm.variance_epsilon,
+                    )
+                elif (
                     qkv_latent.shape[0] < 65536
                     and not dsa_use_prefill_cp(forward_batch)
                     and not getattr(m, "_disable_npu_fused_split_qk_norm", False)

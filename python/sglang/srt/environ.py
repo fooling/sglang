@@ -903,8 +903,12 @@ class Envs:
     # DCP a2a LSE merge: "npu" (out in model dtype + fp32 LSE packed as
     # trailing columns in one all_to_all_single, merged with
     # torch_npu.npu_attention_update), "vllm" (fp32 [H, D+1, B]
-    # all_to_all_single + npu_attention_update, as vllm-ascend) or "torch"
-    # (same packing as "npu" + pure-torch lse_combine). ag_rs is unaffected.
+    # all_to_all_single + npu_attention_update, as vllm-ascend), "torch"
+    # (same packing as "npu" + pure-torch lse_combine) or "triton" (same
+    # packing as "npu", with the pack copies and the sanitise + update
+    # sequence each replaced by one Triton-Ascend kernel; accumulates in
+    # float32, so SGLANG_NPU_DCP_MERGE_FP32 no longer applies).
+    # ag_rs is unaffected.
     SGLANG_NPU_DCP_MERGE_IMPL = EnvStr("npu")
     # Cast attention outputs to float32 before torch_npu.npu_attention_update
     # in the "npu" merge and the local prefix / verify merges. Off by default:
@@ -919,6 +923,24 @@ class Envs:
     # Global prefix tokens all-gathered per chunk when an MLA extend attends
     # to a DCP-sharded prefix (chunks merged with npu_attention_update).
     SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS = EnvInt(65536)
+    # Merge the DSPARK target-verify current window as the (N+1)-th shard of
+    # the cross-rank merge instead of merging the received shards first and the
+    # window second. One merge over N+1 shards instead of two, with no
+    # intermediate LSE. Needs the a2a comm backend and a merge implementation
+    # whose exchange can be split from its merge (npu / torch / triton).
+    SGLANG_NPU_DCP_VERIFY_FUSED_MERGE = EnvBool(False)
+    # Write the MLA KV cache under DCP with one Triton-Ascend kernel: the owner
+    # filter (loc % dcp == rank -> loc // dcp) becomes the store mask, so a
+    # token owned by another rank writes nothing instead of landing on the
+    # reserved slot 0, and the latent and rope caches are written together.
+    SGLANG_NPU_DCP_KV_STORE_TRITON = EnvBool(False)
+    # Split the fused qkv_a_proj output and RMSNorm its q / kv parts with one
+    # Triton-Ascend kernel reading the strided slices in place, instead of
+    # split + two implicit contiguous + two npu_rms_norm. Unlike the vendor
+    # fused_split_qk_norm (which Kimi-K3 disables as numerically
+    # non-equivalent), this kernel keeps the reference arithmetic; check it
+    # element-wise against npu_rms_norm before switching it on.
+    SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON = EnvBool(False)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)

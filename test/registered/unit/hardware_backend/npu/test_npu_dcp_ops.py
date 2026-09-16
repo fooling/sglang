@@ -941,9 +941,11 @@ class TestMerge(CustomTestCase):
         with patch.object(dcp_ops, "dcp_merge_a2a_npu", fake("npu")), patch.object(
             dcp_ops, "dcp_merge_a2a_vllm", fake("vllm")
         ), patch.object(dcp_ops, "dcp_merge_a2a", fake("torch")), patch.object(
+            dcp_ops, "dcp_merge_a2a_triton", fake("triton")
+        ), patch.object(
             dcp_ops, "dcp_merge_ag_rs", fake("ag_rs")
         ):
-            for impl in ("npu", "vllm", "torch"):
+            for impl in ("npu", "vllm", "torch", "triton"):
                 dcp_ops.dcp_merge_with_lse(out, lse, None, "a2a", impl)
             dcp_ops.dcp_merge_with_lse(out, lse, None, "ag_rs", "npu")
             with self.assertRaises(ValueError):
@@ -954,6 +956,7 @@ class TestMerge(CustomTestCase):
                 ("npu", True, {"merge_fp32": False}),
                 ("vllm", True, {}),
                 ("torch", True, {}),
+                ("triton", True, {"merge_fp32": False}),
                 ("ag_rs", True, {}),
             ],
         )
@@ -1109,7 +1112,13 @@ def _cpu_tensor(*args, **kwargs):
 
 
 def _real_ascend_backend(
-    *, dcp_size, allocator_page_size, is_draft_worker=False, page=4, heads=8
+    *,
+    dcp_size,
+    allocator_page_size,
+    is_draft_worker=False,
+    page=4,
+    heads=8,
+    comm_backend="a2a",
 ):
     """Run the real AscendAttnBackend.__init__ on CPU with NPU deps mocked."""
     backend_mod = _import_ascend_backend()
@@ -1142,7 +1151,12 @@ def _real_ascend_backend(
         model_runner.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=allocator_page_size
         )
-    parallel = SimpleNamespace(attn_tp_size=1, attn_dcp_size=dcp_size, attn_dcp_rank=0)
+    parallel = SimpleNamespace(
+        attn_tp_size=1,
+        attn_dcp_size=dcp_size,
+        attn_dcp_rank=0,
+        dcp_comm_backend=comm_backend,
+    )
     with patch.object(torch, "tensor", _cpu_tensor), patch.object(
         backend_mod, "get_parallel", return_value=parallel
     ), patch.object(
@@ -1491,7 +1505,16 @@ class TestAscendBackendVerifySplit(CustomTestCase):
 
     H, D_C, D_R, PAGE, W = 3, 6, 3, 2, 3
 
-    def _run(self, c, prefix_lens, graph_mode, comm_backend, merge_impl, pad_heads):
+    def _run(
+        self,
+        c,
+        prefix_lens,
+        graph_mode,
+        comm_backend,
+        merge_impl,
+        pad_heads,
+        fused_merge=False,
+    ):
         backend_mod = _import_ascend_backend()
         g = torch.Generator().manual_seed(11)
         w, page_size, heads = self.W, self.PAGE, self.H * c
@@ -1548,6 +1571,7 @@ class TestAscendBackendVerifySplit(CustomTestCase):
             backend.speculative_num_draft_tokens = w
             backend.graph_mode = graph_mode
             backend.mtp_mask = torch.ones(1, dtype=torch.bool)
+            backend.dcp_verify_fused_merge = fused_merge
             hist = dcp_verify_history_local_lens(seq_lens, w, c, r)
             if graph_mode:
                 # Captured bs = 5 (one padding request), lists rebound at replay.
@@ -1632,7 +1656,9 @@ class TestAscendBackendVerifySplit(CustomTestCase):
                 )
                 exp = ref[:, r * self.H : (r + 1) * self.H]
                 err = (got[i] - exp).abs().max().item()
-                self.assertLess(err, 1e-5, (graph_mode, merge_impl, i, r))
+                self.assertLess(
+                    err, 1e-5, (graph_mode, merge_impl, fused_merge, i, r)
+                )
 
     def test_eager(self):
         for merge_impl, comm in (("npu", "a2a"), ("vllm", "a2a"), ("torch", "ag_rs")):
@@ -1642,6 +1668,23 @@ class TestAscendBackendVerifySplit(CustomTestCase):
     def test_graph_mode(self):
         self._run(2, [0, 1, 7, 12], True, "a2a", "npu", pad_heads=True)
 
+    def test_fused_merge_matches_two_stage(self):
+        """SGLANG_NPU_DCP_VERIFY_FUSED_MERGE: the current window folded into the
+        cross-rank merge as the (dcp + 1)-th shard gives the same attention."""
+        for merge_impl in ("npu", "torch"):
+            self._run(
+                2,
+                [0, 1, 7, 12],
+                False,
+                "a2a",
+                merge_impl,
+                pad_heads=True,
+                fused_merge=True,
+            )
+        self._run(
+            3, [2, 0, 9], True, "a2a", "npu", pad_heads=False, fused_merge=True
+        )
+
 
 class TestEnvDefaults(CustomTestCase):
     def test_defaults(self):
@@ -1649,6 +1692,39 @@ class TestEnvDefaults(CustomTestCase):
         self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
         self.assertFalse(envs.SGLANG_NPU_DCP_MERGE_FP32.get())
         self.assertEqual(envs.SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS.get(), 65536)
+
+    def test_fusion_switches_default_off(self):
+        """Every fused-kernel switch is opt-in until it is checked on device."""
+        self.assertFalse(envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get())
+        self.assertFalse(envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get())
+        self.assertFalse(envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get())
+        self.assertEqual(dcp_ops.DCP_SPLIT_MERGE_IMPLS, ("npu", "torch", "triton"))
+
+    def test_verify_fused_merge_requires_a_splittable_merge(self):
+        for impl in dcp_ops.DCP_SPLIT_MERGE_IMPLS:
+            with envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.override(
+                True
+            ), envs.SGLANG_NPU_DCP_MERGE_IMPL.override(impl):
+                _, backend, _ = _real_ascend_backend(
+                    dcp_size=2, allocator_page_size=8, page=4
+                )
+                self.assertTrue(backend.dcp_verify_fused_merge)
+        # vllm packs a different layout, ag_rs has no per-shard exchange.
+        for impl, comm in (("vllm", "a2a"), ("npu", "ag_rs")):
+            with envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.override(
+                True
+            ), envs.SGLANG_NPU_DCP_MERGE_IMPL.override(impl):
+                with self.assertRaises(ValueError):
+                    _real_ascend_backend(
+                        dcp_size=2,
+                        allocator_page_size=8,
+                        page=4,
+                        comm_backend=comm,
+                    )
+
+    def test_verify_fused_merge_off_by_default(self):
+        _, backend, _ = _real_ascend_backend(dcp_size=2, allocator_page_size=8, page=4)
+        self.assertFalse(backend.dcp_verify_fused_merge)
 
     def test_merge_impl_selects_path(self):
         mocked = {
@@ -1677,6 +1753,8 @@ class TestEnvDefaults(CustomTestCase):
         ), patch.object(
             mla_npu, "dcp_merge_a2a_vllm", fake("vllm")
         ), patch.object(mla_npu, "dcp_merge_a2a", fake("torch")), patch.object(
+            mla_npu, "dcp_merge_a2a_triton", fake("triton")
+        ), patch.object(
             mla_npu, "dcp_merge_ag_rs", fake("ag_rs")
         ):
             out, lse = torch.zeros(1, 2, 3), torch.zeros(1, 2)
@@ -1685,12 +1763,14 @@ class TestEnvDefaults(CustomTestCase):
                 mla_npu._npu_dcp_merge_mla_decode(out, lse)
             with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("torch"):
                 mla_npu._npu_dcp_merge_mla_decode(out, lse)
+            with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("triton"):
+                mla_npu._npu_dcp_merge_mla_decode(out, lse)
             with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("bogus"):
                 with self.assertRaises(ValueError):
                     mla_npu._npu_dcp_merge_mla_decode(out, lse)
             parallel.dcp_comm_backend = "ag_rs"
             mla_npu._npu_dcp_merge_mla_decode(out, lse)
-        self.assertEqual(calls, ["npu", "vllm", "torch", "ag_rs"])
+        self.assertEqual(calls, ["npu", "vllm", "torch", "triton", "ag_rs"])
 
 
 class TestMlaNpuVerifyDispatch(CustomTestCase):
