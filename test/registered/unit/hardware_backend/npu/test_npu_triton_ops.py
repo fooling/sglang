@@ -98,7 +98,11 @@ class TestSplitQkNormGating(CustomTestCase):
         latent = torch.randn(3, 12)
         batch = SimpleNamespace()
         with patch.object(mla_npu, "dsa_use_prefill_cp", return_value=False):
-            self.assertFalse(mla_npu._use_triton_split_qk_norm(m, latent, batch))
+            # On by default on this branch; switching it off restores the
+            # split + two npu_rms_norm path.
+            self.assertTrue(mla_npu._use_triton_split_qk_norm(m, latent, batch))
+            with envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.override(False):
+                self.assertFalse(mla_npu._use_triton_split_qk_norm(m, latent, batch))
             with envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.override(True):
                 self.assertTrue(mla_npu._use_triton_split_qk_norm(m, latent, batch))
                 # A column-major latent has no contiguous reduction dim.

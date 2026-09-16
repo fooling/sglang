@@ -190,15 +190,17 @@ class TestVerifyHistoryLocalLens(CustomTestCase):
                 t = dcp_verify_history_local_lens(torch.tensor(seq_lens), w, c, r)
                 self.assertEqual(t.tolist(), got)
                 expect = [
-                    sum(1 for p in range(max(n - w, 0)) if p % c == r)
-                    for n in seq_lens
+                    sum(1 for p in range(max(n - w, 0)) if p % c == r) for n in seq_lens
                 ]
                 self.assertEqual(got, expect, (c, w, r))
             # Every history token is counted on exactly one rank.
             totals = [
                 sum(col)
                 for col in zip(
-                    *[dcp_verify_history_local_lens(seq_lens, w, c, r) for r in range(c)]
+                    *[
+                        dcp_verify_history_local_lens(seq_lens, w, c, r)
+                        for r in range(c)
+                    ]
                 )
             ]
             self.assertEqual(totals, [max(n - w, 0) for n in seq_lens])
@@ -443,7 +445,8 @@ def _mla_attn_with_lse(q_nope, q_rope, kv, kr, scale, causal):
     causal: query i sees keys [: S - T + i + 1] (bottom-right aligned)."""
     t, s = q_nope.shape[0], kv.shape[0]
     scores = (
-        torch.einsum("thd,sd->ths", q_nope, kv) + torch.einsum("thd,sd->ths", q_rope, kr)
+        torch.einsum("thd,sd->ths", q_nope, kv)
+        + torch.einsum("thd,sd->ths", q_rope, kr)
     ) * scale
     if causal:
         allowed = torch.arange(s)[None, :] <= torch.arange(t)[:, None] + (s - t)
@@ -499,12 +502,17 @@ class TestVerifySplitExactness(CustomTestCase):
             )
             if fia_sentinel:
                 empty = torch.isneginf(hist_lse)
-                hist_lse = torch.where(empty, torch.full_like(hist_lse, math.inf), hist_lse)
+                hist_lse = torch.where(
+                    empty, torch.full_like(hist_lse, math.inf), hist_lse
+                )
                 hist_out = torch.where(
                     empty[..., None], torch.full_like(hist_out, float("nan")), hist_out
                 )
             hist_out, hist_lse = dcp_merge_with_lse(
-                hist_out, hist_lse, group, "a2a" if merge_impl != "ag_rs" else "ag_rs",
+                hist_out,
+                hist_lse,
+                group,
+                "a2a" if merge_impl != "ag_rs" else "ag_rs",
                 merge_impl,
             )
             # Current: this rank's heads x the window's own K/V, causal.
@@ -513,7 +521,12 @@ class TestVerifySplitExactness(CustomTestCase):
             for i in range(bsz):
                 tok = slice(i * w, (i + 1) * w)
                 cur_lse, cur_out = _mla_attn_with_lse(
-                    q_nope[tok, sl], q_rope[tok, sl], kv[i][-w:], kr[i][-w:], scale, True
+                    q_nope[tok, sl],
+                    q_rope[tok, sl],
+                    kv[i][-w:],
+                    kr[i][-w:],
+                    scale,
+                    True,
                 )
                 merged = npu_attention_update(
                     [hist_lse[tok].reshape(-1), cur_lse.reshape(-1)],
@@ -906,9 +919,7 @@ class TestMerge(CustomTestCase):
                     self.assertEqual(got_lse.shape, (bsz, h), name)
                     exp = ref_lse[:, r * h : (r + 1) * h]
                     finite = torch.isfinite(exp)
-                    self.assertTrue(
-                        torch.equal(torch.isneginf(got_lse), ~finite), name
-                    )
+                    self.assertTrue(torch.equal(torch.isneginf(got_lse), ~finite), name)
                     diff = (got_lse[finite] - exp[finite]).abs().max().item()
                     self.assertLess(diff, 1e-4, name)
                     if name != "ag_rs":
@@ -1626,7 +1637,9 @@ class TestAscendBackendVerifySplit(CustomTestCase):
             side_effect=lambda: SimpleNamespace(
                 dcp_group=local.group, dcp_comm_backend=comm_backend
             ),
-        ), envs.SGLANG_NPU_DCP_MERGE_IMPL.override(merge_impl):
+        ), envs.SGLANG_NPU_DCP_MERGE_IMPL.override(
+            merge_impl
+        ):
             per_rank = _run_ranks(c, rank_fn)
 
         hist_heads = {
@@ -1656,9 +1669,7 @@ class TestAscendBackendVerifySplit(CustomTestCase):
                 )
                 exp = ref[:, r * self.H : (r + 1) * self.H]
                 err = (got[i] - exp).abs().max().item()
-                self.assertLess(
-                    err, 1e-5, (graph_mode, merge_impl, fused_merge, i, r)
-                )
+                self.assertLess(err, 1e-5, (graph_mode, merge_impl, fused_merge, i, r))
 
     def test_eager(self):
         for merge_impl, comm in (("npu", "a2a"), ("vllm", "a2a"), ("torch", "ag_rs")):
@@ -1681,23 +1692,23 @@ class TestAscendBackendVerifySplit(CustomTestCase):
                 pad_heads=True,
                 fused_merge=True,
             )
-        self._run(
-            3, [2, 0, 9], True, "a2a", "npu", pad_heads=False, fused_merge=True
-        )
+        self._run(3, [2, 0, 9], True, "a2a", "npu", pad_heads=False, fused_merge=True)
 
 
 class TestEnvDefaults(CustomTestCase):
     def test_defaults(self):
-        self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "npu")
+        self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "triton")
         self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
         self.assertFalse(envs.SGLANG_NPU_DCP_MERGE_FP32.get())
         self.assertEqual(envs.SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS.get(), 65536)
 
-    def test_fusion_switches_default_off(self):
-        """Every fused-kernel switch is opt-in until it is checked on device."""
-        self.assertFalse(envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get())
-        self.assertFalse(envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get())
-        self.assertFalse(envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get())
+    def test_fusion_switches_default_on(self):
+        """This branch carries the fused kernels, so every fused path is the
+        default here; the unfused behaviour is the branch without them."""
+        self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "triton")
+        self.assertTrue(envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get())
+        self.assertTrue(envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get())
+        self.assertTrue(envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get())
         self.assertEqual(dcp_ops.DCP_SPLIT_MERGE_IMPLS, ("npu", "torch", "triton"))
 
     def test_verify_fused_merge_requires_a_splittable_merge(self):
@@ -1722,9 +1733,22 @@ class TestEnvDefaults(CustomTestCase):
                         comm_backend=comm,
                     )
 
-    def test_verify_fused_merge_off_by_default(self):
+    def test_verify_fused_merge_on_by_default(self):
         _, backend, _ = _real_ascend_backend(dcp_size=2, allocator_page_size=8, page=4)
-        self.assertFalse(backend.dcp_verify_fused_merge)
+        self.assertTrue(backend.dcp_verify_fused_merge)
+
+    def test_an_unsplittable_merge_downgrades_when_it_was_not_asked_for(self):
+        """On by default, so a config that cannot split its merge falls back
+        with a warning; only an explicit request is an error."""
+        with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("vllm"):
+            with self.assertLogs(level="WARNING") as logs:
+                _, backend, _ = _real_ascend_backend(
+                    dcp_size=2, allocator_page_size=8, page=4
+                )
+            self.assertFalse(backend.dcp_verify_fused_merge)
+            self.assertTrue(
+                any("fused target-verify merge" in m for m in logs.output), logs.output
+            )
 
     def test_merge_impl_selects_path(self):
         mocked = {
@@ -1750,15 +1774,18 @@ class TestEnvDefaults(CustomTestCase):
         parallel = SimpleNamespace(dcp_comm_backend="a2a", dcp_group=None)
         with patch.object(mla_npu, "get_parallel", return_value=parallel), patch.object(
             mla_npu, "dcp_merge_a2a_npu", fake("npu")
+        ), patch.object(mla_npu, "dcp_merge_a2a_vllm", fake("vllm")), patch.object(
+            mla_npu, "dcp_merge_a2a", fake("torch")
         ), patch.object(
-            mla_npu, "dcp_merge_a2a_vllm", fake("vllm")
-        ), patch.object(mla_npu, "dcp_merge_a2a", fake("torch")), patch.object(
             mla_npu, "dcp_merge_a2a_triton", fake("triton")
         ), patch.object(
             mla_npu, "dcp_merge_ag_rs", fake("ag_rs")
         ):
             out, lse = torch.zeros(1, 2, 3), torch.zeros(1, 2)
-            mla_npu._npu_dcp_merge_mla_decode(out, lse)
+            # Named explicitly rather than leaning on the default, which is
+            # "triton" on this branch.
+            with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("npu"):
+                mla_npu._npu_dcp_merge_mla_decode(out, lse)
             with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("vllm"):
                 mla_npu._npu_dcp_merge_mla_decode(out, lse)
             with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("torch"):
@@ -1769,7 +1796,8 @@ class TestEnvDefaults(CustomTestCase):
                 with self.assertRaises(ValueError):
                     mla_npu._npu_dcp_merge_mla_decode(out, lse)
             parallel.dcp_comm_backend = "ag_rs"
-            mla_npu._npu_dcp_merge_mla_decode(out, lse)
+            with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("npu"):
+                mla_npu._npu_dcp_merge_mla_decode(out, lse)
         self.assertEqual(calls, ["npu", "vllm", "torch", "triton", "ag_rs"])
 
 
@@ -1849,9 +1877,9 @@ class TestMlaNpuVerifyDispatch(CustomTestCase):
             )
             merge = MagicMock(return_value=torch.zeros(5, heads, d))
             parallel = SimpleNamespace(dcp_enabled=True, attn_dcp_size=c)
-            with patch.object(mla_npu, "get_parallel", return_value=parallel), patch.object(
-                mla_npu, "_npu_dcp_merge_mla_decode", merge
-            ):
+            with patch.object(
+                mla_npu, "get_parallel", return_value=parallel
+            ), patch.object(mla_npu, "_npu_dcp_merge_mla_decode", merge):
                 mla_npu.forward_mla_core_npu(
                     m, "q_pe", "k_pe", "q_nope", "k_nope", fb, None, None, None
                 )
@@ -1977,7 +2005,6 @@ class TestKimiK3NpuDcpConfig(CustomTestCase):
         self.assertEqual(self._resolve(dcp_size=1), {})
 
 
-
 class TestDsparkWithoutDcp(CustomTestCase):
     """DSPARK with DCP off (dcp_size == 1) keeps every original non-DCP path:
     Ascend target / draft backends, K3 overrides, the MLA NPU module."""
@@ -2041,7 +2068,9 @@ class TestDsparkWithoutDcp(CustomTestCase):
             backend_mod, "DllmConfig", MagicMock(from_server_args=lambda _: None)
         ), patch.object(
             backend_mod, "is_fia_nz", return_value=False
-        ), envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(fias_v2):
+        ), envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(
+            fias_v2
+        ):
             backend = cls(model_runner)
         return backend_mod, backend, model_runner
 
