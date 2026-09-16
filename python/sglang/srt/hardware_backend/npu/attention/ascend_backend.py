@@ -41,6 +41,7 @@ from sglang.srt.hardware_backend.npu.dcp.ops import (
     npu_attention_update,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.utils.common import log_info_on_rank0
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
@@ -454,6 +455,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
             self.dcp_comm_backend = get_parallel().dcp_comm_backend
             self.dcp_merge_fp32 = envs.SGLANG_NPU_DCP_MERGE_FP32.get()
+            if self.dcp_merge_fp32 and self.dcp_merge_impl == "triton":
+                # Silently ignoring it would make an A/B between the two
+                # switches look like the merge dtype had no effect.
+                logger.warning(
+                    "SGLANG_NPU_DCP_MERGE_FP32=1 has no effect with "
+                    "SGLANG_NPU_DCP_MERGE_IMPL=triton: the combine kernel "
+                    "always accumulates in float32 and casts once on the way "
+                    "out."
+                )
             # FIA's LSE is converted to a natural log once, right after FIA.
             self.dcp_lse_scale = (
                 1.0 if envs.SGLANG_NPU_DCP_LSE_BASE_E.get() else math.log(2.0)
@@ -462,6 +472,24 @@ class AscendAttnBackend(AttentionBackend):
             # SGLANG_NPU_DCP_PAD_HEADS=1 pads it to a power of 2.
             self.dcp_pad_heads = envs.SGLANG_NPU_DCP_PAD_HEADS.get()
             self.dcp_prefix_chunk_tokens = envs.SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS.get()
+            # One line saying which DCP implementation each step actually runs:
+            # every fused path is opt-in, so "did the switch take effect" is
+            # otherwise only answerable by reading a profile.
+            log_info_on_rank0(
+                logger,
+                "NPU DCP: comm=%s merge=%s attn=%s pad_heads=%s merge_fp32=%s | "
+                "fused: verify_merge=%s kv_store_triton=%s split_qk_norm_triton=%s"
+                % (
+                    self.dcp_comm_backend,
+                    self.dcp_merge_impl,
+                    self.dcp_attn_impl,
+                    self.dcp_pad_heads,
+                    self.dcp_merge_fp32,
+                    envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get(),
+                    envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get(),
+                    envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get(),
+                ),
+            )
             if self.dcp_prefix_chunk_tokens <= 0:
                 raise ValueError(
                     "SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS must be positive, got "
@@ -469,19 +497,24 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # Target verify: merge the current window as the (N+1)-th shard of
             # the cross-rank merge (one merge instead of two).
-            self.dcp_verify_fused_merge = (
-                envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get()
-            )
+            self.dcp_verify_fused_merge = envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get()
             if self.dcp_verify_fused_merge and (
                 self.dcp_comm_backend != "a2a"
                 or self.dcp_merge_impl not in DCP_SPLIT_MERGE_IMPLS
             ):
-                raise ValueError(
-                    "SGLANG_NPU_DCP_VERIFY_FUSED_MERGE needs the 'a2a' DCP comm "
-                    f"backend (got {self.dcp_comm_backend!r}) and a merge "
-                    f"implementation in {DCP_SPLIT_MERGE_IMPLS} (got "
-                    f"{self.dcp_merge_impl!r})."
+                reason = (
+                    "needs the 'a2a' DCP comm backend (got "
+                    f"{self.dcp_comm_backend!r}) and a merge implementation in "
+                    f"{DCP_SPLIT_MERGE_IMPLS} (got {self.dcp_merge_impl!r})"
                 )
+                if envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.is_set():
+                    # Asked for explicitly: a silent downgrade would make an
+                    # A/B measure the wrong thing.
+                    raise ValueError(f"SGLANG_NPU_DCP_VERIFY_FUSED_MERGE {reason}.")
+                # On by default on this branch, so a configuration that cannot
+                # split its merge falls back instead of refusing to start.
+                logger.warning("Disabling the fused target-verify merge: it %s.", reason)
+                self.dcp_verify_fused_merge = False
 
         # dllm model config
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
