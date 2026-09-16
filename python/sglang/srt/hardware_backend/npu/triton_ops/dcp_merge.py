@@ -1,0 +1,297 @@
+"""Triton-Ascend kernels for the DCP cross-rank attention merge.
+
+Two kernels replace the op sequence the torch merge needs (see
+``hardware_backend/npu/dcp/ops.py``):
+
+``pack``     ``cat`` + ``view`` + ``transpose`` + ``contiguous``  ->  one kernel
+             writing this rank's partials straight into the rank-major
+             all_to_all send buffer, with the fp32 LSE reinterpreted as
+             trailing payload-dtype columns.
+``combine``  ``isfinite`` + ``where`` x2 + ``unbind`` +
+             ``npu_attention_update``                             ->  one kernel
+             that treats a non-finite shard LSE as weight 0 in-kernel (as
+             vllm-ascend's fused_sfa_dcp_lse_combine does) and accumulates in
+             float32, so ``SGLANG_NPU_DCP_MERGE_FP32`` has nothing left to do.
+
+The combine kernel takes an optional extra shard, which is how the DSPARK
+target-verify path merges its current window as the (N+1)-th shard instead of
+running a second merge over the cross-rank result.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.srt.hardware_backend.npu.triton_ops.utils import row_grid
+
+_INF = float("inf")
+
+
+def _lse_pack_cols(dtype: torch.dtype) -> int:
+    elem = dtype.itemsize
+    assert 4 % elem == 0, f"cannot pack an fp32 LSE into {dtype} columns"
+    return 4 // elem
+
+
+@triton.jit
+def _pack_send_kernel(
+    out_ptr,  # [B, N * h, D] partials, model dtype
+    lse_ptr,  # [B, N * h] float32
+    send_ptr,  # [N, B, h, D + cols] model dtype, contiguous
+    send_f32_ptr,  # the same buffer viewed as float32
+    o_b,
+    o_h,  # element strides of out
+    l_b,
+    l_h,  # element strides of lse
+    n_rows,  # B * N * h
+    heads,  # N * h
+    h,  # heads per rank
+    bsz,
+    SEND_ROW: tl.constexpr,  # elements per send row (D + cols)
+    SEND_ROW_F32: tl.constexpr,  # the same row in float32 elements
+    LSE_COL: tl.constexpr,  # float32 column holding the LSE
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """send[j, b, i] = (out[b, j * h + i], lse[b, j * h + i]) for every row."""
+    pid = tl.program_id(0)
+    n_programs = tl.num_programs(0)
+    rows_per_program = (n_rows + n_programs - 1) // n_programs
+    start_row = pid * rows_per_program
+    end_row = tl.minimum(start_row + rows_per_program, n_rows)
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+    for row in range(start_row, end_row):
+        b = row // heads
+        head = row % heads
+        j = head // h
+        i = head % h
+        dst = (j * bsz + b) * h + i
+        payload = tl.load(out_ptr + b * o_b + head * o_h + cols, mask=mask, other=0)
+        tl.store(send_ptr + dst * SEND_ROW + cols, payload, mask=mask)
+        lse = tl.load(lse_ptr + b * l_b + head * l_h)
+        tl.store(send_f32_ptr + dst * SEND_ROW_F32 + LSE_COL, lse)
+
+
+@triton.jit
+def _lse_combine_kernel(
+    out_ptr,  # [R, D] merged output, model dtype, contiguous
+    lse_out_ptr,  # [R] merged float32 LSE (natural log)
+    src_ptr,  # [N, B, h, D] shard outputs, model dtype, D contiguous
+    src_lse_ptr,  # [N, B, h] shard LSEs, float32
+    x_ptr,  # [B, h, D] extra shard, or src_ptr when unused
+    x_lse_ptr,  # [B, h] extra shard LSE, or src_lse_ptr when unused
+    s_n,
+    s_b,
+    s_h,  # element strides of src
+    l_n,
+    l_b,
+    l_h,  # element strides of src_lse
+    x_b,
+    x_h,  # element strides of x
+    xl_b,
+    xl_h,  # element strides of x_lse
+    n_rows,  # B * h
+    h,
+    n_shards,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
+):
+    """Exact softmax merge of ``n_shards`` (+1) partial attentions over disjoint KV.
+
+    A shard whose LSE is not finite (FIA returns +inf for an empty local KV)
+    gets weight 0 and its output is never read into the accumulator; a row with
+    no valid shard merges to 0 with an LSE of -inf, matching ``lse_combine``.
+    """
+    pid = tl.program_id(0)
+    n_programs = tl.num_programs(0)
+    rows_per_program = (n_rows + n_programs - 1) // n_programs
+    start_row = pid * rows_per_program
+    end_row = tl.minimum(start_row + rows_per_program, n_rows)
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+    for row in range(start_row, end_row):
+        b = row // h
+        i = row % h
+
+        # Pass 1: the largest finite LSE over the shards (the softmax pivot).
+        max_lse = -_INF
+        for n in range(n_shards):
+            lse = tl.load(src_lse_ptr + n * l_n + b * l_b + i * l_h)
+            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
+            max_lse = tl.maximum(max_lse, tl.where(valid, lse, -_INF))
+        if HAS_EXTRA:
+            lse = tl.load(x_lse_ptr + b * xl_b + i * xl_h)
+            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
+            max_lse = tl.maximum(max_lse, tl.where(valid, lse, -_INF))
+        any_valid = max_lse > -_INF
+        pivot = tl.where(any_valid, max_lse, 0.0)
+
+        # Pass 2: weighted sum of the shard outputs in float32.
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        denom = 0.0
+        for n in range(n_shards):
+            lse = tl.load(src_lse_ptr + n * l_n + b * l_b + i * l_h)
+            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
+            weight = tl.where(valid, tl.exp(lse - pivot), 0.0)
+            vals = tl.load(
+                src_ptr + n * s_n + b * s_b + i * s_h + cols, mask=mask, other=0
+            ).to(tl.float32)
+            acc += weight * tl.where(valid, vals, 0.0)
+            denom += weight
+        if HAS_EXTRA:
+            lse = tl.load(x_lse_ptr + b * xl_b + i * xl_h)
+            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
+            weight = tl.where(valid, tl.exp(lse - pivot), 0.0)
+            vals = tl.load(x_ptr + b * x_b + i * x_h + cols, mask=mask, other=0).to(
+                tl.float32
+            )
+            acc += weight * tl.where(valid, vals, 0.0)
+            denom += weight
+
+        scale = tl.where(denom > 0.0, 1.0 / tl.where(denom > 0.0, denom, 1.0), 0.0)
+        merged = acc * scale
+        tl.store(
+            out_ptr + row * D + cols, merged.to(out_ptr.dtype.element_ty), mask=mask
+        )
+        if RETURN_LSE:
+            merged_lse = tl.where(any_valid, pivot + tl.log(denom), -_INF)
+            tl.store(lse_out_ptr + row, merged_lse)
+
+
+def dcp_pack_send(out: torch.Tensor, lse: torch.Tensor, n: int) -> torch.Tensor:
+    """[B, N*h, D] + [B, N*h] float32 -> rank-major send buffer [N, B, h, D+cols].
+
+    ``out`` / ``lse`` may be non-contiguous head slices of the FIA outputs; the
+    kernel reads them with their own strides, so no staging copy is made.
+    """
+    b, heads, d = out.shape
+    assert heads % n == 0, f"num_heads ({heads}) must be divisible by dcp ({n})"
+    h = heads // n
+    cols = _lse_pack_cols(out.dtype)
+    lse_col = d * out.dtype.itemsize // 4
+    assert (
+        lse_col * 4 == d * out.dtype.itemsize
+    ), f"head dim {d} in {out.dtype} does not align an fp32 LSE column"
+    lse = lse.float()
+    send = out.new_empty((n, b, h, d + cols))
+    n_rows = b * heads
+    _pack_send_kernel[(row_grid(n_rows),)](
+        out,
+        lse,
+        send,
+        send.view(torch.float32),
+        out.stride(0),
+        out.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        n_rows,
+        heads,
+        h,
+        b,
+        SEND_ROW=d + cols,
+        SEND_ROW_F32=(d + cols) // cols,
+        LSE_COL=lse_col,
+        D=d,
+        BLOCK_D=triton.next_power_of_2(d),
+    )
+    return send
+
+
+def lse_combine_shards(
+    outs: torch.Tensor,
+    lses: torch.Tensor,
+    extra_out: torch.Tensor = None,
+    extra_lse: torch.Tensor = None,
+    return_lse: bool = False,
+):
+    """Merge partial attentions: outs [N, B, h, D], lses [N, B, h] (natural log).
+
+    ``extra_out`` [B, h, D] / ``extra_lse`` [B, h] add one more shard (the
+    DSPARK verify window merged as the (N+1)-th shard). Returns [B*h, D] in the
+    shard dtype, plus the merged LSE [B*h] float32 with ``return_lse``.
+    Accumulation is float32 regardless of the shard dtype.
+    """
+    n, b, h, d = outs.shape
+    assert outs.stride(3) == 1, "shard outputs need a contiguous head dim"
+    lses = lses.float()
+    n_rows = b * h
+    merged = outs.new_empty((n_rows, d))
+    merged_lse = torch.empty(
+        n_rows if return_lse else 0, dtype=torch.float32, device=outs.device
+    )
+    has_extra = extra_out is not None
+    if has_extra:
+        assert extra_out.stride(2) == 1, "the extra shard needs a contiguous head dim"
+        extra_lse = extra_lse.float()
+    _lse_combine_kernel[(row_grid(n_rows),)](
+        merged,
+        merged_lse if return_lse else lses,
+        outs,
+        lses,
+        extra_out if has_extra else outs,
+        extra_lse if has_extra else lses,
+        outs.stride(0),
+        outs.stride(1),
+        outs.stride(2),
+        lses.stride(0),
+        lses.stride(1),
+        lses.stride(2),
+        extra_out.stride(0) if has_extra else 0,
+        extra_out.stride(1) if has_extra else 0,
+        extra_lse.stride(0) if has_extra else 0,
+        extra_lse.stride(1) if has_extra else 0,
+        n_rows,
+        h,
+        n,
+        D=d,
+        BLOCK_D=triton.next_power_of_2(d),
+        HAS_EXTRA=has_extra,
+        RETURN_LSE=return_lse,
+    )
+    if return_lse:
+        return merged, merged_lse
+    return merged
+
+
+def dcp_exchange_a2a_triton(out: torch.Tensor, lse: torch.Tensor, group):
+    """Packed A2A exchange with the Triton pack kernel.
+
+    out [B, N*h, D] + lse [B, N*h] -> ([N, B, h, D], [N, B, h] float32), views
+    into the received buffer (the LSE is read back through its float32 view).
+    """
+    n = group.world_size
+    d = out.shape[-1]
+    cols = _lse_pack_cols(out.dtype)
+    send = dcp_pack_send(out, lse, n)
+    recv = torch.empty_like(send)
+    group.all_to_all_single(recv.view(-1), send.view(-1))
+    return recv[..., :d], recv.view(torch.float32)[..., d // cols]
+
+
+def dcp_merge_a2a_triton(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    return_lse: bool = False,
+    merge_fp32: bool = False,
+):
+    """A2A merge with the Triton pack + combine kernels: out [B, N*h, D],
+    lse [B, N*h] natural log -> [B, h, D] (with ``return_lse`` also the merged
+    LSE [B, h] float32).
+
+    ``merge_fp32`` is accepted for signature parity and ignored: the combine
+    kernel always accumulates in float32 and casts once on the way out.
+    """
+    b, heads, d = out.shape
+    h = heads // group.world_size
+    recv_out, recv_lse = dcp_exchange_a2a_triton(out, lse, group)
+    merged = lse_combine_shards(recv_out, recv_lse, return_lse=return_lse)
+    if return_lse:
+        merged, merged_lse = merged
+        return merged.view(b, h, d), merged_lse.view(b, h)
+    return merged.view(b, h, d)
