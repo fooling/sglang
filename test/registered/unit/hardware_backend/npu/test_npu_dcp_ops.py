@@ -1286,6 +1286,8 @@ class TestNpuMlaPoolDcpHelpers(CustomTestCase):
         pool.kv_lora_rank = self.D_C
         pool.qk_rope_head_dim = self.D_R
         pool.kv_cache_dim, pool.kr_cache_dim = self.D_C, self.D_R
+        # The base's _get_cpu_offload_layer_buffers reads this.
+        pool.dsa_kv_cache_store_fp8 = False
         pool.cpu_offloading_chunk_size = 3
         shape = (self.LAYERS, pages + 1, self.P, 1)
         pool.k_buffer = torch.zeros(*shape, self.D_C)
