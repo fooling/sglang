@@ -2370,5 +2370,44 @@ class TestDsparkWithoutDcp(CustomTestCase):
             m.attn_mqa_for_dcp_decode.assert_not_called()
 
 
+class TestMergeShardsShapeContract(CustomTestCase):
+    """Every merge implementation returns the documented [B*h, D] rows (and
+    the [B*h] LSE), with and without the extra shard.
+
+    Nothing pinned this before, and the same contract going unpinned in the
+    op-bench reference cost a device round trip: its npu leg returned the
+    flattened rows while its torch mirror kept [B, h, D], so stacking the two
+    worked on a host and failed on a card with "aclnnStack ... dimnum of
+    tensor 1 is [3], should be equal to tensor 0 [2]". Here the three legs
+    agree by construction; this is what keeps them agreeing.
+    """
+
+    N, B, H, D = 4, 3, 2, 8
+
+    def test_every_impl_returns_the_same_rows(self):
+        torch.manual_seed(0)
+        outs = torch.randn(self.N, self.B, self.H, self.D)
+        lses = torch.randn(self.N, self.B, self.H)
+        extra = dict(
+            extra_out=torch.randn(self.B, self.H, self.D),
+            extra_lse=torch.randn(self.B, self.H),
+        )
+        rows = self.B * self.H
+        for label, kwargs in (("plain", {}), ("with the extra shard", extra)):
+            merged = {}
+            with patch.object(
+                dcp_ops, "_attention_update_op", attention_update_reference
+            ):
+                for impl in ("npu", "torch"):
+                    out, lse = dcp_ops.dcp_merge_shards(
+                        outs, lses, impl, return_lse=True, **kwargs
+                    )
+                    self.assertEqual(tuple(out.shape), (rows, self.D), (impl, label))
+                    self.assertEqual(tuple(lse.shape), (rows,), (impl, label))
+                    merged[impl] = out
+            err = (merged["npu"] - merged["torch"]).abs().max().item()
+            self.assertLess(err, 1e-5, (label, err))
+
+
 if __name__ == "__main__":
     unittest.main()
