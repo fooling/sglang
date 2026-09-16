@@ -16,6 +16,15 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.dsa_attn_a2a import (
+    DsaA2APlan,
+    gather_attn_out,
+    local_seq_metadata_general,
+    local_seq_metadata_uniform,
+    local_sparse_indices,
+    make_dsa_a2a_plan,
+    scatter_query,
+)
 from sglang.srt.hardware_backend.npu.attention.fp8_contracts import (
     DSA_KV_QUANT_TILE_SIZE,
     get_dsa_fp8_packed_cache_dim,
@@ -32,11 +41,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import (
-    get_flags,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -390,14 +395,29 @@ class AscendAttnBackend(AttentionBackend):
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
         self.q_head_num_padding = None
+        # same rounding for the full head set, used when the query has been
+        # exchanged over the attention-TP domain
+        self.q_head_num_padding_full = None
+        self.num_attention_heads_full = None
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self._dsa_a2a_q_cumsum_cache = {}
+        # read once: forward_sparse runs per layer and EnvField.get() hits
+        # os.environ every call
+        self.dsa_attn_a2a_enabled = envs.SGLANG_NPU_DSA_ATTN_A2A.get()
+        self.dsa_attn_a2a_ragged = envs.SGLANG_NPU_DSA_ATTN_A2A_RAGGED.get()
         if hasattr(model_runner.model_config, "num_attention_heads") and self.use_mla:
+            self.num_attention_heads_full = model_runner.model_config.num_attention_heads
             self.tp_q_head_num = (
-                model_runner.model_config.num_attention_heads
-                // get_parallel().attn_tp_size
+                model_runner.model_config.num_attention_heads // self.attn_tp_size
             )
             for num in self.padding_size_list:
                 if num >= self.tp_q_head_num:
                     self.q_head_num_padding = num
+                    break
+            for num in self.padding_size_list:
+                if num >= model_runner.model_config.num_attention_heads:
+                    self.q_head_num_padding_full = num
                     break
 
         # dllm model config
@@ -1196,6 +1216,252 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _dsa_sparse_attn(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: Optional[torch.Tensor],
+        sparse_indices: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        block_table: torch.Tensor,
+        layer: RadixAttention,
+        head_num_padding: Optional[int],
+        query_packed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """One DSA sparse attention call.
+
+        The packed-FP8 KV contract and the q head padding live here so the
+        plain and the attention-TP all-to-all path share them.  ``query_packed``
+        is the already concatenated [T, H, nope + rope] query when the caller
+        has one (the all-to-all path moves it as a single buffer).
+        """
+        device = q_nope.device
+        seq_q = actual_seq_lengths_query.to(device=device, dtype=torch.int32)
+        seq_kv = actual_seq_lengths_kv.to(device=device, dtype=torch.int32)
+
+        if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_nope.contiguous(),
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_pe.contiguous(),
+                key_rope=k_pe,
+                sparse_indices=sparse_indices,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=seq_q,
+                actual_seq_lengths_kv=seq_kv,
+                block_table=block_table,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+            return attn_out
+
+        if q_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "Packed FP8 DSA sparse attention requires BF16 q_nope "
+                f"and q_rope, got {q_nope.dtype} and {q_pe.dtype}."
+            )
+        packed_cache_dim = get_dsa_fp8_packed_cache_dim(
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        if k_nope.shape[-1] != packed_cache_dim:
+            raise RuntimeError(
+                f"Unexpected packed DSA KV width {k_nope.shape[-1]}, "
+                f"expected {packed_cache_dim}."
+            )
+        if k_nope.dtype == torch.uint8:
+            k_nope = k_nope.view(torch.float8_e4m3fn)
+        if k_nope.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"Unexpected packed DSA KV dtype {k_nope.dtype}, "
+                f"expected {torch.float8_e4m3fn}."
+            )
+
+        query = (
+            query_packed
+            if query_packed is not None
+            else torch.cat((q_nope, q_pe), dim=-1)
+        )
+        orig_num_heads = query.shape[1]
+        if head_num_padding is not None and head_num_padding > orig_num_heads:
+            query = torch.nn.functional.pad(
+                query, (0, 0, 0, head_num_padding - orig_num_heads)
+            )
+
+        attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=query.contiguous(),
+            key=k_nope.view(-1, self.page_size, 1, packed_cache_dim),
+            value=k_nope.view(-1, self.page_size, 1, packed_cache_dim),
+            sparse_indices=sparse_indices,
+            scale_value=layer.scaling,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            key_dequant_scale=None,
+            value_dequant_scale=None,
+            actual_seq_lengths_query=seq_q,
+            actual_seq_lengths_kv=seq_kv,
+            block_table=block_table,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=DSA_KV_QUANT_TILE_SIZE,
+            rope_head_dim=self.qk_rope_head_dim,
+        )
+        if head_num_padding is not None and head_num_padding > orig_num_heads:
+            attn_out = attn_out[:, :orig_num_heads, :]
+        return attn_out
+
+    def _plan_dsa_attn_a2a(
+        self,
+        num_tokens: int,
+        num_batches: int,
+        num_heads: int,
+        forward_batch: ForwardBatch,
+    ) -> Optional[DsaA2APlan]:
+        """Decide whether to exchange the query over the attention-TP domain.
+
+        Every rank in the domain sees the same token count, batch count, head
+        count and forward mode, so every rank reaches the same decision --
+        required, since the exchange is a collective inside the captured decode
+        graph.
+        """
+        if (
+            self.attn_tp_size <= 1
+            or num_batches <= 0
+            or not self.dsa_attn_a2a_enabled
+        ):
+            return None
+
+        # below one token per rank the exchange cannot win: ranks past the last
+        # token sit idle while the rest do the same token-head work they already
+        # did, and the two collectives are pure overhead
+        if num_tokens < self.attn_tp_size:
+            return None
+
+        # the exchange reassembles the full head set out of attn_tp shards, so
+        # the query must be exactly this rank's attn-TP shard. A second head
+        # split on top of it (the decode CP attention-TP context re-shards by
+        # decode_tp_size) would reassemble a strided subset instead: correct,
+        # but it would then be padded back up to the full head count and throw
+        # the extra flops away. Leave those configurations on the plain path.
+        if (
+            self.num_attention_heads_full is None
+            or num_heads * self.attn_tp_size != self.num_attention_heads_full
+        ):
+            return None
+
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify() or mode.is_draft_extend_v2():
+            tokens_per_batch = int(self.speculative_num_draft_tokens or 0)
+        elif mode.is_extend():
+            tokens_per_batch = 0  # ragged: the token window cuts sequences
+        else:
+            tokens_per_batch = 1  # decode / idle: one query token per batch
+
+        if tokens_per_batch and (
+            num_tokens % tokens_per_batch
+            or num_tokens // tokens_per_batch < num_batches
+        ):
+            # not the layout we assumed; fall back to the ragged transform.
+            # A token axis longer than the batches (DP attention pads the query
+            # to the global max while the metadata stays local) is expected and
+            # stays on the uniform path -- the surplus slots become padding.
+            tokens_per_batch = 0
+        if tokens_per_batch == 0 and not self.dsa_attn_a2a_ragged:
+            return None
+
+        return make_dsa_a2a_plan(
+            num_tokens=num_tokens,
+            num_batches=num_batches,
+            tp_size=self.attn_tp_size,
+            tp_rank=self.attn_tp_rank,
+            tokens_per_batch=tokens_per_batch,
+        )
+
+    def _dsa_a2a_query_cumsum(
+        self, plan: DsaA2APlan, device: torch.device
+    ) -> torch.Tensor:
+        """Cached per-shape constant ``(u, 2u, ..., B/tp * u)``.
+
+        Constant for a given plan shape, so it is built once and reused: graph
+        capture needs a stable address and no allocation on replay.
+        """
+        key = (plan.batches_per_rank, plan.tokens_per_batch, str(device))
+        cached = self._dsa_a2a_q_cumsum_cache.get(key)
+        if cached is None:
+            u = plan.tokens_per_batch
+            cached = torch.arange(
+                u, plan.batches_per_rank * u + 1, u, dtype=torch.int32, device=device
+            )
+            self._dsa_a2a_q_cumsum_cache[key] = cached
+        return cached
+
+    def _dsa_sparse_attn_a2a(
+        self,
+        plan: DsaA2APlan,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: Optional[torch.Tensor],
+        sparse_indices: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        """Sparse attention with the query exchanged over the attention-TP domain.
+
+        [T, H/tp, D] -> [T/tp, H, D] -> one sparse attention call -> back.  KV is
+        untouched: it is multi-query and every rank holds the whole cache.
+        """
+        group = get_parallel().attn_tp_group
+        nope_dim = q_nope.shape[-1]
+
+        query = scatter_query(
+            torch.cat((q_nope, q_pe), dim=-1), plan, group
+        )  # [T_pad/tp, H, nope + rope]
+        local_indices = local_sparse_indices(sparse_indices, plan)
+
+        if plan.uniform:
+            seq_q, seq_kv, block_table = local_seq_metadata_uniform(
+                plan,
+                actual_seq_lengths_kv,
+                self.forward_metadata.block_tables,
+                self._dsa_a2a_query_cumsum(plan, q_nope.device),
+            )
+        else:
+            seq_q, seq_kv, block_table = local_seq_metadata_general(
+                plan,
+                actual_seq_lengths_query,
+                actual_seq_lengths_kv,
+                self.forward_metadata.block_tables,
+                device=q_nope.device,
+            )
+
+        attn_out = self._dsa_sparse_attn(
+            query[..., :nope_dim],
+            query[..., nope_dim:],
+            k_nope,
+            k_pe,
+            local_indices,
+            seq_q,
+            seq_kv,
+            block_table,
+            layer,
+            self.q_head_num_padding_full,
+            query_packed=query,
+        )
+        return gather_attn_out(attn_out, plan, group)
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1279,125 +1545,36 @@ class AscendAttnBackend(AttentionBackend):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-                if q_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
-                    raise RuntimeError(
-                        "Packed FP8 DSA sparse attention requires BF16 q_nope "
-                        f"and q_rope, got {q_nope.dtype} and {q_pe.dtype}."
-                    )
-                packed_cache_dim = get_dsa_fp8_packed_cache_dim(
-                    kv_lora_rank=self.kv_lora_rank,
-                    qk_rope_head_dim=self.qk_rope_head_dim,
+            plan = self._plan_dsa_attn_a2a(
+                num_tokens=q_nope.shape[0],
+                num_batches=actual_seq_qlen.shape[0],
+                num_heads=q_nope.shape[1],
+                forward_batch=forward_batch,
+            )
+            if plan is None:
+                attn_out = self._dsa_sparse_attn(
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    topk_indices,
+                    actual_seq_qlen,
+                    actual_seq_lengths_kv,
+                    self.forward_metadata.block_tables,
+                    layer,
+                    self.q_head_num_padding,
                 )
-                if k_nope.shape[-1] != packed_cache_dim:
-                    raise RuntimeError(
-                        f"Unexpected packed DSA KV width {k_nope.shape[-1]}, "
-                        f"expected {packed_cache_dim}."
-                    )
-                if k_nope.dtype == torch.uint8:
-                    k_nope = k_nope.view(torch.float8_e4m3fn)
-                if k_nope.dtype != torch.float8_e4m3fn:
-                    raise RuntimeError(
-                        f"Unexpected packed DSA KV dtype {k_nope.dtype}, "
-                        f"expected {torch.float8_e4m3fn}."
-                    )
-
-                orig_num_heads = q_nope.shape[1]
-                if (
-                    self.q_head_num_padding is not None
-                    and self.q_head_num_padding > orig_num_heads
-                ):
-                    pad_size = self.q_head_num_padding - orig_num_heads
-                    q_nope = torch.cat(
-                        [
-                            q_nope,
-                            torch.zeros(
-                                q_nope.shape[0],
-                                pad_size,
-                                q_nope.shape[2],
-                                dtype=q_nope.dtype,
-                                device=q_nope.device,
-                            ),
-                        ],
-                        dim=1,
-                    ).contiguous()
-                    q_pe = torch.cat(
-                        [
-                            q_pe,
-                            torch.zeros(
-                                q_pe.shape[0],
-                                pad_size,
-                                q_pe.shape[2],
-                                dtype=q_pe.dtype,
-                                device=q_pe.device,
-                            ),
-                        ],
-                        dim=1,
-                    ).contiguous()
-
-                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
-                    query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-                    key=k_nope.view(
-                        -1,
-                        self.page_size,
-                        1,
-                        packed_cache_dim,
-                    ),
-                    value=k_nope.view(
-                        -1,
-                        self.page_size,
-                        1,
-                        packed_cache_dim,
-                    ),
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    key_quant_mode=2,
-                    value_quant_mode=2,
-                    key_dequant_scale=None,
-                    value_dequant_scale=None,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device,
-                        dtype=torch.int32,
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device,
-                        dtype=torch.int32,
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    quant_scale_repo_mode=1,
-                    tile_size=DSA_KV_QUANT_TILE_SIZE,
-                    rope_head_dim=self.qk_rope_head_dim,
-                )
-
-                if self.q_head_num_padding is not None and self.q_head_num_padding > orig_num_heads:
-                    attn_out = attn_out[:, :orig_num_heads, :]
             else:
-                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
-                    query=q_nope,
-                    key=k_nope,
-                    value=k_nope,
-                    query_rope=q_pe,
-                    key_rope=k_pe,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    return_softmax_lse=False,
+                attn_out = self._dsa_sparse_attn_a2a(
+                    plan,
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    topk_indices,
+                    actual_seq_qlen,
+                    actual_seq_lengths_kv,
+                    layer,
                 )
 
         return attn_out

@@ -902,6 +902,17 @@ class Envs:
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
     )
+    # Exchange the DSA sparse-attention query over the attention-TP domain:
+    # [T, q_heads/attn_tp, D] -> [T/attn_tp, q_heads, D]. The DSA KV is
+    # multi-query and replicated on every rank, so without this each rank
+    # gathers the same topk KV entries for every token while computing only
+    # 1/attn_tp of the heads.
+    SGLANG_NPU_DSA_ATTN_A2A = EnvBool(False)
+    # Also exchange when the token window cuts sequences (extend / prefill),
+    # which leaves the op with zero-length query segments for the batches
+    # outside the window. Turn off to keep the exchange on decode-shaped
+    # batches only.
+    SGLANG_NPU_DSA_ATTN_A2A_RAGGED = EnvBool(True)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
