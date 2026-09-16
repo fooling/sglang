@@ -34,10 +34,13 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.hardware_backend.npu.dcp.ops import (
     DCP_MERGE_IMPLS,
+    DCP_SPLIT_MERGE_IMPLS,
+    dcp_a2a_exchange,
     dcp_block_tables,
     dcp_gather_chunk_rows,
     dcp_local_seq_lens,
     dcp_merge,
+    dcp_merge_shards,
     dcp_prefix_chunk_plan,
     dcp_verify_history_local_lens,
     mla_decode_with_lse_torch,
@@ -531,6 +534,21 @@ class AscendAttnBackend(AttentionBackend):
                 raise ValueError(
                     "SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS must be positive, got "
                     f"{self.dcp_prefix_chunk_tokens}."
+                )
+            # Target verify: merge the current window as the (N+1)-th shard of
+            # the cross-rank merge (one merge instead of two).
+            self.dcp_verify_fused_merge = (
+                envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get()
+            )
+            if self.dcp_verify_fused_merge and (
+                self.dcp_comm_backend != "a2a"
+                or self.dcp_merge_impl not in DCP_SPLIT_MERGE_IMPLS
+            ):
+                raise ValueError(
+                    "SGLANG_NPU_DCP_VERIFY_FUSED_MERGE needs the 'a2a' DCP comm "
+                    f"backend (got {self.dcp_comm_backend!r}) and a merge "
+                    f"implementation in {DCP_SPLIT_MERGE_IMPLS} (got "
+                    f"{self.dcp_merge_impl!r})."
                 )
 
         # SGLANG_NPU_USE_FIAS_V2_BSND asks for the FlashMLA custom op on MLA
@@ -3188,6 +3206,13 @@ class AscendAttnBackend(AttentionBackend):
             merge_fp32=self.dcp_merge_fp32,
         )
 
+    def _dcp_exchange(self, out: torch.Tensor, lse: torch.Tensor):
+        """The a2a of the cross-rank merge without the merge: [T, H * dcp, D] +
+        natural-log LSE -> ([dcp, T, H, D], [dcp, T, H] float32)."""
+        return dcp_a2a_exchange(
+            out, lse, get_parallel().dcp_group, self.dcp_merge_impl
+        )
+
     def _forward_verify_mla_dcp(
         self,
         q: torch.Tensor,
@@ -3338,12 +3363,17 @@ class AscendAttnBackend(AttentionBackend):
             workspace=workspace,
             out=[hist_out, hist_lse],
         )
-        # [T, H * dcp, D] -> ([T, H, D], [T, H] float32 natural log)
-        hist_out, hist_lse = self._dcp_merge(
-            hist_out[:, :num_heads],
-            self._dcp_natural_lse(hist_lse.view(num_tokens, hist_heads)[:, :num_heads]),
-            return_lse=True,
+        hist_out = hist_out[:, :num_heads]
+        hist_lse = self._dcp_natural_lse(
+            hist_lse.view(num_tokens, hist_heads)[:, :num_heads]
         )
+        if self.dcp_verify_fused_merge:
+            # Exchange only: the received shards are merged below together with
+            # the current window, in one pass over dcp + 1 shards.
+            shard_out, shard_lse = self._dcp_exchange(hist_out, hist_lse)
+        else:
+            # [T, H * dcp, D] -> ([T, H, D], [T, H] float32 natural log)
+            hist_out, hist_lse = self._dcp_merge(hist_out, hist_lse, return_lse=True)
 
         return self._dcp_verify_current_and_merge(
             q_nope, q_rope, k_nope, k_rope, layer, w, bs, hist_out, hist_lse
@@ -3407,17 +3437,29 @@ class AscendAttnBackend(AttentionBackend):
             cur_lse.reshape(num_tokens, cur_heads)[:, :local_heads]
         )
 
-        # 3. local merge (no collective): the history part already covers
-        # every rank's shard, the current window is counted once here. Both
-        # outputs are finite (history invalid shards were zeroed by the
-        # cross-rank merge, the window always attends to itself), so only the
-        # LSEs are sanitised.
-        merged = npu_attention_update(
-            [hist_lse, cur_lse],
-            [hist_out, cur_out],
-            merge_fp32=self.dcp_merge_fp32,
-            mask_out=False,
-        )
+        # 3. merge. The history part covers every rank's KV shard, the current
+        # window is counted once. With SGLANG_NPU_DCP_VERIFY_FUSED_MERGE the
+        # window goes in as the (dcp + 1)-th shard of the exchanged history
+        # shards, so there is one merge and no intermediate LSE; otherwise the
+        # cross-rank result and the window are merged locally. Either way the
+        # outputs are finite (invalid history shards are zeroed by the merge,
+        # the window always attends to itself), so only the LSEs are sanitised.
+        if self.dcp_verify_fused_merge:
+            merged = dcp_merge_shards(
+                shard_out,
+                shard_lse,
+                self.dcp_merge_impl,
+                extra_out=cur_out,
+                extra_lse=cur_lse,
+                merge_fp32=self.dcp_merge_fp32,
+            )
+        else:
+            merged = npu_attention_update(
+                [hist_lse, cur_lse],
+                [hist_out, cur_out],
+                merge_fp32=self.dcp_merge_fp32,
+                mask_out=False,
+            )
         return merged.view(num_tokens, local_heads * d_c)
 
     def _dcp_decode_fia(
