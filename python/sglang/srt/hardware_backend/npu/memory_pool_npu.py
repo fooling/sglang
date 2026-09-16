@@ -578,6 +578,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # write into the NZ-addressed view below so ordinary MLA (including
         # Kimi-K3 MTP) can use FIA NZ without MLAPO.
         self.use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ")
+        # One Triton-Ascend kernel for the DCP owner filter + both cache writes.
+        self.use_triton_dcp_kv_store = envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get()
         super(MLATokenToKVPool, self).__init__(
             size=size,
             page_size=page_size,
@@ -824,6 +826,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         parallel = get_parallel()
+        if (
+            parallel.dcp_enabled
+            and self.use_triton_dcp_kv_store
+            and not self.dsa_kv_cache_store_fp8
+            and not self.use_fia_nz
+        ):
+            self._set_dcp_kv_buffer_triton(
+                layer_id,
+                loc,
+                cache_k,
+                cache_v,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+            )
+            return
         if parallel.dcp_enabled:
             # Virtual loc -> this rank's physical slot; tokens owned by other
             # DCP ranks are written to the reserved slot 0 (static shape).
@@ -874,6 +891,46 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ),
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
+        )
+
+    def _set_dcp_kv_buffer_triton(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        dcp_size: int,
+        dcp_rank: int,
+    ) -> None:
+        """Owner filter + both MLA cache writes in one Triton-Ascend kernel.
+
+        ``loc`` stays in virtual (pre-shard) space: the kernel keeps the tokens
+        with ``loc % dcp_size == dcp_rank``, writes them to ``loc // dcp_size``,
+        and stores nothing for the rest -- so unlike the torch path there is no
+        dummy write to the reserved slot 0.
+        """
+        from sglang.srt.hardware_backend.npu.triton_ops.kv_store import (
+            dcp_store_mla_kv,
+        )
+
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+        dcp_store_mla_kv(
+            self.k_buffer[layer_id - self.start_layer].view(-1, self.kv_lora_rank),
+            self.v_buffer[layer_id - self.start_layer].view(-1, self.qk_rope_head_dim),
+            cache_k,
+            cache_v,
+            loc,
+            dcp_size,
+            dcp_rank,
         )
 
     def _set_fia_nz_kv_buffer(

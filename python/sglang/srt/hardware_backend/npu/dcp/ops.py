@@ -12,7 +12,7 @@ that communicate take a ``GroupCoordinator``-like ``group`` argument.
 """
 
 import math
-from typing import List, NamedTuple, Sequence, Union
+from typing import List, NamedTuple, Optional, Sequence, Union
 
 import torch
 
@@ -332,13 +332,17 @@ def npu_attention_update_stacked(
     outs: torch.Tensor,
     return_lse: bool = False,
     merge_fp32: bool = False,
+    extra_lse: Optional[torch.Tensor] = None,
+    extra_out: Optional[torch.Tensor] = None,
 ):
     """``npu_attention_update`` over stacked shards: lses [N, *S], outs [N, *S, D]
     -> [prod(S), D] (and lse [prod(S)] with ``return_lse``).
 
-    The sanitising is vectorised over the shard axis (isfinite + two where
-    for all N shards, instead of per-shard ops), then the op gets the N
-    unbound rows.
+    The sanitising is vectorised over the shard axis (isfinite + two where for
+    all N shards), then the op gets the N unbound rows. ``extra_lse`` [*S] /
+    ``extra_out`` [*S, D] add one more shard (the DSPARK verify window merged
+    as the (N+1)-th shard); like the ``mask_out=False`` callers, its outputs go
+    in unmasked, so they must be finite.
     """
     n, d = outs.shape[0], outs.shape[-1]
     if merge_fp32:
@@ -347,9 +351,18 @@ def npu_attention_update_stacked(
     lses = torch.where(valid, lses.float(), _INVALID_LSE).view(n, -1)
     outs = torch.where(valid.unsqueeze(-1), outs, 0.0).view(n, -1, d)
     any_valid = valid.any(dim=0).view(-1) if return_lse else None
-    return _attention_update_call(
-        list(lses.unbind(0)), list(outs.unbind(0)), return_lse, any_valid
-    )
+    lse_list, out_list = list(lses.unbind(0)), list(outs.unbind(0))
+    if extra_out is not None:
+        extra_valid = torch.isfinite(extra_lse)
+        if return_lse:
+            any_valid = any_valid | extra_valid.reshape(-1)
+        lse_list.append(
+            torch.where(extra_valid, extra_lse.float(), _INVALID_LSE).reshape(-1)
+        )
+        out_list.append(
+            (extra_out.float() if merge_fp32 else extra_out).reshape(-1, d)
+        )
+    return _attention_update_call(lse_list, out_list, return_lse, any_valid)
 
 
 def dcp_merge_a2a_vllm(
@@ -431,6 +444,118 @@ def dcp_merge_a2a_npu(
     return merged.view(b, h, d).to(out_dtype)
 
 
+def dcp_merge_a2a_triton(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group,
+    base_e: bool = True,
+    return_lse: bool = False,
+    merge_fp32: bool = False,
+):
+    """A2A merge with the Triton-Ascend pack + combine kernels: out [B, N*h, D],
+    lse [B, N*h] -> [B, h, D] (with ``return_lse`` also the merged natural-log
+    LSE [B, h] float32).
+
+    Same exchange as ``dcp_merge_a2a_npu`` (payload in the model dtype, fp32
+    LSE packed as trailing columns); the pack copies and the sanitise +
+    ``npu_attention_update`` sequence are each replaced by one kernel.
+    ``merge_fp32`` is accepted for signature parity and ignored: the combine
+    kernel always accumulates in float32 and casts once on the way out.
+    """
+    n = group.world_size
+    if n == 1:
+        return (out, _natural_lse(lse, base_e)) if return_lse else out
+    from sglang.srt.hardware_backend.npu.triton_ops.dcp_merge import (
+        dcp_exchange_a2a_triton,
+        lse_combine_shards,
+    )
+
+    out_dtype = out.dtype
+    b, heads, d = out.shape
+    h = heads // n
+    recv_out, recv_lse = dcp_exchange_a2a_triton(out, lse, group)
+    if not base_e:
+        recv_lse = recv_lse * math.log(2.0)
+    merged = lse_combine_shards(recv_out, recv_lse, return_lse=return_lse)
+    if return_lse:
+        merged, merged_lse = merged
+        return merged.view(b, h, d).to(out_dtype), merged_lse.view(b, h)
+    return merged.view(b, h, d).to(out_dtype)
+
+
+# Merge implementations whose a2a exchange can be split from the merge, so a
+# caller can add a local shard to the received ones
+# (SGLANG_NPU_DCP_VERIFY_FUSED_MERGE): "vllm" packs a different wire layout and
+# ag_rs has no per-shard exchange to split from.
+DCP_SPLIT_MERGE_IMPLS = ("npu", "torch", "triton")
+
+
+def dcp_a2a_exchange(out: torch.Tensor, lse: torch.Tensor, group, merge_impl: str):
+    """The packed a2a of an A2A merge, without the merge itself.
+
+    out [B, N*h, D] + lse [B, N*h] (natural log or base-2, matching the
+    caller's LSE base -- packing does not touch the LSE units) -> ([N, B, h,
+    D], [N, B, h] float32): every DCP rank's partial for the heads this rank
+    keeps.
+    """
+    if merge_impl == "triton":
+        from sglang.srt.hardware_backend.npu.triton_ops.dcp_merge import (
+            dcp_exchange_a2a_triton,
+        )
+
+        return dcp_exchange_a2a_triton(out, lse, group)
+    return _dcp_a2a_packed_exchange(out, lse, group)
+
+
+def dcp_merge_shards(
+    outs: torch.Tensor,
+    lses: torch.Tensor,
+    merge_impl: str,
+    extra_out: Optional[torch.Tensor] = None,
+    extra_lse: Optional[torch.Tensor] = None,
+    base_e: bool = True,
+    return_lse: bool = False,
+    merge_fp32: bool = False,
+):
+    """Merge already-exchanged shards: outs [N, B, h, D], lses [N, B, h] in
+    ``base_e`` units -> [B * h, D] (and the merged LSE [B * h] float32 with
+    ``return_lse``).
+
+    ``extra_out`` [B, h, D] / ``extra_lse`` [B, h] are merged as one more
+    shard in the same pass, which is how the DSPARK verify window is folded
+    in instead of running a second merge over the cross-rank result;
+    ``extra_lse`` must already be a natural log (as the local verify-window
+    LSE always is by the time it reaches this call).
+    """
+    if not base_e:
+        lses = lses * math.log(2.0)
+    if merge_impl == "triton":
+        from sglang.srt.hardware_backend.npu.triton_ops.dcp_merge import (
+            lse_combine_shards,
+        )
+
+        return lse_combine_shards(
+            outs, lses, extra_out, extra_lse, return_lse=return_lse
+        )
+    if merge_impl == "torch":
+        if extra_out is not None:
+            outs = torch.cat([outs, extra_out.unsqueeze(0)], dim=0)
+            lses = torch.cat([lses, extra_lse.unsqueeze(0)], dim=0)
+        n, d = outs.shape[0], outs.shape[-1]
+        merged = lse_combine(outs.reshape(n, -1, d), lses.reshape(n, -1))
+        if not return_lse:
+            return merged
+        return merged, lse_logsumexp_valid(lses.reshape(n, -1))
+    return npu_attention_update_stacked(
+        lses,
+        outs,
+        return_lse=return_lse,
+        merge_fp32=merge_fp32,
+        extra_lse=extra_lse,
+        extra_out=extra_out,
+    )
+
+
 def dcp_merge_ag_rs(
     out: torch.Tensor,
     lse: torch.Tensor,
@@ -482,18 +607,25 @@ def dcp_merge_with_lse(
 
     out [B, N*h, D], lse [B, N*h] -> (out [B, h, D], lse [B, h] float32 natural
     log, -inf where no rank holds KV). ``comm_backend`` 'a2a' selects by
-    ``merge_impl`` ('npu' / 'vllm' / 'torch', as SGLANG_NPU_DCP_MERGE_IMPL);
-    anything else uses AG+RS. ``merge_fp32`` only affects 'npu'.
+    ``merge_impl`` ('npu' / 'vllm' / 'torch' / 'triton', as
+    SGLANG_NPU_DCP_MERGE_IMPL); anything else uses AG+RS. ``merge_fp32`` only
+    affects 'npu' and is ignored by 'triton' (which always accumulates in
+    float32).
     """
     if comm_backend == "a2a":
-        merges = dict(npu=dcp_merge_a2a_npu, vllm=dcp_merge_a2a_vllm, torch=dcp_merge_a2a)
+        merges = dict(
+            npu=dcp_merge_a2a_npu,
+            vllm=dcp_merge_a2a_vllm,
+            torch=dcp_merge_a2a,
+            triton=dcp_merge_a2a_triton,
+        )
         if merge_impl not in merges:
             raise ValueError(
-                "SGLANG_NPU_DCP_MERGE_IMPL must be 'npu', 'vllm' or 'torch', "
-                f"got {merge_impl!r}."
+                "SGLANG_NPU_DCP_MERGE_IMPL must be 'npu', 'vllm', 'torch' or "
+                f"'triton', got {merge_impl!r}."
             )
-        if merge_impl == "npu":
-            return merges["npu"](
+        if merge_impl in ("npu", "triton"):
+            return merges[merge_impl](
                 out, lse, group, base_e=base_e, return_lse=True, merge_fp32=merge_fp32
             )
         merge = merges[merge_impl]

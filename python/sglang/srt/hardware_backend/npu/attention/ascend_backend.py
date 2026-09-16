@@ -27,9 +27,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.dcp.ops import (
+    DCP_SPLIT_MERGE_IMPLS,
+    dcp_a2a_exchange,
     dcp_block_tables,
     dcp_gather_chunk_rows,
     dcp_local_seq_lens,
+    dcp_merge_shards,
     dcp_merge_with_lse,
     dcp_prefix_chunk_plan,
     dcp_verify_history_local_lens,
@@ -454,6 +457,21 @@ class AscendAttnBackend(AttentionBackend):
                 raise ValueError(
                     "SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS must be positive, got "
                     f"{self.dcp_prefix_chunk_tokens}."
+                )
+            # Target verify: merge the current window as the (N+1)-th shard of
+            # the cross-rank merge (one merge instead of two).
+            self.dcp_verify_fused_merge = (
+                envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get()
+            )
+            if self.dcp_verify_fused_merge and (
+                get_parallel().dcp_comm_backend != "a2a"
+                or envs.SGLANG_NPU_DCP_MERGE_IMPL.get() not in DCP_SPLIT_MERGE_IMPLS
+            ):
+                raise ValueError(
+                    "SGLANG_NPU_DCP_VERIFY_FUSED_MERGE needs the 'a2a' DCP comm "
+                    f"backend (got {get_parallel().dcp_comm_backend!r}) and a "
+                    f"merge implementation in {DCP_SPLIT_MERGE_IMPLS} (got "
+                    f"{envs.SGLANG_NPU_DCP_MERGE_IMPL.get()!r})."
                 )
             if self.dcp_pad_heads and self.q_head_num_padding is not None:
                 self.dcp_q_head_num_padding = next_power_of_2(
@@ -2920,17 +2938,26 @@ class AscendAttnBackend(AttentionBackend):
         hist_lse = hist_lse.view(num_tokens, hist_heads)[:, :num_heads]
         parallel = get_parallel()
         merge_fp32 = envs.SGLANG_NPU_DCP_MERGE_FP32.get()
-        # [T, H * dcp, D] -> ([T, H, D] model dtype, [T, H] float32 natural log);
-        # the merges pack / cast the padded head slices without a contiguous copy.
-        hist_out, hist_lse = dcp_merge_with_lse(
-            hist_out,
-            hist_lse,
-            parallel.dcp_group,
-            parallel.dcp_comm_backend,
-            envs.SGLANG_NPU_DCP_MERGE_IMPL.get(),
-            base_e=base_e,
-            merge_fp32=merge_fp32,
-        )
+        merge_impl = envs.SGLANG_NPU_DCP_MERGE_IMPL.get()
+        if self.dcp_verify_fused_merge:
+            # Exchange only: the received shards are merged below together
+            # with the current window, in one pass over dcp + 1 shards.
+            shard_out, shard_lse = dcp_a2a_exchange(
+                hist_out, hist_lse, parallel.dcp_group, merge_impl
+            )
+        else:
+            # [T, H * dcp, D] -> ([T, H, D] model dtype, [T, H] float32 natural
+            # log); the merges pack / cast the padded head slices without a
+            # contiguous copy.
+            hist_out, hist_lse = dcp_merge_with_lse(
+                hist_out,
+                hist_lse,
+                parallel.dcp_group,
+                parallel.dcp_comm_backend,
+                merge_impl,
+                base_e=base_e,
+                merge_fp32=merge_fp32,
+            )
 
         # 2. current: this rank's heads x the window's own K/V, causal.
         head_start = self.dcp_rank * local_heads
@@ -2977,17 +3004,31 @@ class AscendAttnBackend(AttentionBackend):
         if not base_e:
             cur_lse = cur_lse * math.log(2.0)
 
-        # 3. local merge (no collective): the history part already covers
-        # every rank's shard, the current window is counted once here. Both
-        # outputs are finite (history invalid shards were zeroed by the
-        # cross-rank merge, the window always attends to itself), so only the
-        # LSEs are sanitised.
-        merged = npu_attention_update(
-            [hist_lse, cur_lse],
-            [hist_out, cur_out],
-            merge_fp32=merge_fp32,
-            mask_out=False,
-        )
+        # 3. merge. The history part covers every rank's KV shard, the current
+        # window is counted once. With SGLANG_NPU_DCP_VERIFY_FUSED_MERGE the
+        # window goes in as the (dcp + 1)-th shard of the exchanged history
+        # shards, so there is one merge and no intermediate LSE; otherwise the
+        # cross-rank result and the window are merged locally. Either way the
+        # outputs are finite (invalid history shards are zeroed by the merge,
+        # the window always attends to itself), so only the LSEs are
+        # sanitised.
+        if self.dcp_verify_fused_merge:
+            merged = dcp_merge_shards(
+                shard_out,
+                shard_lse,
+                merge_impl,
+                extra_out=cur_out,
+                extra_lse=cur_lse,
+                base_e=base_e,
+                merge_fp32=merge_fp32,
+            )
+        else:
+            merged = npu_attention_update(
+                [hist_lse, cur_lse],
+                [hist_out, cur_out],
+                merge_fp32=merge_fp32,
+                mask_out=False,
+            )
         return merged.view(num_tokens, local_heads * d_c)
 
     def _forward_decode_mla_dcp(
