@@ -907,7 +907,7 @@ class Envs:
     # multi-query and replicated on every rank, so without this each rank
     # gathers the same topk KV entries for every token while computing only
     # 1/attn_tp of the heads.
-    SGLANG_NPU_DSA_ATTN_A2A = EnvBool(False)
+    SGLANG_NPU_DSA_ATTN_A2A = EnvBool(True)
     # Also exchange when the token window cuts sequences (extend / prefill),
     # which leaves the op with zero-length query segments for the batches
     # outside the window. Turn off to keep the exchange on decode-shaped
