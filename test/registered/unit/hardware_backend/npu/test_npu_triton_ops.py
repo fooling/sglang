@@ -98,7 +98,11 @@ class TestSplitQkNormGating(CustomTestCase):
         latent = torch.randn(3, 12)
         batch = SimpleNamespace()
         with patch.object(mla_npu, "dsa_use_prefill_cp", return_value=False):
-            self.assertFalse(mla_npu._use_triton_split_qk_norm(m, latent, batch))
+            # On by default on this branch; switching it off restores the
+            # split + two npu_rms_norm path.
+            self.assertTrue(mla_npu._use_triton_split_qk_norm(m, latent, batch))
+            with envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.override(False):
+                self.assertFalse(mla_npu._use_triton_split_qk_norm(m, latent, batch))
             with envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.override(True):
                 self.assertTrue(mla_npu._use_triton_split_qk_norm(m, latent, batch))
                 # A column-major latent has no contiguous reduction dim.
@@ -240,6 +244,131 @@ class TestDcpKvStoreDispatch(CustomTestCase):
             pool._pack_dsa_fp8_kv_cache = MagicMock(return_value=torch.zeros(4, 1, 1))
             self._run(pool, loc, cache_k, cache_v, 0, calls)
             self.assertEqual(calls, [], kwargs)
+
+
+class TestTritonSplitMergeDispatch(CustomTestCase):
+    """``dcp_a2a_exchange`` / ``dcp_merge_shards`` reach the Triton pack and
+    combine kernels when the merge implementation is "triton".
+
+    This is the one switch combination -- SGLANG_NPU_DCP_VERIFY_FUSED_MERGE
+    with SGLANG_NPU_DCP_MERGE_IMPL=triton -- that no numeric case reaches: the
+    target-verify exactness test runs in-process, where triton cannot, so it
+    only covers the npu / torch merges. The kernels' own math is checked by
+    triton_ops_check.py; what is checked here is that the split-merge API
+    hands them the right arguments and passes their results through, with the
+    kernels stubbed by their torch equivalents.
+    """
+
+    N, B, H, D = 4, 3, 2, 8
+
+    def _shards(self):
+        torch.manual_seed(0)
+        outs = torch.randn(self.N, self.B, self.H, self.D)
+        lses = torch.randn(self.N, self.B, self.H)
+        extra_out = torch.randn(self.B, self.H, self.D)
+        extra_lse = torch.randn(self.B, self.H)
+        return outs, lses, extra_out, extra_lse
+
+    @staticmethod
+    def _stub_kernels(calls):
+        """A stand-in triton_ops.dcp_merge with the same contract."""
+        from sglang.srt.hardware_backend.npu.dcp import ops as dcp_ops
+
+        def dcp_exchange_a2a_triton(out, lse, group):
+            calls.append(("exchange", tuple(out.shape), tuple(lse.shape)))
+            return dcp_ops._dcp_a2a_packed_exchange(out, lse, group)
+
+        def lse_combine_shards(
+            outs, lses, extra_out=None, extra_lse=None, return_lse=False
+        ):
+            calls.append(("combine", outs.shape[0], extra_out is not None))
+            return dcp_ops.dcp_merge_shards(
+                outs,
+                lses,
+                "torch",
+                extra_out=extra_out,
+                extra_lse=extra_lse,
+                return_lse=return_lse,
+            )
+
+        module = ModuleType("sglang.srt.hardware_backend.npu.triton_ops.dcp_merge")
+        module.dcp_exchange_a2a_triton = dcp_exchange_a2a_triton
+        module.lse_combine_shards = lse_combine_shards
+        return module
+
+    def test_merge_shards_routes_the_extra_shard_to_the_kernel(self):
+        from sglang.srt.hardware_backend.npu.dcp import ops as dcp_ops
+
+        outs, lses, extra_out, extra_lse = self._shards()
+        calls = []
+        key = "sglang.srt.hardware_backend.npu.triton_ops.dcp_merge"
+        with patch.dict(sys.modules, {key: self._stub_kernels(calls)}):
+            got = dcp_ops.dcp_merge_shards(
+                outs, lses, "triton", extra_out=extra_out, extra_lse=extra_lse
+            )
+        # The kernel is called once, over the N shards, with the extra one.
+        self.assertEqual(calls, [("combine", self.N, True)])
+        want = dcp_ops.dcp_merge_shards(
+            outs, lses, "torch", extra_out=extra_out, extra_lse=extra_lse
+        )
+        self.assertTrue(torch.allclose(got, want, atol=1e-6), (got - want).abs().max())
+
+    def test_the_other_implementations_do_not_import_the_kernels(self):
+        from sglang.srt.hardware_backend.npu.dcp import ops as dcp_ops
+
+        outs, lses, extra_out, extra_lse = self._shards()
+        key = "sglang.srt.hardware_backend.npu.triton_ops.dcp_merge"
+        for impl in ("torch", "npu"):
+            calls = []
+            with patch.dict(
+                sys.modules, {key: self._stub_kernels(calls)}
+            ), patch.object(
+                dcp_ops, "_attention_update_op", _reference_attention_update
+            ):
+                dcp_ops.dcp_merge_shards(
+                    outs, lses, impl, extra_out=extra_out, extra_lse=extra_lse
+                )
+            self.assertEqual(calls, [], impl)
+
+    def test_exchange_routes_to_the_pack_kernel(self):
+        from sglang.srt.hardware_backend.npu.dcp import ops as dcp_ops
+
+        out = torch.randn(self.B, 1 * self.H, self.D, dtype=torch.bfloat16)
+        lse = torch.randn(self.B, 1 * self.H)
+        group = _SingleRankGroup()
+        key = "sglang.srt.hardware_backend.npu.triton_ops.dcp_merge"
+        calls = []
+        with patch.dict(sys.modules, {key: self._stub_kernels(calls)}):
+            recv_out, recv_lse = dcp_ops.dcp_a2a_exchange(out, lse, group, "triton")
+        self.assertEqual(calls, [("exchange", tuple(out.shape), tuple(lse.shape))])
+        self.assertTrue(torch.equal(recv_out[0], out))
+        self.assertTrue(torch.allclose(recv_lse[0], lse, atol=1e-6))
+        # The other implementations keep the torch packing.
+        calls = []
+        with patch.dict(sys.modules, {key: self._stub_kernels(calls)}):
+            dcp_ops.dcp_a2a_exchange(out, lse, group, "npu")
+        self.assertEqual(calls, [])
+
+
+class _SingleRankGroup:
+    """A one-rank DCP group: all_to_all_single is a copy."""
+
+    world_size = 1
+    rank_in_group = 0
+
+    @staticmethod
+    def all_to_all_single(output, input):
+        output.copy_(input)
+
+
+def _reference_attention_update(lse_list, out_list, update_type=0):
+    """Pure-torch torch_npu.npu_attention_update, as test_npu_dcp_ops.py uses."""
+    lses = torch.stack([l.float() for l in lse_list])
+    outs = torch.stack([o.float() for o in out_list])
+    lse_max = lses.amax(dim=0)
+    lse = lse_max + torch.log(torch.exp(lses - lse_max).sum(dim=0))
+    out = (outs * torch.exp(lses - lse).unsqueeze(-1)).sum(dim=0)
+    return out, (lse if update_type == 1 else None)
 
 
 if __name__ == "__main__":

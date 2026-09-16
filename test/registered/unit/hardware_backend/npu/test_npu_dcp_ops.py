@@ -204,15 +204,17 @@ class TestVerifyHistoryLocalLens(CustomTestCase):
                 t = dcp_verify_history_local_lens(torch.tensor(seq_lens), w, c, r)
                 self.assertEqual(t.tolist(), got)
                 expect = [
-                    sum(1 for p in range(max(n - w, 0)) if p % c == r)
-                    for n in seq_lens
+                    sum(1 for p in range(max(n - w, 0)) if p % c == r) for n in seq_lens
                 ]
                 self.assertEqual(got, expect, (c, w, r))
             # Every history token is counted on exactly one rank.
             totals = [
                 sum(col)
                 for col in zip(
-                    *[dcp_verify_history_local_lens(seq_lens, w, c, r) for r in range(c)]
+                    *[
+                        dcp_verify_history_local_lens(seq_lens, w, c, r)
+                        for r in range(c)
+                    ]
                 )
             ]
             self.assertEqual(totals, [max(n - w, 0) for n in seq_lens])
@@ -457,7 +459,8 @@ def _mla_attn_with_lse(q_nope, q_rope, kv, kr, scale, causal):
     causal: query i sees keys [: S - T + i + 1] (bottom-right aligned)."""
     t, s = q_nope.shape[0], kv.shape[0]
     scores = (
-        torch.einsum("thd,sd->ths", q_nope, kv) + torch.einsum("thd,sd->ths", q_rope, kr)
+        torch.einsum("thd,sd->ths", q_nope, kv)
+        + torch.einsum("thd,sd->ths", q_rope, kr)
     ) * scale
     if causal:
         allowed = torch.arange(s)[None, :] <= torch.arange(t)[:, None] + (s - t)
@@ -513,7 +516,9 @@ class TestVerifySplitExactness(CustomTestCase):
             )
             if fia_sentinel:
                 empty = torch.isneginf(hist_lse)
-                hist_lse = torch.where(empty, torch.full_like(hist_lse, math.inf), hist_lse)
+                hist_lse = torch.where(
+                    empty, torch.full_like(hist_lse, math.inf), hist_lse
+                )
                 hist_out = torch.where(
                     empty[..., None], torch.full_like(hist_out, float("nan")), hist_out
                 )
@@ -531,7 +536,12 @@ class TestVerifySplitExactness(CustomTestCase):
             for i in range(bsz):
                 tok = slice(i * w, (i + 1) * w)
                 cur_lse, cur_out = _mla_attn_with_lse(
-                    q_nope[tok, sl], q_rope[tok, sl], kv[i][-w:], kr[i][-w:], scale, True
+                    q_nope[tok, sl],
+                    q_rope[tok, sl],
+                    kv[i][-w:],
+                    kr[i][-w:],
+                    scale,
+                    True,
                 )
                 merged = npu_attention_update(
                     [hist_lse[tok].reshape(-1), cur_lse.reshape(-1)],
@@ -915,9 +925,7 @@ class TestMerge(CustomTestCase):
                     self.assertEqual(got_lse.shape, (bsz, h), name)
                     exp = ref_lse[:, r * h : (r + 1) * h]
                     finite = torch.isfinite(exp)
-                    self.assertTrue(
-                        torch.equal(torch.isneginf(got_lse), ~finite), name
-                    )
+                    self.assertTrue(torch.equal(torch.isneginf(got_lse), ~finite), name)
                     diff = (got_lse[finite] - exp[finite]).abs().max().item()
                     self.assertLess(diff, 1e-4, name)
                     if name != "ag_rs":
@@ -1701,9 +1709,7 @@ class TestAscendBackendVerifySplit(CustomTestCase):
                 )
                 exp = ref[:, r * self.H : (r + 1) * self.H]
                 err = (got[i] - exp).abs().max().item()
-                self.assertLess(
-                    err, 1e-5, (graph_mode, merge_impl, fused_merge, i, r)
-                )
+                self.assertLess(err, 1e-5, (graph_mode, merge_impl, fused_merge, i, r))
 
     def test_eager(self):
         for merge_impl, comm in (("npu", "a2a"), ("vllm", "a2a"), ("torch", "ag_rs")):
@@ -1726,23 +1732,23 @@ class TestAscendBackendVerifySplit(CustomTestCase):
                 pad_heads=True,
                 fused_merge=True,
             )
-        self._run(
-            3, [2, 0, 9], True, "a2a", "npu", pad_heads=False, fused_merge=True
-        )
+        self._run(3, [2, 0, 9], True, "a2a", "npu", pad_heads=False, fused_merge=True)
 
 
 class TestEnvDefaults(CustomTestCase):
     def test_defaults(self):
-        self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "npu")
+        self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "triton")
         self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
         self.assertFalse(envs.SGLANG_NPU_DCP_MERGE_FP32.get())
         self.assertEqual(envs.SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS.get(), 65536)
 
-    def test_fusion_switches_default_off(self):
-        """Every fused-kernel switch is opt-in until it is checked on device."""
-        self.assertFalse(envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get())
-        self.assertFalse(envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get())
-        self.assertFalse(envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get())
+    def test_fusion_switches_default_on(self):
+        """This branch carries the fused kernels, so every fused path is the
+        default here; the unfused behaviour is the branch without them."""
+        self.assertEqual(envs.SGLANG_NPU_DCP_MERGE_IMPL.get(), "triton")
+        self.assertTrue(envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get())
+        self.assertTrue(envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get())
+        self.assertTrue(envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get())
         self.assertIn("triton", dcp_ops.DCP_MERGE_IMPLS)
         self.assertEqual(dcp_ops.DCP_SPLIT_MERGE_IMPLS, ("npu", "torch", "triton"))
 
@@ -1768,9 +1774,23 @@ class TestEnvDefaults(CustomTestCase):
                         comm_backend=comm,
                     )
 
-    def test_verify_fused_merge_off_by_default(self):
+    def test_verify_fused_merge_on_by_default(self):
         _, backend, _ = _real_ascend_backend(dcp_size=2, allocator_page_size=8, page=4)
-        self.assertFalse(backend.dcp_verify_fused_merge)
+        self.assertTrue(backend.dcp_verify_fused_merge)
+
+    def test_an_unsplittable_merge_downgrades_when_it_was_not_asked_for(self):
+        """On by default, so a config that cannot split its merge must fall
+        back with a warning rather than refuse to start -- only an explicit
+        request is an error (a silent downgrade would spoil an A/B)."""
+        with envs.SGLANG_NPU_DCP_MERGE_IMPL.override("vllm"):
+            with self.assertLogs(level="WARNING") as logs:
+                _, backend, _ = _real_ascend_backend(
+                    dcp_size=2, allocator_page_size=8, page=4
+                )
+            self.assertFalse(backend.dcp_verify_fused_merge)
+            self.assertTrue(
+                any("fused target-verify merge" in m for m in logs.output), logs.output
+            )
 
     def test_backend_reads_merge_settings_once(self):
         _, backend, _ = _real_ascend_backend(dcp_size=2, allocator_page_size=8, page=4)
@@ -1782,7 +1802,7 @@ class TestEnvDefaults(CustomTestCase):
                 backend.dcp_lse_scale,
                 backend.dcp_pad_heads,
             ),
-            ("npu", "a2a", False, 1.0, False),
+            ("triton", "a2a", False, 1.0, False),
         )
         with envs.SGLANG_NPU_DCP_LSE_BASE_E.override(False):
             _, base2, _ = _real_ascend_backend(
@@ -2009,7 +2029,6 @@ class TestKimiK3NpuDcpConfig(CustomTestCase):
 
     def test_dcp_disabled_is_untouched(self):
         self.assertEqual(self._resolve(dcp_size=1), {})
-
 
 
 class TestDsparkWithoutDcp(CustomTestCase):
