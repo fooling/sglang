@@ -24,7 +24,11 @@ import triton.language as tl
 
 from sglang.srt.hardware_backend.npu.triton_ops.utils import row_grid
 
-_INF = float("inf")
+# Triton resolves only constexpr / jit globals inside a kernel, so these
+# reach the kernel as constexpr arguments rather than module globals
+# (Ascend reports "cannot access global variable ... from within @jit").
+_FINITE_MAX = 3.3e38  # above any real LSE, below +inf
+_NEG_INF = float("-inf")
 
 
 def _lse_pack_cols(dtype: torch.dtype) -> int:
@@ -99,6 +103,8 @@ def _lse_combine_kernel(
     BLOCK_D: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
     RETURN_LSE: tl.constexpr,
+    FINITE_MAX: tl.constexpr,
+    NEG_INF: tl.constexpr,
 ):
     """Exact softmax merge of ``n_shards`` (+1) partial attentions over disjoint KV.
 
@@ -119,16 +125,16 @@ def _lse_combine_kernel(
         i = row % h
 
         # Pass 1: the largest finite LSE over the shards (the softmax pivot).
-        max_lse = -_INF
+        max_lse = -FINITE_MAX
         for n in range(n_shards):
             lse = tl.load(src_lse_ptr + n * l_n + b * l_b + i * l_h)
-            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
-            max_lse = tl.maximum(max_lse, tl.where(valid, lse, -_INF))
+            valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
+            max_lse = tl.maximum(max_lse, tl.where(valid, lse, -FINITE_MAX))
         if HAS_EXTRA:
             lse = tl.load(x_lse_ptr + b * xl_b + i * xl_h)
-            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
-            max_lse = tl.maximum(max_lse, tl.where(valid, lse, -_INF))
-        any_valid = max_lse > -_INF
+            valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
+            max_lse = tl.maximum(max_lse, tl.where(valid, lse, -FINITE_MAX))
+        any_valid = max_lse > -FINITE_MAX
         pivot = tl.where(any_valid, max_lse, 0.0)
 
         # Pass 2: weighted sum of the shard outputs in float32.
@@ -136,7 +142,7 @@ def _lse_combine_kernel(
         denom = 0.0
         for n in range(n_shards):
             lse = tl.load(src_lse_ptr + n * l_n + b * l_b + i * l_h)
-            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
+            valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
             weight = tl.where(valid, tl.exp(lse - pivot), 0.0)
             vals = tl.load(
                 src_ptr + n * s_n + b * s_b + i * s_h + cols, mask=mask, other=0
@@ -145,7 +151,7 @@ def _lse_combine_kernel(
             denom += weight
         if HAS_EXTRA:
             lse = tl.load(x_lse_ptr + b * xl_b + i * xl_h)
-            valid = (lse == lse) & (lse != _INF) & (lse != -_INF)
+            valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
             weight = tl.where(valid, tl.exp(lse - pivot), 0.0)
             vals = tl.load(x_ptr + b * x_b + i * x_h + cols, mask=mask, other=0).to(
                 tl.float32
@@ -159,7 +165,7 @@ def _lse_combine_kernel(
             out_ptr + row * D + cols, merged.to(out_ptr.dtype.element_ty), mask=mask
         )
         if RETURN_LSE:
-            merged_lse = tl.where(any_valid, pivot + tl.log(denom), -_INF)
+            merged_lse = tl.where(any_valid, pivot + tl.log(denom), NEG_INF)
             tl.store(lse_out_ptr + row, merged_lse)
 
 
@@ -252,6 +258,8 @@ def lse_combine_shards(
         BLOCK_D=triton.next_power_of_2(d),
         HAS_EXTRA=has_extra,
         RETURN_LSE=return_lse,
+        FINITE_MAX=_FINITE_MAX,
+        NEG_INF=_NEG_INF,
     )
     if return_lse:
         return merged, merged_lse
