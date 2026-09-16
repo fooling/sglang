@@ -30,6 +30,19 @@ from sglang.srt.hardware_backend.npu.triton_ops.utils import row_grid
 _FINITE_MAX = 3.3e38  # above any real LSE, below +inf
 _NEG_INF = float("-inf")
 
+# Cap on the combine kernel's row tile (BLOCK_R). CANNON's triton_tile_cost
+# probe only prices tl.load / tl.store / tl.dot tiles, not the tl.zeros fp32
+# accumulator or the fp32 cast/multiply temporaries a row of the merge holds
+# alongside it (see DEVELOPING.md); by hand, one row of the merge at D = 512
+# holds roughly acc (BLOCK_R*512*4 B) + the bf16 payload load
+# (BLOCK_R*512*2 B) + its fp32 cast and the weighted product
+# (2 * BLOCK_R*512*4 B) at once, i.e. ~14 B/element. At BLOCK_R = 16 that is
+# ~115 KiB against a 192 KiB Ascend910B UB; BLOCK_R = 32 would be ~230 KiB,
+# over budget once the excluded temporaries are counted by hand, so the cap
+# stays at 16 even though the probe alone would call 32 WITHIN. This is a
+# host-side wrapper constant, not referenced inside @triton.jit.
+_MAX_BLOCK_R = 16
+
 
 def _lse_pack_cols(dtype: torch.dtype) -> int:
     elem = dtype.itemsize
@@ -101,12 +114,21 @@ def _lse_combine_kernel(
     n_shards,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
     RETURN_LSE: tl.constexpr,
     FINITE_MAX: tl.constexpr,
     NEG_INF: tl.constexpr,
 ):
     """Exact softmax merge of ``n_shards`` (+1) partial attentions over disjoint KV.
+
+    Vectorised over ``BLOCK_R`` rows at a time as well as ``BLOCK_D`` columns:
+    each shard's LSE load is a ``[BLOCK_R]`` vector and its payload load a
+    ``[BLOCK_R, BLOCK_D]`` tile, instead of one scalar LSE load plus one
+    ``[BLOCK_D]`` vector load per row per shard. Same two-pass
+    max-then-weighted-sum algorithm and the same sentinel handling as before,
+    just batched across the row dimension so the per-shard loop issues one
+    wide load instead of ``BLOCK_R`` narrow ones.
 
     A shard whose LSE is not finite (FIA returns +inf for an empty local KV)
     gets weight 0 and its output is never read into the accumulator; a row with
@@ -119,54 +141,73 @@ def _lse_combine_kernel(
     end_row = tl.minimum(start_row + rows_per_program, n_rows)
 
     cols = tl.arange(0, BLOCK_D)
-    mask = cols < D
-    for row in range(start_row, end_row):
-        b = row // h
-        i = row % h
+    col_mask = cols < D
+    row_base = tl.arange(0, BLOCK_R)
 
-        # Pass 1: the largest finite LSE over the shards (the softmax pivot).
-        max_lse = -FINITE_MAX
+    for row0 in range(start_row, end_row, BLOCK_R):
+        rows = row0 + row_base
+        row_mask = rows < end_row
+        b = rows // h
+        i = rows % h
+
+        # Pass 1: the largest finite LSE over the shards (the softmax pivot),
+        # one [BLOCK_R] vector load per shard instead of BLOCK_R scalar loads.
+        max_lse = tl.full([BLOCK_R], -FINITE_MAX, dtype=tl.float32)
         for n in range(n_shards):
-            lse = tl.load(src_lse_ptr + n * l_n + b * l_b + i * l_h)
+            lse = tl.load(
+                src_lse_ptr + n * l_n + b * l_b + i * l_h,
+                mask=row_mask,
+                other=-FINITE_MAX,
+            )
             valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
             max_lse = tl.maximum(max_lse, tl.where(valid, lse, -FINITE_MAX))
         if HAS_EXTRA:
-            lse = tl.load(x_lse_ptr + b * xl_b + i * xl_h)
+            lse = tl.load(
+                x_lse_ptr + b * xl_b + i * xl_h, mask=row_mask, other=-FINITE_MAX
+            )
             valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
             max_lse = tl.maximum(max_lse, tl.where(valid, lse, -FINITE_MAX))
         any_valid = max_lse > -FINITE_MAX
         pivot = tl.where(any_valid, max_lse, 0.0)
 
-        # Pass 2: weighted sum of the shard outputs in float32.
-        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-        denom = 0.0
+        # Pass 2: weighted sum of the shard outputs in float32, one
+        # [BLOCK_R, BLOCK_D] tile load per shard instead of BLOCK_R separate
+        # [BLOCK_D] loads.
+        acc = tl.zeros([BLOCK_R, BLOCK_D], dtype=tl.float32)
+        denom = tl.zeros([BLOCK_R], dtype=tl.float32)
+        tile_mask = row_mask[:, None] & col_mask[None, :]
         for n in range(n_shards):
-            lse = tl.load(src_lse_ptr + n * l_n + b * l_b + i * l_h)
+            lse = tl.load(
+                src_lse_ptr + n * l_n + b * l_b + i * l_h,
+                mask=row_mask,
+                other=-FINITE_MAX,
+            )
             valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
             weight = tl.where(valid, tl.exp(lse - pivot), 0.0)
-            vals = tl.load(
-                src_ptr + n * s_n + b * s_b + i * s_h + cols, mask=mask, other=0
-            ).to(tl.float32)
-            acc += weight * tl.where(valid, vals, 0.0)
+            ptrs = (
+                src_ptr + n * s_n + b[:, None] * s_b + i[:, None] * s_h + cols[None, :]
+            )
+            vals = tl.load(ptrs, mask=tile_mask, other=0).to(tl.float32)
+            acc += weight[:, None] * tl.where(valid[:, None], vals, 0.0)
             denom += weight
         if HAS_EXTRA:
-            lse = tl.load(x_lse_ptr + b * xl_b + i * xl_h)
+            lse = tl.load(
+                x_lse_ptr + b * xl_b + i * xl_h, mask=row_mask, other=-FINITE_MAX
+            )
             valid = (lse == lse) & (lse < FINITE_MAX) & (lse > -FINITE_MAX)
             weight = tl.where(valid, tl.exp(lse - pivot), 0.0)
-            vals = tl.load(x_ptr + b * x_b + i * x_h + cols, mask=mask, other=0).to(
-                tl.float32
-            )
-            acc += weight * tl.where(valid, vals, 0.0)
+            ptrs = x_ptr + b[:, None] * x_b + i[:, None] * x_h + cols[None, :]
+            vals = tl.load(ptrs, mask=tile_mask, other=0).to(tl.float32)
+            acc += weight[:, None] * tl.where(valid[:, None], vals, 0.0)
             denom += weight
 
         scale = tl.where(denom > 0.0, 1.0 / tl.where(denom > 0.0, denom, 1.0), 0.0)
-        merged = acc * scale
-        tl.store(
-            out_ptr + row * D + cols, merged.to(out_ptr.dtype.element_ty), mask=mask
-        )
+        merged = acc * scale[:, None]
+        out_ptrs = out_ptr + rows[:, None] * D + cols[None, :]
+        tl.store(out_ptrs, merged.to(out_ptr.dtype.element_ty), mask=tile_mask)
         if RETURN_LSE:
             merged_lse = tl.where(any_valid, pivot + tl.log(denom), NEG_INF)
-            tl.store(lse_out_ptr + row, merged_lse)
+            tl.store(lse_out_ptr + rows, merged_lse, mask=row_mask)
 
 
 def dcp_pack_send(out: torch.Tensor, lse: torch.Tensor, n: int) -> torch.Tensor:
@@ -230,11 +271,20 @@ def lse_combine_shards(
     merged_lse = torch.empty(
         n_rows if return_lse else 0, dtype=torch.float32, device=outs.device
     )
+    if n_rows == 0:
+        # Ascend rejects a (0,) grid at launch; row_grid() already floors the
+        # grid to 1 program, but skipping the launch entirely avoids relying
+        # on that and matches the n_rows == 0 guard used elsewhere in this
+        # file (dcp_store_mla_kv, split_qk_rmsnorm).
+        return (merged, merged_lse) if return_lse else merged
     has_extra = extra_out is not None
     if has_extra:
         assert extra_out.stride(2) == 1, "the extra shard needs a contiguous head dim"
         extra_lse = extra_lse.float()
-    _lse_combine_kernel[(row_grid(n_rows),)](
+    grid = row_grid(n_rows)
+    rows_per_program = -(-n_rows // grid)  # ceil div
+    block_r = min(triton.next_power_of_2(rows_per_program), _MAX_BLOCK_R)
+    _lse_combine_kernel[(grid,)](
         merged,
         merged_lse if return_lse else lses,
         outs,
@@ -256,6 +306,7 @@ def lse_combine_shards(
         n,
         D=d,
         BLOCK_D=triton.next_power_of_2(d),
+        BLOCK_R=block_r,
         HAS_EXTRA=has_extra,
         RETURN_LSE=return_lse,
         FINITE_MAX=_FINITE_MAX,
