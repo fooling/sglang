@@ -40,6 +40,7 @@ from sglang.srt.hardware_backend.npu.dcp.ops import (
     npu_attention_update,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.utils.common import log_info_on_rank0
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
@@ -460,19 +461,39 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # Target verify: merge the current window as the (N+1)-th shard of
             # the cross-rank merge (one merge instead of two).
-            self.dcp_verify_fused_merge = (
-                envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get()
-            )
+            self.dcp_verify_fused_merge = envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.get()
             if self.dcp_verify_fused_merge and (
                 get_parallel().dcp_comm_backend != "a2a"
                 or envs.SGLANG_NPU_DCP_MERGE_IMPL.get() not in DCP_SPLIT_MERGE_IMPLS
             ):
-                raise ValueError(
-                    "SGLANG_NPU_DCP_VERIFY_FUSED_MERGE needs the 'a2a' DCP comm "
-                    f"backend (got {get_parallel().dcp_comm_backend!r}) and a "
-                    f"merge implementation in {DCP_SPLIT_MERGE_IMPLS} (got "
-                    f"{envs.SGLANG_NPU_DCP_MERGE_IMPL.get()!r})."
+                reason = (
+                    "needs the 'a2a' DCP comm backend (got "
+                    f"{get_parallel().dcp_comm_backend!r}) and a merge "
+                    f"implementation in {DCP_SPLIT_MERGE_IMPLS} (got "
+                    f"{envs.SGLANG_NPU_DCP_MERGE_IMPL.get()!r})"
                 )
+                if envs.SGLANG_NPU_DCP_VERIFY_FUSED_MERGE.is_set():
+                    # Asked for explicitly: a silent downgrade would make an
+                    # A/B measure the wrong thing.
+                    raise ValueError(f"SGLANG_NPU_DCP_VERIFY_FUSED_MERGE {reason}.")
+                # On by default on this branch, so a configuration that cannot
+                # split its merge falls back instead of refusing to start.
+                logger.warning("Disabling the fused target-verify merge: it %s.", reason)
+                self.dcp_verify_fused_merge = False
+            log_info_on_rank0(
+                logger,
+                "NPU DCP: comm=%s merge=%s attn=%s pad_heads=%s | fused: "
+                "verify_merge=%s kv_store_triton=%s split_qk_norm_triton=%s"
+                % (
+                    get_parallel().dcp_comm_backend,
+                    envs.SGLANG_NPU_DCP_MERGE_IMPL.get(),
+                    envs.SGLANG_NPU_DCP_ATTN_IMPL.get(),
+                    self.dcp_pad_heads,
+                    self.dcp_verify_fused_merge,
+                    envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get(),
+                    envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get(),
+                ),
+            )
             if self.dcp_pad_heads and self.q_head_num_padding is not None:
                 self.dcp_q_head_num_padding = next_power_of_2(
                     self.tp_q_head_num * self.dcp_size
