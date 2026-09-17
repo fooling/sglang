@@ -925,7 +925,13 @@ class Envs:
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
-    SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
+    # Branch default: this line integrates the FlashMLA custom op, so it runs
+    # MLA target verify on it without being asked. Set the variable explicitly
+    # to pin either value -- an explicit setting is also what turns a missing
+    # vendor package from a downgrade into a startup failure, so an A/B cannot
+    # silently measure the fallback. Run a5-k3-0828 for the pre-FlashMLA
+    # behaviour.
+    SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(True)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2

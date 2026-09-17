@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 from sglang.srt.hardware_backend.npu.attention.flash_mla_op import (
     flash_mla_with_kvcache,
     flash_mla_with_kvcache_metadata,
+    is_flash_mla_available,
     require_flash_mla,
 )
 from sglang.srt.hardware_backend.npu.attention.fp8_contracts import (
@@ -385,17 +386,12 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        # What the run asked for. Kept as asked so the switch stays readable;
+        # whether the op is actually reached is flash_mla_serves_verify below.
+        self._flash_mla_requested = envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
         self.use_fias_v2_bsnd = (
-            envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
-            and model_runner.spec_algorithm.is_dspark()
+            self._flash_mla_requested and model_runner.spec_algorithm.is_dspark()
         )
-        if self.use_fias_v2_bsnd:
-            # This is the only path that calls the FlashMLA custom op. Fail here
-            # rather than in the first target-verify forward.
-            require_flash_mla(
-                "SGLANG_NPU_USE_FIAS_V2_BSND with DSPARK speculative decoding "
-                "runs MLA target verify on the FlashMLA custom op."
-            )
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -503,6 +499,57 @@ class AscendAttnBackend(AttentionBackend):
                 raise ValueError(
                     "SGLANG_NPU_DCP_PREFIX_CHUNK_TOKENS must be positive, got "
                     f"{self.dcp_prefix_chunk_tokens}."
+                )
+
+        # SGLANG_NPU_USE_FIAS_V2_BSND asks for the FlashMLA custom op on MLA
+        # target verify. It is reached only where DCP does not serve verify
+        # itself: with dcp_size > 1 every MLA layer goes through
+        # attn_mqa_for_dcp_decode and returns from _forward_verify_mla_dcp
+        # before that branch (the replicated DSPARK draft runs the plain dcp=1
+        # layout and does reach it). Everything FlashMLA-only hangs off this
+        # derived value, not off the switch, so asking for the op under DCP
+        # cannot hand the DCP FIA calls the cu_seqlens-style
+        # actual_seq_lengths_q that the FlashMLA graph metadata builds.
+        self.flash_mla_serves_verify = self.use_fias_v2_bsnd and self.dcp_size == 1
+        if self._flash_mla_requested and not self.flash_mla_serves_verify:
+            reason = (
+                "the speculative algorithm is not DSPARK"
+                if not model_runner.spec_algorithm.is_dspark()
+                else f"decode context parallel (dcp_size={self.dcp_size}) serves "
+                "MLA target verify itself, so the op is never reached"
+            )
+            logger.warning(
+                "SGLANG_NPU_USE_FIAS_V2_BSND is set but MLA target verify will "
+                "NOT run on the FlashMLA custom op: %s.",
+                reason,
+            )
+        elif self.flash_mla_serves_verify:
+            if not envs.SGLANG_NPU_USE_FIAS_V2_BSND.is_set() and not (
+                is_flash_mla_available()
+            ):
+                # The switch is on because this branch defaults it on, not
+                # because the run asked. A deployment without the vendor
+                # package should still start, on the torch_npu FIA path it had
+                # before. An explicit setting is handled below instead: a
+                # silent downgrade would let an A/B measure the fallback and
+                # report it as FlashMLA.
+                logger.warning(
+                    "FlashMLA is this branch's default for MLA target verify "
+                    "but the cann_ops_transformer vendor package is not "
+                    "importable; falling back to the torch_npu FIA path. Set "
+                    "SGLANG_NPU_USE_FIAS_V2_BSND=1 to make this a startup "
+                    "failure instead, or =0 to select the fallback on purpose."
+                )
+                self.flash_mla_serves_verify = False
+            else:
+                logger.info(
+                    "NPU MLA target verify runs on the FlashMLA custom op "
+                    "(DSPARK, dcp_size=1)."
+                )
+                # Fail here rather than in the first target-verify forward.
+                require_flash_mla(
+                    "SGLANG_NPU_USE_FIAS_V2_BSND with DSPARK speculative "
+                    "decoding runs MLA target verify on the FlashMLA custom op."
                 )
 
         # dllm model config
@@ -745,7 +792,7 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        if self.use_fias_v2_bsnd and (
+        if self.flash_mla_serves_verify and (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
@@ -924,11 +971,12 @@ class AscendAttnBackend(AttentionBackend):
         #         device=seq_lens.device,
         #     )
         device = seq_lens.device
-        # FlashMLA-only metadata. Gated on use_fias_v2_bsnd, not use_mla: every
-        # other MLA consumer of actual_seq_lengths_q (the DSA indexer, the DCP
-        # FIA calls) wants the plain per-request cumulative lengths, without the
-        # leading zero that the FlashMLA cu_seqlens layout prepends below.
-        if self.use_fias_v2_bsnd:
+        # FlashMLA-only metadata. Gated on flash_mla_serves_verify, not on
+        # use_mla and not on the switch: every other MLA consumer of
+        # actual_seq_lengths_q (the DSA indexer, the DCP FIA calls) wants the
+        # plain per-request cumulative lengths, without the leading zero that
+        # the FlashMLA cu_seqlens layout prepends below.
+        if self.flash_mla_serves_verify:
             def _calculate_metadata_size(batch_size, aic_core_num, aiv_core_num):
                 """计算 metadata tensor 的对齐后大小。
 
@@ -1035,7 +1083,7 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.block_tables[:bs, total_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if self.use_fias_v2_bsnd:
+        if self.flash_mla_serves_verify:
             query_seq_len = (
                 self.speculative_num_draft_tokens
                 if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
@@ -1049,7 +1097,7 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
-        if self.use_fias_v2_bsnd:
+        if self.flash_mla_serves_verify:
             metadata.seqused_q.copy_(seqused_q.to(torch.int32))
             metadata_flash_mla = flash_mla_with_kvcache_metadata(
                 cache_seqlens=seq_lens.to(torch.int32),
@@ -2680,7 +2728,7 @@ class AscendAttnBackend(AttentionBackend):
             # FlashMLA consumes the merged row whole; the torch_npu FIA path
             # below wants the two halves, so keep both spellings available.
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            if not self.use_fias_v2_bsnd:
+            if not self.flash_mla_serves_verify:
                 c_kv, k_rope = _split_mla_kv_buffer(kv_cache, self.kv_lora_rank)
                 if is_fia_nz():
                     k_rope_cache = _reshape_kv_for_fia_nz(
@@ -2716,7 +2764,7 @@ class AscendAttnBackend(AttentionBackend):
             batch_size = q_nope.shape[0] // query_seq_len
 
             actual_seq_lengths = actual_seq_lengths_kv = None
-            if not self.use_fias_v2_bsnd:
+            if not self.flash_mla_serves_verify:
                 # Only the torch_npu FIA call below wants host lengths. FlashMLA
                 # takes device tensors, so building these would be the one thing
                 # keeping the FlashMLA path on needs_cpu_seq_lens.
@@ -2776,7 +2824,7 @@ class AscendAttnBackend(AttentionBackend):
             #     q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
 
             num_query_heads = q_nope.shape[1]
-            if self.use_fias_v2_bsnd:
+            if self.flash_mla_serves_verify:
                 # The existing paged MLA cache is [block, KV_N, page, D].
                 # FlashMLA consumes it with BSND queries; keep the cache
                 # unchanged. batch_size / query_seq_len came from the query

@@ -1066,7 +1066,8 @@ def _cpu_tensor(*args, **kwargs):
 
 
 def _real_ascend_backend(
-    *, dcp_size, allocator_page_size, is_draft_worker=False, page=4, heads=8
+    *, dcp_size, allocator_page_size, is_draft_worker=False, page=4, heads=8,
+    is_dspark=False,
 ):
     """Run the real AscendAttnBackend.__init__ on CPU with NPU deps mocked."""
     backend_mod = _import_ascend_backend()
@@ -1087,7 +1088,7 @@ def _real_ascend_backend(
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         token_to_kv_pool=object(),
         spec_algorithm=SimpleNamespace(
-            is_dspark=lambda: False,
+            is_dspark=lambda: is_dspark,
             get_num_tokens_per_req_for_target_verify=lambda n, is_draft_worker: n,
         ),
         is_draft_worker=is_draft_worker,
@@ -1173,6 +1174,69 @@ class TestDcpTargetBackendInit(CustomTestCase):
             _, plain, _ = _real_ascend_backend(dcp_size=1, allocator_page_size=None)
             self.assertEqual(plain.dcp_size, 1)
             self.assertFalse(plain.needs_cpu_seq_lens)
+
+    def test_flash_mla_switch_stays_readable_under_dcp(self):
+        """The switch keeps the value the run asked for; what changes under DCP
+        is whether the op is reached.
+
+        Every MLA layer goes through attn_mqa_for_dcp_decode and returns from
+        _forward_verify_mla_dcp before the FlashMLA branch, so a dcp_size > 1
+        backend never calls the op. That has to be a derived value rather than
+        a rewrite of the switch: everything FlashMLA-only hangs off it,
+        including the graph metadata that prepends a leading zero to
+        actual_seq_lengths_q, which the DCP FIA calls read. Rewriting the
+        switch instead would also make the feature untestable from outside."""
+        with envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(True):
+            _, dcp_backend, _ = _real_ascend_backend(
+                dcp_size=4,
+                allocator_page_size=self.PAGE * 4,
+                page=self.PAGE,
+                is_dspark=True,
+            )
+            self.assertEqual(dcp_backend.dcp_size, 4)
+            self.assertTrue(dcp_backend.use_fias_v2_bsnd)
+            self.assertFalse(dcp_backend.flash_mla_serves_verify)
+
+            # The replicated DSPARK draft runs the plain dcp=1 layout, so it
+            # does reach the op -- and an explicit setting makes a missing
+            # vendor package a startup failure rather than a downgrade.
+            with self.assertRaisesRegex(RuntimeError, "FlashMLA"):
+                _real_ascend_backend(
+                    dcp_size=4,
+                    allocator_page_size=None,
+                    is_draft_worker=True,
+                    is_dspark=True,
+                )
+
+    def test_flash_mla_off_without_dspark(self):
+        """The switch alone is not enough: the op only serves DSPARK verify."""
+        with envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(True):
+            _, backend, _ = _real_ascend_backend(
+                dcp_size=1, allocator_page_size=None, is_dspark=False
+            )
+            self.assertFalse(backend.use_fias_v2_bsnd)
+            self.assertFalse(backend.flash_mla_serves_verify)
+
+    def test_branch_default_downgrades_when_the_vendor_package_is_absent(self):
+        """This branch defaults the switch on, so a host without the vendor
+        package must still start -- on the torch_npu FIA path. Only an explicit
+        setting turns that into a startup failure, so an A/B cannot silently
+        measure the fallback and report it as FlashMLA."""
+        self.assertTrue(
+            envs.SGLANG_NPU_USE_FIAS_V2_BSND.get(),
+            "this branch is expected to default the FlashMLA switch on",
+        )
+        self.assertFalse(
+            envs.SGLANG_NPU_USE_FIAS_V2_BSND.is_set(),
+            "the test host must not pin the switch for this case",
+        )
+        _, backend, _ = _real_ascend_backend(
+            dcp_size=1, allocator_page_size=None, is_dspark=True
+        )
+        # The switch reads as on; the op is not served because the package is
+        # absent on a CPU test host.
+        self.assertTrue(backend.use_fias_v2_bsnd)
+        self.assertFalse(backend.flash_mla_serves_verify)
 
     def test_eager_decode_block_table_width_from_host_lens(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
