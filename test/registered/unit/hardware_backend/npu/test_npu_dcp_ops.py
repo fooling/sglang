@@ -1173,17 +1173,32 @@ class TestDcpTargetBackendInit(CustomTestCase):
         # (default True); only dcp_size > 1 forces it on regardless of the env.
         self.assertTrue(draft.needs_cpu_seq_lens)
 
-    def test_dcp_forces_host_seq_lens_even_when_env_disables_it(self):
-        """DCP builds rank-local lengths and block tables from the host mirror,
-        so SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 must not switch it off.
-        Without DCP the same env value is honoured."""
+    def test_host_seq_lens_are_forced_only_by_the_forms_that_read_them(self):
+        """SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is the host-free
+        (zero-bubble) path. FIA takes its KV lengths as a host list and cannot
+        run on it, so that form forces the mirror back on. FlashMLA takes
+        device int32 and does not, which is what lets DCP run zero bubble.
+
+        The predicate is asserted directly rather than by building a backend
+        per form: on a CPU host the vendor package is absent, so a flash_mla
+        selection falls back to fia before it could be observed.
+        """
+        backend_mod = _import_ascend_backend()
+        needs_host = backend_mod.AscendAttnBackend._dcp_needs_host_seq_lens
+        self.assertTrue(needs_host("fia"))
+        self.assertTrue(needs_host("torch"))
+        self.assertFalse(needs_host("flash_mla"))
+
         with envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.override(False):
+            # This host resolves to the fia fallback, so the mirror comes back.
             _, dcp_backend, _ = _real_ascend_backend(
                 dcp_size=4, allocator_page_size=self.PAGE * 4, page=self.PAGE
             )
             self.assertEqual(dcp_backend.dcp_size, 4)
+            self.assertEqual(dcp_backend.dcp_attn_impl, "fia")
             self.assertTrue(dcp_backend.needs_cpu_seq_lens)
 
+            # Without DCP the switch is honoured as before.
             _, plain, _ = _real_ascend_backend(dcp_size=1, allocator_page_size=None)
             self.assertEqual(plain.dcp_size, 1)
             self.assertFalse(plain.needs_cpu_seq_lens)
@@ -1250,6 +1265,46 @@ class TestDcpTargetBackendInit(CustomTestCase):
         # absent on a CPU test host.
         self.assertTrue(backend.use_fias_v2_bsnd)
         self.assertFalse(backend.flash_mla_serves_verify)
+
+    def test_host_free_decode_block_table_keeps_the_dcp_stride(self):
+        """The zero-bubble path has no host length to truncate on, so the table
+        spans the whole req_to_token row -- but the stride is still the virtual
+        page, page_size * dcp_size, not page_size. Getting that wrong is silent:
+        the table is the right shape and points at the wrong pages."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        dcp = 2
+        with envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.override(False):
+            backend_mod, backend, mr = _real_ascend_backend(
+                dcp_size=dcp, allocator_page_size=self.PAGE * dcp, page=self.PAGE
+            )
+            # The fia fallback on a CPU host forces the mirror back on, so pin
+            # the host-free path directly: that is the case under test.
+            backend.needs_cpu_seq_lens = False
+            fb = SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=2,
+                seq_lens=torch.tensor([5, 19]),
+                seq_lens_cpu=None,
+                spec_info=None,
+                spec_algorithm=None,
+                req_pool_indices=torch.tensor([1, 0]),
+                extend_seq_lens=None,
+                extend_seq_lens_cpu=[1, 1],
+                out_cache_loc=None,
+            )
+            with patch.object(torch, "tensor", _cpu_tensor):
+                backend.init_forward_metadata(fb)
+
+        stride = self.PAGE * dcp
+        rows = mr.req_to_token_pool.req_to_token[torch.tensor([1, 0])]
+        expect = (rows[:, ::stride] // stride).to(torch.int32)
+        got = backend.forward_metadata.block_tables
+        self.assertTrue(torch.equal(got, expect), (got, expect))
+        # The whole row, since nothing truncates it.
+        self.assertEqual(got.shape[1], (rows.shape[1] + stride - 1) // stride)
+        # And no host mirror was built for the run to lean on.
+        self.assertIsNone(backend.forward_metadata.seq_lens_cpu_int)
 
     def test_eager_decode_block_table_width_from_host_lens(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode

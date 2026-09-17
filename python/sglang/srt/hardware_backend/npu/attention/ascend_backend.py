@@ -484,18 +484,6 @@ class AscendAttnBackend(AttentionBackend):
         )
         self.dcp_pad_heads = False
         if self.dcp_size > 1:
-            # DCP builds rank-local FIA lengths and block tables from the host
-            # sequence lengths, so the scheduler must publish seq_lens_cpu.
-            # FIA takes actual_seq_lengths_kv as a host list; only moving the DCP
-            # attention to an op that takes device lengths (FlashMLA) can drop
-            # this, and with it the overlap scheduler's per-step seq_lens D2H.
-            if not self.needs_cpu_seq_lens:
-                logger.warning(
-                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is overridden "
-                    "to 1 under decode context parallel: the DCP FIA calls read "
-                    "their KV lengths from seq_lens_cpu."
-                )
-            self.needs_cpu_seq_lens = True
             self._check_dcp_allocator_page_size(
                 getattr(model_runner, "token_to_kv_pool_allocator", None)
             )
@@ -515,6 +503,21 @@ class AscendAttnBackend(AttentionBackend):
                     "falling back to SGLANG_NPU_DCP_ATTN_IMPL=fia."
                 )
                 self.dcp_attn_impl = "fia"
+            if self._dcp_needs_host_seq_lens(self.dcp_attn_impl) and (
+                not self.needs_cpu_seq_lens
+            ):
+                # FIA takes actual_seq_lengths_kv as a host list, so these two
+                # forms cannot run on the host-free path. FlashMLA takes device
+                # int32 and does not, which is what lets DCP keep the switch as
+                # the run set it -- the block tables below have a device-only
+                # form for exactly that.
+                logger.warning(
+                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is overridden "
+                    "to 1: SGLANG_NPU_DCP_ATTN_IMPL=%s reads its KV lengths "
+                    "from seq_lens_cpu as a host list.",
+                    self.dcp_attn_impl,
+                )
+                self.needs_cpu_seq_lens = True
             if self.dcp_attn_impl not in ("flash_mla", "fia", "torch"):
                 raise ValueError(
                     "SGLANG_NPU_DCP_ATTN_IMPL must be 'flash_mla', 'fia' or "
@@ -648,6 +651,16 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = model_runner.ps.attn_cp_size
+
+    @staticmethod
+    def _dcp_needs_host_seq_lens(dcp_attn_impl: str) -> bool:
+        """Whether this DCP attention form reads its KV lengths as a host list.
+
+        FIA takes actual_seq_lengths_kv as one, and the torch reference walks
+        it, so both pin the run to the host mirror -- i.e. off the host-free
+        (zero-bubble) path. FlashMLA takes device int32 and does not.
+        """
+        return dcp_attn_impl in ("fia", "torch")
 
     @staticmethod
     def _dcp_layout(
@@ -796,11 +809,12 @@ class AscendAttnBackend(AttentionBackend):
                     .contiguous()
                 )
         else:
-            self.forward_metadata.block_tables = (
-                self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, :: self.page_size
-                ]
-                // self.page_size
+            # Host-free: no length to truncate on, so the table spans the whole
+            # req_to_token row. Under DCP a block is a virtual page of
+            # page_size * dcp_size, so the stride is not page_size.
+            rows = self.req_to_token_pool.req_to_token[forward_batch.req_pool_indices]
+            self.forward_metadata.block_tables = dcp_block_tables(
+                rows, rows.shape[1], self.page_size, self.dcp_size
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
@@ -823,42 +837,54 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
+        # The same offset goes on both mirrors. The host one is only there when
+        # the run publishes it; the device one always is, and the graph path
+        # applies the same offset to it (speculative_step_offset_npu).
+        spec_offset = 0
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
             if spec_algorithm is None or not spec_algorithm.is_dspark():
-                self.forward_metadata.seq_lens_cpu_int += spec_tokens_per_req
+                spec_offset = spec_tokens_per_req
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+            spec_offset = self.speculative_step_id + 1
+        if spec_offset and self.forward_metadata.seq_lens_cpu_int is not None:
+            self.forward_metadata.seq_lens_cpu_int += spec_offset
 
         if self.dcp_size > 1 and forward_batch.forward_mode.is_decode_or_idle():
-            self.forward_metadata.dcp_local_seq_lens = dcp_local_seq_lens(
-                self.forward_metadata.seq_lens_cpu_int.tolist(),
-                self.dcp_size,
-                self.dcp_rank,
-            )
+            if self.forward_metadata.seq_lens_cpu_int is not None:
+                self.forward_metadata.dcp_local_seq_lens = dcp_local_seq_lens(
+                    self.forward_metadata.seq_lens_cpu_int.tolist(),
+                    self.dcp_size,
+                    self.dcp_rank,
+                )
+            dev_lens = self.forward_metadata.seq_lens
+            if spec_offset:
+                dev_lens = dev_lens + spec_offset
             self._init_dcp_flash_mla_metadata(
-                dcp_local_seq_lens(
-                    self.forward_metadata.seq_lens, self.dcp_size, self.dcp_rank
-                ),
-                self.forward_metadata.seq_lens,
+                dcp_local_seq_lens(dev_lens, self.dcp_size, self.dcp_rank),
+                dev_lens,
                 q_len=1,
             )
         elif self.dcp_size > 1 and forward_batch.forward_mode.is_target_verify():
             # seq_lens_cpu_int counts the verify window (DSPARK publishes it on
             # CPU); the history FIA reads only this rank's shard of the prefix
             # before the window.
-            self.forward_metadata.dcp_local_seq_lens = dcp_verify_history_local_lens(
-                self.forward_metadata.seq_lens_cpu_int.tolist(),
-                spec_tokens_per_req,
-                self.dcp_size,
-                self.dcp_rank,
-            )
+            if self.forward_metadata.seq_lens_cpu_int is not None:
+                self.forward_metadata.dcp_local_seq_lens = (
+                    dcp_verify_history_local_lens(
+                        self.forward_metadata.seq_lens_cpu_int.tolist(),
+                        spec_tokens_per_req,
+                        self.dcp_size,
+                        self.dcp_rank,
+                    )
+                )
             # The same lengths on device, from the same helpers -- they take a
             # tensor as readily as a host list, so the FlashMLA form needs no
-            # host mirror of its own.
+            # host mirror of its own. DSPARK's lengths already count the
+            # window, on both mirrors, so neither gets the spec offset here.
             self._init_dcp_flash_mla_metadata(
                 dcp_verify_history_local_lens(
                     self.forward_metadata.seq_lens,
@@ -1207,16 +1233,19 @@ class AscendAttnBackend(AttentionBackend):
 
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         else:
+            # Host-free replay: as in the eager path, the whole row, strided by
+            # the virtual page the DCP layout uses.
+            block_stride = self.page_size * self.dcp_size
             total_pages = min(
                 metadata.block_tables.shape[1],
-                (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
+                (self.req_to_token.shape[1] + block_stride - 1) // block_stride,
             )
             metadata.block_tables[:bs, :total_pages].copy_(
                 self.req_to_token[
                     req_pool_indices[:bs],
-                    0 : total_pages * self.page_size : self.page_size,
+                    0 : total_pages * block_stride : block_stride,
                 ]
-                // self.page_size
+                // block_stride
             )
             if total_pages < metadata.block_tables.shape[1]:
                 metadata.block_tables[:bs, total_pages:].fill_(0)
