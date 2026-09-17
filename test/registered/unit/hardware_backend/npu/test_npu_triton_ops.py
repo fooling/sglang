@@ -149,12 +149,18 @@ class TestDcpKvStoreDispatch(CustomTestCase):
         pool.kv_lora_rank, pool.qk_rope_head_dim = self.D_C, self.D_R
         pool.dtype = pool.store_dtype = torch.float32
         pool.dsa_kv_cache_store_fp8 = dsa_fp8
-        pool.kv_cache_dim = self.D_C
+        pool.kv_cache_dim, pool.kr_cache_dim = self.D_C, self.D_R
         pool.use_fia_nz = fia_nz
         pool.use_triton_dcp_kv_store = use_triton
-        pool.k_buffer = [torch.zeros(self.SLOTS, 1, self.D_C)]
-        pool.v_buffer = [torch.zeros(self.SLOTS, 1, self.D_R)]
+        # One merged cache row: the latent occupies the first D_C columns and
+        # the rope key the rest, so both destinations the kernel gets are
+        # strided views of this buffer.
+        pool.kv_buffer = [torch.zeros(self.SLOTS, 1, self.D_C + self.D_R)]
         return pool
+
+    def _halves(self, pool):
+        rows = pool.kv_buffer[0].view(self.SLOTS, self.D_C + self.D_R)
+        return rows[:, : self.D_C], rows[:, self.D_C :]
 
     @staticmethod
     def _stub_kernel(recorder):
@@ -216,11 +222,11 @@ class TestDcpKvStoreDispatch(CustomTestCase):
             self.assertEqual(scatters, 0)
 
             plain = self._pool(use_triton=False)
-            self.assertEqual(self._run(plain, loc, cache_k, cache_v, rank, []), 2)
-            fused_k = fused.k_buffer[0].view(self.SLOTS, self.D_C)
-            plain_k = plain.k_buffer[0].view(self.SLOTS, self.D_C)
-            fused_v = fused.v_buffer[0].view(self.SLOTS, self.D_R)
-            plain_v = plain.v_buffer[0].view(self.SLOTS, self.D_R)
+            # The torch path is one scatter over the merged row (it cats the
+            # latent and the rope key first), where it used to be two.
+            self.assertEqual(self._run(plain, loc, cache_k, cache_v, rank, []), 1)
+            fused_k, fused_v = self._halves(fused)
+            plain_k, plain_v = self._halves(plain)
             # Real slots agree; the pad slot is written by the torch path only.
             self.assertTrue(torch.equal(fused_k[1:], plain_k[1:]), rank)
             self.assertTrue(torch.equal(fused_v[1:], plain_v[1:]), rank)

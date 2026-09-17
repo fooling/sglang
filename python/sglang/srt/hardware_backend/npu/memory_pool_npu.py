@@ -943,9 +943,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
+        # The latent and the rope key share one cache row, so the kernel gets
+        # the two column halves as strided [slot, D] views (it takes their row
+        # stride) rather than two dense buffers.
+        rows = self.kv_buffer[layer_id - self.start_layer].view(
+            -1, self.kv_cache_dim + self.kr_cache_dim
+        )
         dcp_store_mla_kv(
-            self.k_buffer[layer_id - self.start_layer].view(-1, self.kv_lora_rank),
-            self.v_buffer[layer_id - self.start_layer].view(-1, self.qk_rope_head_dim),
+            rows[:, : self.kv_lora_rank],
+            rows[:, self.kv_lora_rank :],
             cache_k,
             cache_v,
             loc,

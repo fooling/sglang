@@ -140,6 +140,38 @@ def dcp_kv_store():
 
 
 @check
+def dcp_kv_store_merged_row():
+    """The two halves of one merged cache row, as the MLA pool hands them over.
+
+    kv_buffer keeps the latent and the rope key in the same row, so both
+    destinations are strided [slot, D] views with row stride d_c + d_r. Nothing
+    can view them as dense blocks, which is exactly what the destination row
+    strides are for.
+    """
+    torch.manual_seed(5)
+    dcp_size, slots, d_c, d_r = 4, 24, 12, 6
+    loc = torch.tensor([-1, 2, 6, 9, 10, 5, 0, 3, 7, 11])
+    cache_k = torch.randn(loc.numel(), d_c, dtype=torch.bfloat16)
+    cache_v = torch.randn(loc.numel(), d_r, dtype=torch.bfloat16)
+    for rank in range(dcp_size):
+        rows = torch.full((slots, d_c + d_r), -7.0, dtype=torch.bfloat16)
+        ref = rows.clone()
+        k_view, v_view = rows[:, :d_c], rows[:, d_c:]
+        assert not k_view.is_contiguous() and not v_view.is_contiguous()
+        dcp_store_mla_kv(k_view, v_view, cache_k, cache_v, loc, dcp_size, rank)
+        for i, l in enumerate(loc.tolist()):
+            if l >= 0 and l % dcp_size == rank:
+                ref[l // dcp_size, :d_c] = cache_k[i]
+                ref[l // dcp_size, d_c:] = cache_v[i]
+        assert torch.equal(rows, ref), f"merged row differs at rank {rank}"
+        # Untouched columns of a written row must survive: a wrong destination
+        # stride would spill one half into the other.
+        assert torch.equal(rows[:, :d_c], ref[:, :d_c]), "latent half"
+        assert torch.equal(rows[:, d_c:], ref[:, d_c:]), "rope half"
+    return "bit-exact into strided halves of a merged row, no spill between them"
+
+
+@check
 def dcp_pack_send_matches_torch():
     """The pack kernel reproduces cat + view + transpose + contiguous, bit for bit."""
     torch.manual_seed(3)

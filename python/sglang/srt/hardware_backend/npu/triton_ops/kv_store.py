@@ -25,6 +25,8 @@ def _dcp_store_mla_kv_kernel(
     k_src_ptr,  # [T, K_DIM]
     v_src_ptr,  # [T, V_DIM]
     loc_ptr,  # [T] virtual write locations
+    k_buf_row,
+    v_buf_row,
     k_src_row,
     v_src_row,
     n_tokens,
@@ -50,13 +52,13 @@ def _dcp_store_mla_kv_kernel(
         slot = loc // DCP_SIZE
         k_mask = (k_cols < K_DIM) & owned
         tl.store(
-            k_buf_ptr + slot * K_DIM + k_cols,
+            k_buf_ptr + slot * k_buf_row + k_cols,
             tl.load(k_src_ptr + row * k_src_row + k_cols, mask=k_mask, other=0),
             mask=k_mask,
         )
         v_mask = (v_cols < V_DIM) & owned
         tl.store(
-            v_buf_ptr + slot * V_DIM + v_cols,
+            v_buf_ptr + slot * v_buf_row + v_cols,
             tl.load(v_src_ptr + row * v_src_row + v_cols, mask=v_mask, other=0),
             mask=v_mask,
         )
@@ -74,13 +76,21 @@ def dcp_store_mla_kv(
     """Filtered MLA KV write: k_buffer [S, Dc], v_buffer [S, Dr] (flat slots),
     cache_k [T, Dc], cache_v [T, Dr], loc [T] virtual locations.
 
+    The two destinations carry their own row stride, so they may be the halves
+    of one merged cache row (``kv[:, :Dc]`` and ``kv[:, Dc:]``, row stride
+    Dc + Dr) as well as two separately contiguous buffers. Passing them
+    strided is the point: the merged MLA layout cannot be viewed as a dense
+    [S, Dc] block, and copying it to make one would cost more than the write.
+
     ``dcp_size == 1`` still runs (the filter degenerates to ``loc >= 0``), so
     the kernel is a drop-in for the plain two-scatter write as well.
     """
     k_dim = k_buffer.shape[-1]
     v_dim = v_buffer.shape[-1]
-    k_buffer = k_buffer.view(-1, k_dim)
-    v_buffer = v_buffer.view(-1, v_dim)
+    if k_buffer.dim() != 2:
+        k_buffer = k_buffer.view(-1, k_dim)
+    if v_buffer.dim() != 2:
+        v_buffer = v_buffer.view(-1, v_dim)
     cache_k = cache_k.view(-1, k_dim)
     cache_v = cache_v.view(-1, v_dim)
     loc = loc.view(-1)
@@ -97,6 +107,8 @@ def dcp_store_mla_kv(
         cache_k,
         cache_v,
         loc,
+        k_buffer.stride(0),
+        v_buffer.stride(0),
         cache_k.stride(0),
         cache_v.stride(0),
         n_tokens,
