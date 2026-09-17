@@ -156,6 +156,11 @@ class ForwardMetadata:
     dcp_kv_lens_device: Optional[torch.Tensor] = None
     dcp_seqused_q: Optional[torch.Tensor] = None
     dcp_flash_metadata: Optional[torch.Tensor] = None
+    # The verify window's own FlashMLA call. Its lengths are the constant
+    # [w] * bs, so unlike the history metadata these never move and a captured
+    # graph needs no refresh.
+    dcp_window_lens: Optional[torch.Tensor] = None
+    dcp_window_flash_metadata: Optional[torch.Tensor] = None
     # Query rows per request this graph was captured with (1 decode, w verify).
     dcp_graph_q_len: Optional[int] = None
 
@@ -1049,6 +1054,12 @@ class AscendAttnBackend(AttentionBackend):
                     metadata.dcp_seqused_q,
                     self._dcp_flash_mla_heads(),
                 )
+                if q_len > 1:
+                    # Captured once and never refreshed: the window's lengths
+                    # are the constant [w] * bs the FIAS v2 form also bakes in.
+                    saved, self.forward_metadata = self.forward_metadata, metadata
+                    self._init_dcp_window_metadata(bs, q_len, seq_lens.device)
+                    self.forward_metadata = saved
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -3135,6 +3146,17 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata.dcp_flash_metadata = self._dcp_flash_mla_metadata(
             kv_lens, seqused_q, self._dcp_flash_mla_heads()
         )
+        if q_len > 1:
+            self._init_dcp_window_metadata(kv_lens.shape[0], q_len, kv_lens.device)
+
+    def _init_dcp_window_metadata(self, bs: int, w: int, device) -> None:
+        """The verify window's FlashMLA metadata: q and kv are both the window,
+        so both lengths are w for every request and nothing here moves."""
+        lens = torch.full((bs,), w, dtype=torch.int32, device=device)
+        self.forward_metadata.dcp_window_lens = lens
+        self.forward_metadata.dcp_window_flash_metadata = self._dcp_flash_mla_metadata(
+            lens, lens, self.tp_q_head_num
+        )
 
     def _dcp_flash_mla_metadata(
         self, kv_lens: torch.Tensor, seqused_q: torch.Tensor, num_heads: int
@@ -3159,6 +3181,70 @@ class AscendAttnBackend(AttentionBackend):
             mask_mode=0,
             layout_q="BSND",
         )
+
+    def _dcp_flash_mla_window(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        w: int,
+        bs: int,
+        local_heads: int,
+    ):
+        """The verify window on FlashMLA -> (out [T, h, Dc], lse [T, h]).
+
+        Unlike the history leg this one is not paged: the window's own keys are
+        the tensors just computed, so they go in as BSND, which layout_kv
+        supports alongside the paged forms. The mask is the translation of what
+        the FIAS v2 form passes -- maskMode is the old sparseMode, so
+        sparse_mode=3 with the MTP mask becomes mask_mode=3 with the same mask,
+        which is also the call upstream makes for a non-DCP verify.
+
+        BSND is the op's native layout, so this form needs none of the four
+        BNSD transposes the FIAS v2 form needs, and it takes the real head
+        count rather than one padded to a power of two.
+        """
+        metadata = self.forward_metadata
+        head_start = self.dcp_rank * local_heads
+        own = slice(head_start, head_start + local_heads)
+        num_tokens = bs * w
+        d_qk = self.kv_lora_rank + self.qk_rope_head_dim
+        q = (
+            torch.cat([q_nope[:, own], q_rope[:, own]], dim=-1)
+            .view(bs, w, local_heads, d_qk)
+            .contiguous()
+        )
+        kv = torch.cat([k_nope, k_rope], dim=-1).view(bs, w, 1, d_qk).contiguous()
+        lens = metadata.dcp_window_lens
+        assert lens is not None, (
+            "the DCP FlashMLA window needs dcp_window_lens; "
+            "init_forward_metadata did not build it for this forward mode"
+        )
+        lens = lens[:bs]
+        out, lse = flash_mla_with_kvcache(
+            q,
+            kv,
+            block_table=None,
+            cache_seqlens=lens,
+            cu_seqlens_q=None,
+            seqused_q=lens,
+            attn_mask=self.mtp_mask.to(torch.int8),
+            metadata=metadata.dcp_window_flash_metadata,
+            head_dim_v=self.kv_lora_rank,
+            softmax_scale=layer.scaling,
+            mask_mode=3,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            layout_q="BSND",
+            layout_kv="BSND",
+            layout_out="BSND",
+            return_softmax_lse=True,
+        )
+        out = out.reshape(num_tokens, local_heads, self.kv_lora_rank)
+        lse = lse.view(bs, local_heads, w).transpose(1, 2).reshape(num_tokens, local_heads)
+        return out, lse.float()
 
     def _dcp_flash_mla_paged(
         self,
@@ -3443,6 +3529,15 @@ class AscendAttnBackend(AttentionBackend):
         kv_heads = layer.tp_k_head_num
 
         # 2. current: this rank's heads x the window's own K/V, causal.
+        if self.dcp_attn_impl == "flash_mla":
+            # Already a natural-log LSE, and already this rank's heads.
+            cur_out, cur_lse = self._dcp_flash_mla_window(
+                q_nope, q_rope, k_nope, k_rope, layer, w, bs, local_heads
+            )
+            return self._dcp_verify_merge(
+                hist_out, hist_lse, cur_out, cur_lse, num_tokens, local_heads, d_c
+            )
+
         head_start = self.dcp_rank * local_heads
         cur_heads = self._dcp_fia_heads(local_heads)
 
@@ -3481,13 +3576,30 @@ class AscendAttnBackend(AttentionBackend):
             cur_lse.reshape(num_tokens, cur_heads)[:, :local_heads]
         )
 
-        # 3. merge. The history part covers every rank's KV shard, the current
-        # window is counted once. With SGLANG_NPU_DCP_VERIFY_FUSED_MERGE the
-        # window goes in as the (dcp + 1)-th shard of the exchanged history
-        # shards, so there is one merge and no intermediate LSE; otherwise the
-        # cross-rank result and the window are merged locally. Either way the
-        # outputs are finite (invalid history shards are zeroed by the merge,
-        # the window always attends to itself), so only the LSEs are sanitised.
+        return self._dcp_verify_merge(
+            hist_out, hist_lse, cur_out, cur_lse, num_tokens, local_heads, d_c
+        )
+
+    def _dcp_verify_merge(
+        self,
+        hist_out: torch.Tensor,
+        hist_lse: torch.Tensor,
+        cur_out: torch.Tensor,
+        cur_lse: torch.Tensor,
+        num_tokens: int,
+        local_heads: int,
+        d_c: int,
+    ) -> torch.Tensor:
+        """Step 3, shared by both window forms: the local merge (no collective).
+
+        The history part covers every rank's KV shard, the current window is
+        counted once. With SGLANG_NPU_DCP_VERIFY_FUSED_MERGE the window goes in
+        as the (dcp + 1)-th shard of the exchanged history shards, so there is
+        one merge and no intermediate LSE; otherwise the cross-rank result and
+        the window are merged locally. Either way the outputs are finite
+        (invalid history shards are zeroed by the merge, the window always
+        attends to itself), so only the LSEs are sanitised.
+        """
         if self.dcp_verify_fused_merge:
             merged = dcp_merge_shards(
                 hist_out,

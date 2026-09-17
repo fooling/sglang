@@ -164,6 +164,8 @@ class TestForwardMetadata(unittest.TestCase):
             "dcp_seqused_q",
             "dcp_flash_metadata",
             "dcp_graph_q_len",
+            "dcp_window_lens",
+            "dcp_window_flash_metadata",
         }
         self.assertEqual(names, expected)
 
@@ -877,6 +879,105 @@ class TestDcpFlashMlaPaged(unittest.TestCase):
         # row must read back as 0..H-1.
         head_ids = torch.arange(self.HEADS, dtype=torch.float32)
         self.assertTrue(torch.equal(lse, head_ids.expand(self.B * w, -1)))
+
+
+class TestDcpFlashMlaWindow(unittest.TestCase):
+    """The verify window on FlashMLA.
+
+    Not paged: the window's own keys are the tensors just computed, so they go
+    in as BSND with no block table. The mask is the translation of the FIAS v2
+    form's sparse_mode=3 + MTP mask, maskMode being the old sparseMode. BSND is
+    the op's native layout, so none of the four BNSD transposes the FIAS v2
+    form needs are left, and the head count goes in unpadded.
+    """
+
+    B, W, HEADS, C_DIM, R_DIM, DCP = 2, 3, 8, 16, 4, 4
+
+    def _run(self):
+        from sglang.srt.hardware_backend.npu.attention import (
+            ascend_backend as backend_mod,
+        )
+
+        local_heads = self.HEADS // self.DCP
+        rank = 1
+        backend = object.__new__(AscendAttnBackend)
+        backend.dcp_attn_impl = "flash_mla"
+        backend.dcp_size, backend.dcp_rank = self.DCP, rank
+        backend.kv_lora_rank = self.C_DIM
+        backend.qk_rope_head_dim = self.R_DIM
+        backend.mtp_mask = torch.zeros(8, 8, dtype=torch.bool)
+        lens = torch.full((self.B,), self.W, dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(
+            dcp_window_lens=lens,
+            dcp_window_flash_metadata=torch.zeros(8, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(layer_id=0, tp_k_head_num=1, scaling=0.25)
+
+        t = self.B * self.W
+        # Head index as the payload, so the slice this rank sends is checkable.
+        q_nope = (
+            torch.arange(self.HEADS, dtype=torch.float32)
+            .view(1, self.HEADS, 1)
+            .expand(t, self.HEADS, self.C_DIM)
+            .contiguous()
+        )
+        q_rope = torch.zeros(t, self.HEADS, self.R_DIM)
+        k_nope = torch.zeros(t, 1, self.C_DIM)
+        k_rope = torch.zeros(t, 1, self.R_DIM)
+
+        seen = {}
+
+        def fake_flash(q, kv, **kw):
+            seen["q"] = q
+            seen["kv_shape"] = tuple(kv.shape)
+            seen.update(kw)
+            out = torch.zeros(self.B, self.W, local_heads, self.C_DIM)
+            lse = (
+                torch.arange(local_heads, dtype=torch.float32)
+                .view(1, local_heads, 1)
+                .expand(self.B, local_heads, self.W)
+                .contiguous()
+            )
+            return out, lse
+
+        with unittest.mock.patch.object(
+            backend_mod, "flash_mla_with_kvcache", fake_flash
+        ):
+            out, lse = backend._dcp_flash_mla_window(
+                q_nope, q_rope, k_nope, k_rope, layer, self.W, self.B, local_heads
+            )
+        return seen, out, lse, local_heads, rank
+
+    def test_window_call(self):
+        seen, out, lse, local_heads, rank = self._run()
+        d_qk = self.C_DIM + self.R_DIM
+        # BSND with this rank's heads only, unpadded.
+        self.assertEqual(tuple(seen["q"].shape), (self.B, self.W, local_heads, d_qk))
+        self.assertEqual(seen["layout_q"], "BSND")
+        # Not paged: BSND keys, no block table.
+        self.assertEqual(seen["layout_kv"], "BSND")
+        self.assertEqual(seen["kv_shape"], (self.B, self.W, 1, d_qk))
+        self.assertIsNone(seen["block_table"])
+        # The causal window mask, translated from sparse_mode=3.
+        self.assertEqual(seen["mask_mode"], 3)
+        self.assertIsNotNone(seen["attn_mask"])
+        self.assertEqual(seen["attn_mask"].dtype, torch.int8)
+        # q and kv are both the window, so both lengths are w.
+        self.assertEqual(seen["cache_seqlens"].tolist(), [self.W] * self.B)
+        self.assertEqual(seen["seqused_q"].tolist(), [self.W] * self.B)
+        self.assertTrue(seen["return_softmax_lse"])
+        self.assertEqual(seen["softmax_scale"], 0.25)
+        self.assertEqual(out.shape, (self.B * self.W, local_heads, self.C_DIM))
+        self.assertEqual(lse.shape, (self.B * self.W, local_heads))
+
+    def test_sends_only_this_ranks_heads(self):
+        """q carries the head index, so the slice is readable off the call."""
+        seen, _, _, local_heads, rank = self._run()
+        sent = seen["q"][..., : self.C_DIM][0, 0, :, 0]
+        expected = torch.arange(
+            rank * local_heads, (rank + 1) * local_heads, dtype=torch.float32
+        )
+        self.assertTrue(torch.equal(sent, expected), sent)
 
 
 class TestDcpDecodeHeadPadding(unittest.TestCase):
