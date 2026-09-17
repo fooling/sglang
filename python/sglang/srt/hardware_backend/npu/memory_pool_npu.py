@@ -750,20 +750,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)]
-        # When DSA KV cache is packed into the FP8 k_buffer, the v_buffer is
-        # intentionally empty (kr_cache_dim == 0). Its data_ptr() is null
-        if not self.dsa_kv_cache_store_fp8:
-            kv_data_ptrs += [
-                self.v_buffer[i].data_ptr() for i in range(self.layer_num)
-            ]
-            kv_data_lens += [self.v_buffer[i].nbytes for i in range(self.layer_num)]
-            kv_item_lens += [
-                self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-            ]
+        # c_kv and k_rope share one contiguous kv_buffer, so one region per
+        # layer covers both. A DSA FP8 layout packs everything into the
+        # kv_cache_dim half and leaves kr_cache_dim == 0, which the same region
+        # already describes.
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [self.kv_buffer[i][0].nbytes for i in range(self.layer_num)]
         if self.index_head_dim is not None:
             ptrs, lens, item_lens = self.get_state_buf_infos()
             kv_data_ptrs += ptrs
@@ -953,9 +946,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return out
 
     def _get_cpu_offload_layer_buffers(self, local_layer_id):
+        # One entry, not two: c_kv and k_rope live in the same kv_buffer row.
         buffers = [
-            self.k_buffer[local_layer_id].view(-1, 1, self.kv_cache_dim),
-            self.v_buffer[local_layer_id].view(-1, 1, self.kr_cache_dim),
+            self.kv_buffer[local_layer_id].view(
+                -1, 1, self.kv_cache_dim + self.kr_cache_dim
+            ),
         ]
         if self.index_head_dim is not None:
             buffers.append(

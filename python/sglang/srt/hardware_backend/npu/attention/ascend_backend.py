@@ -17,6 +17,11 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.flash_mla_op import (
+    flash_mla_with_kvcache,
+    flash_mla_with_kvcache_metadata,
+    require_flash_mla,
+)
 from sglang.srt.hardware_backend.npu.attention.fp8_contracts import (
     DSA_KV_QUANT_TILE_SIZE,
     get_dsa_fp8_packed_cache_dim,
@@ -54,10 +59,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
     next_power_of_2,
-)
-from cann_ops_transformer.ops.attention.flash_mla_with_kvcache import (
-    flash_mla_with_kvcache,
-    flash_mla_with_kvcache_metadata,
 )
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -375,6 +376,13 @@ class AscendAttnBackend(AttentionBackend):
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()
         )
+        if self.use_fias_v2_bsnd:
+            # This is the only path that calls the FlashMLA custom op. Fail here
+            # rather than in the first target-verify forward.
+            require_flash_mla(
+                "SGLANG_NPU_USE_FIAS_V2_BSND with DSPARK speculative decoding "
+                "runs MLA target verify on the FlashMLA custom op."
+            )
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -885,7 +893,11 @@ class AscendAttnBackend(AttentionBackend):
         #         device=seq_lens.device,
         #     )
         device = seq_lens.device
-        if self.use_mla:
+        # FlashMLA-only metadata. Gated on use_fias_v2_bsnd, not use_mla: every
+        # other MLA consumer of actual_seq_lengths_q (the DSA indexer, the DCP
+        # FIA calls) wants the plain per-request cumulative lengths, without the
+        # leading zero that the FlashMLA cu_seqlens layout prepends below.
+        if self.use_fias_v2_bsnd:
             def _calculate_metadata_size(batch_size, aic_core_num, aiv_core_num):
                 """计算 metadata tensor 的对齐后大小。
 
@@ -992,7 +1004,7 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.block_tables[:bs, total_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if self.use_mla:
+        if self.use_fias_v2_bsnd:
             query_seq_len = (
                 self.speculative_num_draft_tokens
                 if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
@@ -1006,7 +1018,7 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
-        if self.use_mla:
+        if self.use_fias_v2_bsnd:
             metadata.seqused_q.copy_(seqused_q.to(torch.int32))
             metadata_flash_mla = flash_mla_with_kvcache_metadata(
                 cache_seqlens=seq_lens.to(torch.int32),
