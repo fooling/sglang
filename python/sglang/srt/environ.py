@@ -897,7 +897,11 @@ class Envs:
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # MLA decode-context-parallel local attention: "fia" (FIA with
     # softmax_lse_flag) or "torch" (eager-only reference implementation).
-    SGLANG_NPU_DCP_ATTN_IMPL = EnvStr("fia")
+    # Branch default: the DCP paged legs (decode, and target verify's history)
+    # run on the FlashMLA custom op. "fia" is the torch_npu path they were
+    # built on and the automatic fallback when the vendor package is absent;
+    # "torch" is the eager reference.
+    SGLANG_NPU_DCP_ATTN_IMPL = EnvStr("flash_mla")
     # Whether FIA returns the DCP attention LSE as a natural log (else base 2;
     # the backend converts it to a natural log before any merge).
     SGLANG_NPU_DCP_LSE_BASE_E = EnvBool(True)

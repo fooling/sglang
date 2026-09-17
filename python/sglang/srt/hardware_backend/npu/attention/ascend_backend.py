@@ -145,6 +145,16 @@ class ForwardMetadata:
     # decode: all cached tokens; target verify: the history before the window
     dcp_local_seq_lens: Optional[List[int]] = None
 
+    # The same lengths as a device int32 tensor, the query rows per request,
+    # and the host tiling metadata: what the FlashMLA form of those legs takes
+    # in place of the host list. Built only when the DCP attention runs on
+    # FlashMLA; under a graph these are captured buffers, refilled at replay.
+    dcp_kv_lens_device: Optional[torch.Tensor] = None
+    dcp_seqused_q: Optional[torch.Tensor] = None
+    dcp_flash_metadata: Optional[torch.Tensor] = None
+    # Query rows per request this graph was captured with (1 decode, w verify).
+    dcp_graph_q_len: Optional[int] = None
+
 
 class AscendAttnMaskBuilder:
     def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
@@ -344,6 +354,13 @@ def _cp_allgather_and_save_kv_npu(
 
 class AscendAttnBackend(AttentionBackend):
 
+    # Which op the DCP paged legs run on: the FlashMLA custom op, the torch_npu
+    # FIA form, or the eager torch reference. Resolved from
+    # SGLANG_NPU_DCP_ATTN_IMPL when DCP is on; the class default keeps a
+    # backend built without __init__ (dcp_size == 1, or a hand-built fixture)
+    # answering the same as before FlashMLA existed.
+    dcp_attn_impl: str = "fia"
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -474,10 +491,25 @@ class AscendAttnBackend(AttentionBackend):
                 getattr(model_runner, "token_to_kv_pool_allocator", None)
             )
             self.dcp_attn_impl = envs.SGLANG_NPU_DCP_ATTN_IMPL.get()
-            if self.dcp_attn_impl not in ("fia", "torch"):
+            if self.dcp_attn_impl == "flash_mla" and not is_flash_mla_available():
+                # Same rule as the verify switch: a branch default must not
+                # stop a deployment without the vendor package, but an explicit
+                # request still fails loudly rather than measuring the fallback.
+                if envs.SGLANG_NPU_DCP_ATTN_IMPL.is_set():
+                    require_flash_mla(
+                        "SGLANG_NPU_DCP_ATTN_IMPL=flash_mla runs the DCP paged "
+                        "attention on the FlashMLA custom op."
+                    )
+                logger.warning(
+                    "DCP attention defaults to the FlashMLA custom op but the "
+                    "cann_ops_transformer vendor package is not importable; "
+                    "falling back to SGLANG_NPU_DCP_ATTN_IMPL=fia."
+                )
+                self.dcp_attn_impl = "fia"
+            if self.dcp_attn_impl not in ("flash_mla", "fia", "torch"):
                 raise ValueError(
-                    "SGLANG_NPU_DCP_ATTN_IMPL must be 'fia' or 'torch', got "
-                    f"{self.dcp_attn_impl!r}."
+                    "SGLANG_NPU_DCP_ATTN_IMPL must be 'flash_mla', 'fia' or "
+                    f"'torch', got {self.dcp_attn_impl!r}."
                 )
             self.dcp_merge_impl = envs.SGLANG_NPU_DCP_MERGE_IMPL.get()
             if self.dcp_merge_impl not in DCP_MERGE_IMPLS:
@@ -751,6 +783,13 @@ class AscendAttnBackend(AttentionBackend):
                 self.dcp_size,
                 self.dcp_rank,
             )
+            self._init_dcp_flash_mla_metadata(
+                dcp_local_seq_lens(
+                    self.forward_metadata.seq_lens, self.dcp_size, self.dcp_rank
+                ),
+                self.forward_metadata.seq_lens,
+                q_len=1,
+            )
         elif self.dcp_size > 1 and forward_batch.forward_mode.is_target_verify():
             # seq_lens_cpu_int counts the verify window (DSPARK publishes it on
             # CPU); the history FIA reads only this rank's shard of the prefix
@@ -760,6 +799,19 @@ class AscendAttnBackend(AttentionBackend):
                 spec_tokens_per_req,
                 self.dcp_size,
                 self.dcp_rank,
+            )
+            # The same lengths on device, from the same helpers -- they take a
+            # tensor as readily as a host list, so the FlashMLA form needs no
+            # host mirror of its own.
+            self._init_dcp_flash_mla_metadata(
+                dcp_verify_history_local_lens(
+                    self.forward_metadata.seq_lens,
+                    spec_tokens_per_req,
+                    self.dcp_size,
+                    self.dcp_rank,
+                ),
+                self.forward_metadata.seq_lens,
+                q_len=spec_tokens_per_req,
             )
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
@@ -921,6 +973,31 @@ class AscendAttnBackend(AttentionBackend):
             metadata.dcp_local_seq_lens = dcp_local_seq_lens(
                 metadata.seq_lens_cpu_list, self.dcp_size, self.dcp_rank
             )
+            if self.dcp_attn_impl == "flash_mla":
+                # Captured buffers, refilled in place at replay: the lengths
+                # and query rows the op reads, and the host tiling metadata,
+                # which _apply_cuda_graph_metadata recomputes outside the graph
+                # and copies in (it depends on the lengths, which move).
+                q_len = (
+                    self.speculative_num_draft_tokens
+                    if forward_mode.is_target_verify()
+                    else 1
+                )
+                metadata.dcp_graph_q_len = q_len
+                kv_lens = (
+                    dcp_verify_history_local_lens(
+                        seq_lens, q_len, self.dcp_size, self.dcp_rank
+                    )
+                    if forward_mode.is_target_verify()
+                    else dcp_local_seq_lens(seq_lens, self.dcp_size, self.dcp_rank)
+                ).to(torch.int32)
+                metadata.dcp_kv_lens_device = kv_lens
+                metadata.dcp_seqused_q = (seq_lens > 0).to(torch.int32) * q_len
+                metadata.dcp_flash_metadata = self._dcp_flash_mla_metadata(
+                    kv_lens,
+                    metadata.dcp_seqused_q,
+                    self._dcp_flash_mla_heads(),
+                )
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -1097,6 +1174,26 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+        if self.dcp_size > 1 and metadata.dcp_flash_metadata is not None:
+            # seq_lens here already carries the verify window / spec offset
+            # added just above, which is what the history length subtracts.
+            q_len = metadata.dcp_graph_q_len
+            kv_lens = (
+                dcp_verify_history_local_lens(
+                    seq_lens, q_len, self.dcp_size, self.dcp_rank
+                )
+                if forward_mode.is_target_verify()
+                else dcp_local_seq_lens(seq_lens, self.dcp_size, self.dcp_rank)
+            ).to(torch.int32)
+            metadata.dcp_kv_lens_device.copy_(kv_lens)
+            metadata.dcp_seqused_q.copy_((seq_lens > 0).to(torch.int32) * q_len)
+            metadata.dcp_flash_metadata.copy_(
+                self._dcp_flash_mla_metadata(
+                    metadata.dcp_kv_lens_device,
+                    metadata.dcp_seqused_q,
+                    self._dcp_flash_mla_heads(),
+                )
+            )
         if self.flash_mla_serves_verify:
             metadata.seqused_q.copy_(seqused_q.to(torch.int32))
             metadata_flash_mla = flash_mla_with_kvcache_metadata(
@@ -2957,6 +3054,124 @@ class AscendAttnBackend(AttentionBackend):
         pad = x.new_zeros(x.shape[0], heads - x.shape[1], x.shape[2])
         return torch.cat([x, pad], dim=1)
 
+    def _dcp_flash_mla_heads(self, layer_heads: Optional[int] = None) -> int:
+        """Query heads a DCP FlashMLA leg presents: all H * dcp of them.
+
+        The FIA form optionally pads this to a power of two
+        (SGLANG_NPU_DCP_PAD_HEADS); FlashMLA takes the real count, as the
+        upstream verify call does.
+        """
+        return (
+            self.tp_q_head_num * self.dcp_size if layer_heads is None else layer_heads
+        )
+
+    def _init_dcp_flash_mla_metadata(
+        self, kv_lens: torch.Tensor, global_seq_lens: torch.Tensor, q_len: int
+    ) -> None:
+        """Eager counterpart of the captured DCP FlashMLA buffers.
+
+        ``kv_lens`` is this rank's shard length per request and ``q_len`` the
+        query rows each request presents. A graph-padding row has a global
+        length of 0 and presents none; a real request with an empty shard still
+        presents its rows and gets a +inf LSE, which the merge weights to zero.
+        """
+        if self.dcp_attn_impl != "flash_mla":
+            return
+        kv_lens = kv_lens.to(torch.int32)
+        seqused_q = (global_seq_lens > 0).to(torch.int32) * q_len
+        self.forward_metadata.dcp_kv_lens_device = kv_lens
+        self.forward_metadata.dcp_seqused_q = seqused_q
+        self.forward_metadata.dcp_flash_metadata = self._dcp_flash_mla_metadata(
+            kv_lens, seqused_q, self._dcp_flash_mla_heads()
+        )
+
+    def _dcp_flash_mla_metadata(
+        self, kv_lens: torch.Tensor, seqused_q: torch.Tensor, num_heads: int
+    ) -> torch.Tensor:
+        """Host tiling metadata for a DCP paged FlashMLA call.
+
+        ``mask_mode=0`` is "no mask", which is what these legs want: the DCP
+        decode attends the whole shard, and target verify's history is entirely
+        before the window. maskMode is the old sparseMode (aclnn_flash_attn.h),
+        so 0 here is the same choice the FIA form spells as sparse_mode=0.
+        """
+        return flash_mla_with_kvcache_metadata(
+            cache_seqlens=kv_lens,
+            num_heads_q=num_heads,
+            num_heads_kv=1,
+            cu_seqlens_q=None,
+            seqused_q=seqused_q,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            head_dim_qk=self.kv_lora_rank + self.qk_rope_head_dim,
+            head_dim_v=self.kv_lora_rank,
+            mask_mode=0,
+            layout_q="BSND",
+        )
+
+    def _dcp_flash_mla_paged(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        layer: RadixAttention,
+        q_len: int,
+        block_table: torch.Tensor,
+    ):
+        """FlashMLA over this rank's KV shard -> (out, lse), the FlashMLA form
+        of the paged unmasked legs the FIA path spells with sparse_mode=0.
+
+        q_nope [T, N, Dc] / q_rope [T, N, Dr] token-major, T = bs * q_len;
+        returns out [T, N, Dc] and lse [T, N] float32. The op's LSE is a
+        natural log and is +inf for a request whose shard is empty
+        (flash_attn's golden: ``log(sum + eps) + max``, then ``where(sum <= 0,
+        inf)``), which is what the cross-rank merge reads as zero weight -- the
+        same contract the FIA form already has, so no conversion either way.
+
+        The KV cache goes in whole: FlashMLA takes the merged pool row as
+        PA_BBND, so unlike the FIA form these legs never split it into two
+        strided halves.
+        """
+        metadata = self.forward_metadata
+        num_tokens, num_heads = q_nope.shape[:2]
+        bs = num_tokens // q_len
+        kv_lens = metadata.dcp_kv_lens_device
+        seqused_q = metadata.dcp_seqused_q
+        assert kv_lens is not None and seqused_q is not None, (
+            "the DCP FlashMLA legs need dcp_kv_lens_device / dcp_seqused_q; "
+            "init_forward_metadata did not build them for this forward mode"
+        )
+        if not self.graph_mode:
+            kv_lens, seqused_q = kv_lens[:bs], seqused_q[:bs]
+        # [T, N, Dc] + [T, N, Dr] -> BSND [B, S, N, Dqk]
+        q = (
+            torch.cat([q_nope, q_rope], dim=-1)
+            .view(bs, q_len, num_heads, self.kv_lora_rank + self.qk_rope_head_dim)
+            .contiguous()
+        )
+        out, lse = flash_mla_with_kvcache(
+            q,
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            block_table=block_table,
+            cache_seqlens=kv_lens,
+            cu_seqlens_q=None,
+            seqused_q=seqused_q,
+            attn_mask=None,
+            metadata=metadata.dcp_flash_metadata,
+            head_dim_v=self.kv_lora_rank,
+            softmax_scale=layer.scaling,
+            mask_mode=0,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            layout_q="BSND",
+            layout_kv="PA_BBND",
+            layout_out="BSND",
+            return_softmax_lse=True,
+        )
+        # out [B, S, N, Dv] -> [T, N, Dv]; lse [B, N, S] -> token-major [T, N].
+        out = out.reshape(num_tokens, num_heads, self.kv_lora_rank)
+        lse = lse.view(bs, num_heads, q_len).transpose(1, 2).reshape(num_tokens, num_heads)
+        return out, lse.float()
+
     def _dcp_natural_lse(self, lse: torch.Tensor) -> torch.Tensor:
         """FIA LSE -> natural log (SGLANG_NPU_DCP_LSE_BASE_E=0 means base 2)."""
         return lse if self.dcp_lse_scale == 1.0 else lse * self.dcp_lse_scale
@@ -3066,6 +3281,18 @@ class AscendAttnBackend(AttentionBackend):
         kv_heads = layer.tp_k_head_num
 
         # 1. history: all heads x this rank's KV shard before the window.
+        if self.dcp_attn_impl == "flash_mla":
+            # Paged and unmasked -- what the FIA form below spells as
+            # sparse_mode=0 -- and its LSE is already a natural log, so it goes
+            # to the merge without the _dcp_natural_lse rescale.
+            hist_out, hist_lse = self._dcp_flash_mla_paged(
+                q_nope, q_rope, layer, w, block_table
+            )
+            hist_out, hist_lse = self._dcp_merge(hist_out, hist_lse, return_lse=True)
+            return self._dcp_verify_current_and_merge(
+                q_nope, q_rope, k_nope, k_rope, layer, w, bs, hist_out, hist_lse
+            )
+
         c_kv, k_rope_buf = _split_mla_kv_buffer(
             self.token_to_kv_pool.get_kv_buffer(layer.layer_id), self.kv_lora_rank
         )
@@ -3117,6 +3344,29 @@ class AscendAttnBackend(AttentionBackend):
             self._dcp_natural_lse(hist_lse.view(num_tokens, hist_heads)[:, :num_heads]),
             return_lse=True,
         )
+
+        return self._dcp_verify_current_and_merge(
+            q_nope, q_rope, k_nope, k_rope, layer, w, bs, hist_out, hist_lse
+        )
+
+    def _dcp_verify_current_and_merge(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        w: int,
+        bs: int,
+        hist_out: torch.Tensor,
+        hist_lse: torch.Tensor,
+    ) -> torch.Tensor:
+        """Steps 2 and 3 of the DCP target verify, shared by both history
+        forms: this rank's heads over the window's own K/V, causal, merged
+        locally with the history that already covers every rank's shard."""
+        num_tokens, num_heads, d_c = q_nope.shape
+        local_heads = num_heads // self.dcp_size
+        kv_heads = layer.tp_k_head_num
 
         # 2. current: this rank's heads x the window's own K/V, causal.
         head_start = self.dcp_rank * local_heads
@@ -3264,6 +3514,14 @@ class AscendAttnBackend(AttentionBackend):
                 ),
                 metadata.dcp_local_seq_lens,
                 layer.scaling,
+            )
+        elif self.dcp_attn_impl == "flash_mla":
+            # Already a natural-log LSE, so no _dcp_natural_lse rescale.
+            output, lse = self._dcp_flash_mla_paged(
+                q_nope, q_rope, layer, 1, metadata.block_tables
+            )
+            return self._dcp_merge(output, lse).view(
+                -1, (num_heads // self.dcp_size) * self.kv_lora_rank
             )
         else:
             output, lse = self._dcp_decode_fia(q_nope, q_rope, layer)

@@ -160,6 +160,10 @@ class TestForwardMetadata(unittest.TestCase):
             "prefix_lens",
             "flatten_prefix_block_tables",
             "dcp_local_seq_lens",
+            "dcp_kv_lens_device",
+            "dcp_seqused_q",
+            "dcp_flash_metadata",
+            "dcp_graph_q_len",
         }
         self.assertEqual(names, expected)
 
@@ -762,6 +766,117 @@ class TestCommonTemplate(unittest.TestCase):
         backend.common_template(forward_batch, call_fn)
         for call in call_fn.call_args_list:
             self.assertIs(call.args[1], forward_batch)
+
+
+class TestDcpFlashMlaPaged(unittest.TestCase):
+    """The DCP paged legs on the FlashMLA custom op.
+
+    Same computation the FIA form spells with sparse_mode=0, so the op must get
+    mask_mode=0 and no attn_mask. Everything it reads is a device tensor, which
+    is the point: the FIA form takes its KV lengths as a host list, and that is
+    what holds the backend on needs_cpu_seq_lens.
+    """
+
+    B, HEADS, C_DIM, R_DIM, PAGE, DCP = 2, 8, 16, 4, 4, 4
+
+    def _backend(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.dcp_attn_impl = "flash_mla"
+        backend.dcp_size, backend.dcp_rank = self.DCP, 1
+        backend.graph_mode = True  # no slicing, so the whole batch is read
+        backend.kv_lora_rank = self.C_DIM
+        backend.qk_rope_head_dim = self.R_DIM
+        backend.page_size = self.PAGE
+        backend.tp_q_head_num = self.HEADS // self.DCP
+        return backend
+
+    def _run(self, q_len):
+        from sglang.srt.hardware_backend.npu.attention import (
+            ascend_backend as backend_mod,
+        )
+
+        backend = self._backend()
+        t = self.B * q_len
+        kv_lens = torch.tensor([7, 0], dtype=torch.int32)
+        seqused_q = torch.tensor([q_len, q_len], dtype=torch.int32)
+        meta_blob = torch.zeros(8, dtype=torch.int32)
+        block_table = torch.zeros(self.B, 3, dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(
+            dcp_kv_lens_device=kv_lens,
+            dcp_seqused_q=seqused_q,
+            dcp_flash_metadata=meta_blob,
+            block_tables=block_table,
+        )
+        kv_rows = torch.zeros(3, self.PAGE, 1, self.C_DIM + self.R_DIM)
+        backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: kv_rows)
+        layer = SimpleNamespace(layer_id=0, tp_k_head_num=1, scaling=0.5)
+
+        seen = {}
+
+        def fake_flash(q, kv, **kw):
+            seen["q_shape"] = tuple(q.shape)
+            seen["kv_is_the_merged_row"] = kv is kv_rows
+            seen.update(kw)
+            # out [B, S, N, Dv]; lse [B, N, S] -- head before seq, per the
+            # vendor's softmax_lse shape for a BSND query.
+            out = torch.zeros(self.B, q_len, self.HEADS, self.C_DIM)
+            lse = (
+                torch.arange(self.HEADS, dtype=torch.float32)
+                .view(1, self.HEADS, 1)
+                .expand(self.B, self.HEADS, q_len)
+                .contiguous()
+            )
+            return out, lse
+
+        with unittest.mock.patch.object(
+            backend_mod, "flash_mla_with_kvcache", fake_flash
+        ):
+            out, lse = backend._dcp_flash_mla_paged(
+                torch.randn(t, self.HEADS, self.C_DIM),
+                torch.randn(t, self.HEADS, self.R_DIM),
+                layer,
+                q_len,
+                block_table,
+            )
+        return seen, out, lse
+
+    def test_decode_leg(self):
+        seen, out, lse = self._run(q_len=1)
+        # BSND query, nope and rope concatenated into one head dim.
+        self.assertEqual(seen["q_shape"], (self.B, 1, self.HEADS, self.C_DIM + self.R_DIM))
+        self.assertEqual(seen["layout_q"], "BSND")
+        # The merged cache row goes in whole, never split into two halves.
+        self.assertTrue(seen["kv_is_the_merged_row"])
+        self.assertEqual(seen["layout_kv"], "PA_BBND")
+        self.assertEqual(seen["head_dim_v"], self.C_DIM)
+        # Unmasked: maskMode is the old sparseMode, and the FIA form of this
+        # leg passes sparse_mode=0 with atten_mask=None.
+        self.assertEqual(seen["mask_mode"], 0)
+        self.assertIsNone(seen["attn_mask"])
+        self.assertTrue(seen["return_softmax_lse"])
+        self.assertEqual(seen["softmax_scale"], 0.5)
+        # Lengths are device tensors, not host lists.
+        self.assertIsInstance(seen["cache_seqlens"], torch.Tensor)
+        self.assertEqual(seen["cache_seqlens"].tolist(), [7, 0])
+        self.assertIsInstance(seen["seqused_q"], torch.Tensor)
+        self.assertIsNone(seen["cu_seqlens_q"])
+        self.assertEqual(out.shape, (self.B, self.HEADS, self.C_DIM))
+        self.assertEqual(lse.shape, (self.B, self.HEADS))
+        self.assertEqual(lse.dtype, torch.float32)
+
+    def test_verify_history_leg_is_token_major(self):
+        """q_len = w: the LSE arrives head-before-seq and has to come back
+        token-major, or the merge would pair every row with the wrong head."""
+        w = 3
+        seen, out, lse = self._run(q_len=w)
+        self.assertEqual(seen["q_shape"], (self.B, w, self.HEADS, self.C_DIM + self.R_DIM))
+        self.assertEqual(seen["mask_mode"], 0)
+        self.assertEqual(out.shape, (self.B * w, self.HEADS, self.C_DIM))
+        self.assertEqual(lse.shape, (self.B * w, self.HEADS))
+        # The stub returns lse = head index, constant over seq, so every token
+        # row must read back as 0..H-1.
+        head_ids = torch.arange(self.HEADS, dtype=torch.float32)
+        self.assertTrue(torch.equal(lse, head_ids.expand(self.B * w, -1)))
 
 
 class TestDcpDecodeHeadPadding(unittest.TestCase):
