@@ -3383,7 +3383,11 @@ class AscendAttnBackend(AttentionBackend):
         block_table = metadata.block_tables
         if not self.graph_mode:
             # FIA TND needs block_table rows == len(actual_seq_lengths).
-            history_lens = history_lens[:bs]
+            # The host list exists only when the run publishes seq_lens_cpu:
+            # on the host-free path it is None, and only the FIA / torch forms
+            # read it -- FlashMLA takes dcp_kv_lens_device instead.
+            if history_lens is not None:
+                history_lens = history_lens[:bs]
             block_table = block_table[:bs]
 
         if bs == 0:

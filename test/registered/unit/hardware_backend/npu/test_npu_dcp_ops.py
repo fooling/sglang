@@ -1392,6 +1392,45 @@ class TestDcpTargetBackendInit(CustomTestCase):
             (md.flatten_prefix_block_tables, expect),
         )
 
+    def test_host_free_eager_verify_does_not_slice_a_missing_host_list(self):
+        """On the host-free path nothing publishes seq_lens_cpu, so the host
+        list of per-rank history lengths is None -- only the FIA and torch
+        forms ever read it, FlashMLA takes the device lengths. The eager verify
+        entry sliced it to the batch unconditionally, which is a TypeError on
+        one rank and, to everyone waiting on its all-to-all, a hang."""
+        dcp, w, bs = 2, 3, 2
+        backend_mod, backend, mr = _real_ascend_backend(
+            dcp_size=dcp, allocator_page_size=self.PAGE * dcp, page=self.PAGE
+        )
+        backend.speculative_num_draft_tokens = w
+        backend.graph_mode = False
+        heads = 2 * dcp
+        d_c, d_r = backend.kv_lora_rank, backend.qk_rope_head_dim
+        backend.forward_metadata = SimpleNamespace(
+            dcp_local_seq_lens=None,
+            block_tables=torch.zeros(bs + 1, 4, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(tp_q_head_num=heads, tp_k_head_num=1)
+        fb = SimpleNamespace(num_token_non_padded_cpu=bs * w)
+        seen = {}
+
+        def split(q_nope, q_rope, k_nope, k_rope, layer, w_, history_lens, table):
+            seen["history_lens"], seen["rows"] = history_lens, table.shape[0]
+            return q_nope.new_zeros(q_nope.shape[0], (heads // dcp) * d_c)
+
+        with patch.object(backend, "_forward_verify_mla_dcp_split", split):
+            out = backend._forward_verify_mla_dcp(
+                torch.zeros(bs * w, heads * d_c),
+                torch.zeros(bs * w, heads * d_r),
+                torch.zeros(bs * w, d_c),
+                torch.zeros(bs * w, d_r),
+                layer,
+                fb,
+            )
+        self.assertIsNone(seen["history_lens"])
+        self.assertEqual(seen["rows"], bs)
+        self.assertEqual(out.shape[0], bs * w)
+
     def test_host_free_decode_block_table_keeps_the_dcp_stride(self):
         """The zero-bubble path has no host length to truncate on, so the table
         spans the whole req_to_token row -- but the stride is still the virtual
