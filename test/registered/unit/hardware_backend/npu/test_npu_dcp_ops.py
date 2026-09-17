@@ -1639,26 +1639,33 @@ def _fake_fia_v1_tnd_paged(
         start = end
 
 
-def _fake_fias_v2_bnsd(query, key, value, *, query_rope, key_rope, **kw):
-    """FIAS v2 stand-in for the DCP verify current call: BNSD, non-paged K/V
-    of the window, causal; returns (out [B, N, w, D], lse [B, N, w, 1])."""
-    assert kw["input_layout"] == "BNSD" and kw["return_softmax_lse"]
+def _fake_fias_v2_bsnd(query, key, value, *, query_rope, key_rope, **kw):
+    """FIAS v2 stand-in for the DCP verify current call: BSND, non-paged K/V
+    of the window, causal.
+
+    Returns (out [B, w, N, D], lse [B, N, w, 1]). The output follows
+    input_layout, so it comes back token-major; the LSE does not -- it is
+    head-before-seq in both layouts, which is why the caller still transposes
+    that one and no longer transposes the output.
+    """
+    assert kw["input_layout"] == "BSND" and kw["return_softmax_lse"]
     assert kw["sparse_mode"] == 3 and kw["atten_mask"] is not None
     assert "block_table" not in kw
-    b, n, w, d = query.shape
+    b, w, n, d = query.shape
     assert kw["num_query_heads"] == n
     assert kw["actual_seq_qlen"] == kw["actual_seq_kvlen"] == [w] * b
     outs, lses = [], []
     for i in range(b):
+        # Already [w, N, D] -- the BNSD form had to transpose to get here.
         lse, o = _mla_attn_with_lse(
-            query[i].transpose(0, 1),
-            query_rope[i].transpose(0, 1),
-            key[i, 0],
-            key_rope[i, 0],
+            query[i],
+            query_rope[i],
+            key[i, :, 0],
+            key_rope[i, :, 0],
             kw["softmax_scale"],
             True,
         )
-        outs.append(o.transpose(0, 1))
+        outs.append(o)
         lses.append(lse.transpose(0, 1)[..., None])
     return torch.stack(outs), torch.stack(lses)
 
@@ -1787,7 +1794,7 @@ class TestAscendBackendVerifySplit(CustomTestCase):
         fake_npu.npu_fused_infer_attention_score.out.side_effect = (
             _fake_fia_v1_tnd_paged
         )
-        fake_npu.npu_fused_infer_attention_score_v2.side_effect = _fake_fias_v2_bnsd
+        fake_npu.npu_fused_infer_attention_score_v2.side_effect = _fake_fias_v2_bsnd
         with patch.object(
             dcp_ops, "_attention_update_op", attention_update_reference
         ), patch.object(backend_mod, "is_fia_nz", return_value=False), patch.object(

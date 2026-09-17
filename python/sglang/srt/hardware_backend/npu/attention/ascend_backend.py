@@ -3505,20 +3505,25 @@ class AscendAttnBackend(AttentionBackend):
         # BSND value is rejected outright (EZ0026). The window's keys are the
         # tensors just computed, and the paged cache holds only this rank's
         # shard of them, while this leg needs the whole window. (The generic
-        # flash_attn op does take BSND, but it is a different op.) So the four
-        # BNSD transposes below, and the power-of-two head padding, stay.
+        # flash_attn op does take BSND, but it is a different op.) The head
+        # padding stays with it. The BNSD transposes do not: FIAS v2 takes
+        # BSND, which the DCP decode leg already uses, and the rows here are
+        # token-major already.
         head_start = self.dcp_rank * local_heads
         cur_heads = self._dcp_fia_heads(local_heads)
 
-        def to_bnsd(x):
-            # [T, N, D] -> [B, N, w, D]
-            return x.view(bs, w, x.shape[1], x.shape[2]).transpose(1, 2).contiguous()
+        def to_bsnd(x):
+            # [T, N, D] -> [B, w, N, D]. The rows are already token-major, so
+            # this is a reshape; the copy that remains is only the one a head
+            # slice forces, and for the window's own K/V not even that. The
+            # BNSD form this replaces had to transpose all four.
+            return x.view(bs, w, x.shape[1], x.shape[2]).contiguous()
 
         own = slice(head_start, head_start + local_heads)
-        cur_q_nope = to_bnsd(self._dcp_pad_heads(q_nope[:, own], cur_heads))
-        cur_q_rope = to_bnsd(self._dcp_pad_heads(q_rope[:, own], cur_heads))
-        cur_k_nope = to_bnsd(k_nope)
-        cur_k_rope = to_bnsd(k_rope)
+        cur_q_nope = to_bsnd(self._dcp_pad_heads(q_nope[:, own], cur_heads))
+        cur_q_rope = to_bsnd(self._dcp_pad_heads(q_rope[:, own], cur_heads))
+        cur_k_nope = to_bsnd(k_nope)
+        cur_k_rope = to_bsnd(k_rope)
         cur_out, cur_lse = torch_npu.npu_fused_infer_attention_score_v2(
             cur_q_nope,
             cur_k_nope,
@@ -3527,7 +3532,7 @@ class AscendAttnBackend(AttentionBackend):
             key_rope=cur_k_rope,
             num_query_heads=cur_heads,
             num_key_value_heads=kv_heads,
-            input_layout="BNSD",
+            input_layout="BSND",
             softmax_scale=layer.scaling,
             sparse_mode=3,
             atten_mask=self.mtp_mask,
@@ -3537,8 +3542,10 @@ class AscendAttnBackend(AttentionBackend):
             next_tokens=0,
             return_softmax_lse=True,
         )
-        # [B, N, w, D] / [B, N, w, 1] -> token-major [T, N, D] / [T, N]
-        cur_out = cur_out.transpose(1, 2).reshape(num_tokens, cur_heads, d_c)
+        # out follows input_layout, so [B, w, N, D] is already token-major and
+        # the reshape is a view. The LSE does not: it comes back head-before-
+        # seq in both layouts, so that one is still a transpose.
+        cur_out = cur_out.reshape(num_tokens, cur_heads, d_c)
         cur_lse = cur_lse.reshape(bs, cur_heads, w).transpose(1, 2)
         cur_out = cur_out[:, :local_heads]
         cur_lse = self._dcp_natural_lse(
