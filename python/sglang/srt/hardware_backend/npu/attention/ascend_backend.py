@@ -464,6 +464,15 @@ class AscendAttnBackend(AttentionBackend):
         if self.dcp_size > 1:
             # DCP builds rank-local FIA lengths and block tables from the host
             # sequence lengths, so the scheduler must publish seq_lens_cpu.
+            # FIA takes actual_seq_lengths_kv as a host list; only moving the DCP
+            # attention to an op that takes device lengths (FlashMLA) can drop
+            # this, and with it the overlap scheduler's per-step seq_lens D2H.
+            if not self.needs_cpu_seq_lens:
+                logger.warning(
+                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is overridden "
+                    "to 1 under decode context parallel: the DCP FIA calls read "
+                    "their KV lengths from seq_lens_cpu."
+                )
             self.needs_cpu_seq_lens = True
             self._check_dcp_allocator_page_size(
                 getattr(model_runner, "token_to_kv_pool_allocator", None)
@@ -2697,25 +2706,39 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
-            if self.forward_metadata.seq_lens_cpu_int is None:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-            else:
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-                )
-            actual_seq_lengths = np.arange(
-                self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens + q_nope.shape[0],
-                self.speculative_num_draft_tokens,
+            # One fixed draft block per request, so the batch size is a query
+            # shape -- no host sequence length needed to recover it.
+            query_seq_len = self.speculative_num_draft_tokens
+            assert q_nope.shape[0] % query_seq_len == 0, (
+                f"target verify expects whole draft blocks: {q_nope.shape[0]} "
+                f"query rows is not a multiple of {query_seq_len}"
             )
+            batch_size = q_nope.shape[0] // query_seq_len
+
+            actual_seq_lengths = actual_seq_lengths_kv = None
+            if not self.use_fias_v2_bsnd:
+                # Only the torch_npu FIA call below wants host lengths. FlashMLA
+                # takes device tensors, so building these would be the one thing
+                # keeping the FlashMLA path on needs_cpu_seq_lens.
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_lengths_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    )
+                actual_seq_lengths = np.arange(
+                    query_seq_len,
+                    query_seq_len + q_nope.shape[0],
+                    query_seq_len,
+                )
 
             # When not in graph_mode, query is sliced to num_token_non_padded
             # which may drop finished requests. The FIA TND kernel requires
             # block_table.shape[0] == len(actual_seq_lengths); slice to match.
             if not self.graph_mode:
-                actual_bs = len(actual_seq_lengths)
-                block_table = self.forward_metadata.block_tables[:actual_bs]
-                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+                block_table = self.forward_metadata.block_tables[:batch_size]
+                if actual_seq_lengths_kv is not None:
+                    actual_seq_lengths_kv = actual_seq_lengths_kv[:batch_size]
             else:
                 block_table = self.forward_metadata.block_tables
 
@@ -2755,12 +2778,9 @@ class AscendAttnBackend(AttentionBackend):
             num_query_heads = q_nope.shape[1]
             if self.use_fias_v2_bsnd:
                 # The existing paged MLA cache is [block, KV_N, page, D].
-                # V2 consumes it with BNSD queries; keep the cache unchanged.
-                batch_size = len(actual_seq_lengths_kv)
-                query_seq_len = self.speculative_num_draft_tokens
-                assert (
-                    q_nope.shape[0] == batch_size * query_seq_len
-                ), "FIAS V2 target verify requires one fixed draft block per request"
+                # FlashMLA consumes it with BSND queries; keep the cache
+                # unchanged. batch_size / query_seq_len came from the query
+                # shape above, so this path reads no host sequence length.
                 if batch_size == 0:
                     attn_output = torch.empty_like(q_nope)
                 else:

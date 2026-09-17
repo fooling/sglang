@@ -1886,7 +1886,7 @@ class TestDsparkWithoutDcp(CustomTestCase):
 
     PAGE, W, HEADS, D_C, D_R = 4, 3, 8, 6, 2
 
-    def _backend(self, is_draft_worker, fias_v2=False):
+    def _backend(self, is_draft_worker, fias_v2=False, cpu_seq_lens=True):
         backend_mod = _import_ascend_backend()
         cls = backend_mod.AscendAttnBackend
         req_to_token = torch.arange(2 * 64, dtype=torch.int32).view(2, 64) + 8
@@ -1949,7 +1949,9 @@ class TestDsparkWithoutDcp(CustomTestCase):
             backend_mod,
             "require_flash_mla",
             lambda reason: None,
-        ), envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(fias_v2):
+        ), envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(
+            fias_v2
+        ), envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.override(cpu_seq_lens):
             backend = cls(model_runner)
         return backend_mod, backend, model_runner
 
@@ -2075,6 +2077,85 @@ class TestDsparkWithoutDcp(CustomTestCase):
                 self.assertEqual(call.kwargs["num_heads"], self.HEADS)
                 self.assertEqual(call.kwargs["block_size"], self.PAGE)
                 self.assertTrue(torch.equal(call.kwargs["block_table"], expect))
+
+    def test_flash_mla_verify_reads_no_host_seq_lens(self):
+        """With FlashMLA on, target verify runs without seq_lens_cpu.
+
+        FIA takes its KV lengths as a host list, which is what keeps this
+        backend on needs_cpu_seq_lens (and so keeps the overlap scheduler's
+        per-step seq_lens D2H). FlashMLA takes device tensors, so the path must
+        work with SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 -- nothing may
+        read seq_lens_cpu_int / seq_lens_cpu_list.
+        """
+        backend_mod, backend, mr = self._backend(False, fias_v2=True, cpu_seq_lens=False)
+        self.assertFalse(backend.needs_cpu_seq_lens)
+
+        seq_lens = [5, 13]
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            seq_lens=torch.tensor(seq_lens),
+            seq_lens_cpu=None,
+            spec_info=SimpleNamespace(draft_token_num=self.W),
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
+            req_pool_indices=torch.tensor([1, 0]),
+            extend_seq_lens=None,
+            out_cache_loc=None,
+            num_token_non_padded_cpu=2 * self.W,
+        )
+        fake_flash = MagicMock(
+            side_effect=lambda q, *a, **kw: (q[..., : self.D_C].contiguous(), None)
+        )
+        fake_flash_meta = MagicMock(
+            side_effect=lambda **kw: torch.zeros(8, dtype=torch.int32)
+        )
+        num_pages = 64 // self.PAGE
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_kv_buffer=lambda _: torch.zeros(
+                num_pages, self.PAGE, 1, self.D_C + self.D_R
+            )
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=self.HEADS,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            v_head_dim=self.D_C,
+            scaling=1.0,
+        )
+        T = 2 * self.W
+        with patch.object(
+            backend_mod, "flash_mla_with_kvcache", fake_flash
+        ), patch.object(
+            backend_mod, "flash_mla_with_kvcache_metadata", fake_flash_meta
+        ), patch.object(
+            backend_mod, "torch_npu", MagicMock()
+        ), patch.object(
+            backend_mod, "is_fia_nz", return_value=False
+        ):
+            backend.init_forward_metadata(fb)
+            md = backend.forward_metadata
+            # The host mirrors the FIA path needs were never built.
+            self.assertIsNone(md.seq_lens_cpu_int)
+            self.assertIsNone(md.seq_lens_cpu_list)
+            out = backend.forward_mtp(
+                torch.zeros(T, self.HEADS * self.D_C),
+                torch.zeros(T, self.D_C),
+                None,
+                layer,
+                fb,
+                False,
+                q_rope=torch.zeros(T, self.HEADS * self.D_R),
+                k_rope=torch.zeros(T, self.D_R),
+            )
+        self.assertEqual(out.shape, (T, self.HEADS * self.D_C))
+        # Batch size came from the query shape, and every length the op saw is a
+        # device tensor built from forward_batch.seq_lens.
+        call = fake_flash.call_args
+        self.assertEqual(call.kwargs["cache_seqlens"].tolist(), seq_lens)
+        self.assertEqual(call.kwargs["seqused_q"].tolist(), [self.W] * 2)
+        self.assertEqual(call.kwargs["block_table"].shape[0], 2)
+        self.assertEqual(call.args[0].shape[:2], (2, self.W))
 
     def test_draft_backend_is_plain_dcp1(self):
         _, backend, _ = self._backend(True)
