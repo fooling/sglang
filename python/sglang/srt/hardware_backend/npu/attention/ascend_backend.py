@@ -672,6 +672,29 @@ class AscendAttnBackend(AttentionBackend):
             return torch.tensor(list(host_lens), dtype=torch.int32)
         return device_lens.cpu().int()
 
+    def _dcp_block_tables_strided(
+        self, req_pool_indices: torch.Tensor, max_len: Optional[int]
+    ) -> torch.Tensor:
+        """Per-rank block table, taking the column stride before the gather.
+
+        Indexing req_to_token with a tensor is advanced indexing: it copies
+        whole rows, and a row is max_context_len wide. Gathering first and
+        striding after therefore allocates batch * context * 4 bytes on every
+        forward only to keep one column in every block_stride -- on a full KV
+        pool, enough transient to fail an unrelated HCCL allocation. Striding
+        the whole table first is a view; the gather that follows copies only
+        the columns that survive it.
+
+        ``max_len`` truncates as the host path does; None means the whole row,
+        which is what the host-free path has to do for want of a length.
+        """
+        block_stride = self.page_size * self.dcp_size
+        strided = self.req_to_token_pool.req_to_token[:, ::block_stride]
+        rows = strided[req_pool_indices]
+        if max_len is not None:
+            rows = rows[:, : -(-int(max_len) // block_stride)]
+        return (rows // block_stride).to(torch.int32)
+
     @staticmethod
     def _dcp_needs_host_seq_lens(dcp_attn_impl: str) -> bool:
         """Whether this DCP attention form reads its KV lengths as a host list.
@@ -802,11 +825,8 @@ class AscendAttnBackend(AttentionBackend):
             ):
                 seq_lens_max += self.speculative_step_id + 1
             if self.dcp_size > 1:
-                self.forward_metadata.block_tables = dcp_block_tables(
-                    self.req_to_token_pool.req_to_token[forward_batch.req_pool_indices],
-                    seq_lens_max,
-                    self.page_size,
-                    self.dcp_size,
+                self.forward_metadata.block_tables = self._dcp_block_tables_strided(
+                    forward_batch.req_pool_indices, seq_lens_max
                 )
             else:
                 self.forward_metadata.block_tables = (
@@ -832,9 +852,9 @@ class AscendAttnBackend(AttentionBackend):
             # Host-free: no length to truncate on, so the table spans the whole
             # req_to_token row. Under DCP a block is a virtual page of
             # page_size * dcp_size, so the stride is not page_size.
-            rows = self.req_to_token_pool.req_to_token[forward_batch.req_pool_indices]
-            self.forward_metadata.block_tables = dcp_block_tables(
-                rows, rows.shape[1], self.page_size, self.dcp_size
+            #
+            self.forward_metadata.block_tables = self._dcp_block_tables_strided(
+                forward_batch.req_pool_indices, None
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
@@ -977,9 +997,18 @@ class AscendAttnBackend(AttentionBackend):
             # non-blocking way the extend lengths are, and ForwardBatch carries
             # no settled mirror of it. The loop that remains walks only the
             # scheduler's own prefix lengths.
-            rows = self.req_to_token_pool.req_to_token[forward_batch.req_pool_indices]
+            # Strided view of the whole table first, gather second: indexing
+            # with a tensor copies whole rows, and a row is max_context_len
+            # wide. Striding first keeps one column in every block_stride, so
+            # the copy is that much smaller. Taking the first
+            # ceil(seq_len / block_stride) of a strided row selects the same
+            # entries as slicing to seq_len and then striding.
+            strided = self.req_to_token_pool.req_to_token[:, ::block_stride]
+            rows = strided[forward_batch.req_pool_indices]
             parts = [
-                torch.flatten(rows[i, :seq_len][::block_stride] // block_stride)
+                torch.flatten(
+                    rows[i, : -(-seq_len // block_stride)] // block_stride
+                )
                 for i, seq_len in enumerate(seq_prefix_lens)
             ]
             self.forward_metadata.flatten_prefix_block_tables = (

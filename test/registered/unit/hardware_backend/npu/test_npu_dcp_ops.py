@@ -1266,6 +1266,70 @@ class TestDcpTargetBackendInit(CustomTestCase):
         self.assertTrue(backend.use_fias_v2_bsnd)
         self.assertFalse(backend.flash_mla_serves_verify)
 
+    def test_block_tables_stride_before_they_gather(self):
+        """req_to_token is indexed with the column stride first, the batch
+        second.
+
+        Indexing it with a tensor is advanced indexing: it copies whole rows,
+        and a row is max_context_len wide. Gathering first and striding after
+        allocates batch * context * 4 bytes every forward to keep one column in
+        every block_stride -- enough, on a full KV pool, to fail an unrelated
+        HCCL allocation. Striding first makes the copy that much smaller.
+        """
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        dcp = 2
+        backend_mod, backend, mr = _real_ascend_backend(
+            dcp_size=dcp, allocator_page_size=self.PAGE * dcp, page=self.PAGE
+        )
+        real = mr.req_to_token_pool.req_to_token
+        keys = []
+
+        class _Recording:
+            """Forwards to the real table, recording how it is indexed."""
+
+            def __getitem__(self, key):
+                keys.append(key)
+                return real[key]
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=_Recording())
+        backend.req_to_token = backend.req_to_token_pool.req_to_token
+        prefix_lens, seq_lens = [8, 20], [3, 5]
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            seq_lens=torch.tensor([p + s for p, s in zip(prefix_lens, seq_lens)]),
+            seq_lens_cpu=torch.tensor([p + s for p, s in zip(prefix_lens, seq_lens)]),
+            spec_info=None,
+            spec_algorithm=None,
+            req_pool_indices=torch.tensor([1, 0]),
+            extend_seq_lens=torch.tensor(seq_lens),
+            extend_seq_lens_cpu=seq_lens,
+            extend_prefix_lens=torch.tensor(prefix_lens),
+            extend_prefix_lens_cpu=prefix_lens,
+            out_cache_loc=None,
+        )
+        with patch.object(torch, "tensor", _cpu_tensor):
+            backend.init_forward_metadata(fb)
+
+        gathers = [k for k in keys if isinstance(k, torch.Tensor)]
+        self.assertFalse(
+            gathers,
+            "req_to_token was indexed with a tensor before being column-strided, "
+            "which copies whole max_context_len rows",
+        )
+        # What it is indexed with instead: the column stride.
+        self.assertTrue(
+            any(
+                isinstance(k, tuple) and isinstance(k[-1], slice) and k[-1].step
+                for k in keys
+            ),
+            keys,
+        )
+
     def test_prefill_lengths_never_come_from_the_device_tensors(self):
         """The DCP prefix path runs an all-gather per request per chunk, and the
         chunk count comes from these lengths. forward_batch_info builds the
@@ -1377,11 +1441,11 @@ class TestDcpTargetBackendInit(CustomTestCase):
         )
         seq_lens_cpu = [5, 19]
         widths = []
-        real_block_tables = backend_mod.dcp_block_tables
+        real_block_tables = backend_mod.AscendAttnBackend._dcp_block_tables_strided
 
-        def spy(rows, max_len, page_size, dcp_size):
+        def spy(self_, req_pool_indices, max_len):
             widths.append(max_len)
-            return real_block_tables(rows, max_len, page_size, dcp_size)
+            return real_block_tables(self_, req_pool_indices, max_len)
 
         for spec_info, extra in ((None, 0), (SimpleNamespace(), 2)):
             backend.speculative_step_id = extra - 1
@@ -1400,9 +1464,9 @@ class TestDcpTargetBackendInit(CustomTestCase):
                 out_cache_loc=None,
             )
             widths.clear()
-            with patch.object(backend_mod, "dcp_block_tables", spy), patch.object(
-                torch, "tensor", _cpu_tensor
-            ):
+            with patch.object(
+                backend_mod.AscendAttnBackend, "_dcp_block_tables_strided", spy
+            ), patch.object(torch, "tensor", _cpu_tensor):
                 backend.init_forward_metadata(fb)
             max_len = max(seq_lens_cpu) + extra
             self.assertEqual(widths, [max_len])
