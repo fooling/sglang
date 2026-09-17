@@ -786,10 +786,11 @@ class TestDcpDecodeHeadPadding(unittest.TestCase):
             dcp_local_seq_lens=[3, 0],
             block_tables=torch.zeros(self.B, 1, dtype=torch.int32),
         )
+        # The MLA pool keeps c_kv and k_rope in one contiguous row, shaped
+        # [pages, page_size, 1, C_DIM + R_DIM]; the backend slices it.
         backend.token_to_kv_pool = SimpleNamespace(
-            get_kv_buffer=lambda _: (
-                torch.zeros(8, 1, self.C_DIM),
-                torch.zeros(8, 1, self.R_DIM),
+            get_kv_buffer=lambda _: torch.zeros(
+                2, self.PAGE, 1, self.C_DIM + self.R_DIM
             )
         )
         layer = SimpleNamespace(
