@@ -3346,7 +3346,7 @@ class AscendAttnBackend(AttentionBackend):
             hist_out, hist_lse = self._dcp_flash_mla_paged(
                 q_nope, q_rope, layer, w, block_table
             )
-            hist_out, hist_lse = self._dcp_merge(hist_out, hist_lse, return_lse=True)
+            hist_out, hist_lse = self._dcp_history_exchange_or_merge(hist_out, hist_lse)
             return self._dcp_verify_current_and_merge(
                 q_nope, q_rope, k_nope, k_rope, layer, w, bs, hist_out, hist_lse
             )
@@ -3400,17 +3400,28 @@ class AscendAttnBackend(AttentionBackend):
         hist_lse = self._dcp_natural_lse(
             hist_lse.view(num_tokens, hist_heads)[:, :num_heads]
         )
-        if self.dcp_verify_fused_merge:
-            # Exchange only: the received shards are merged below together with
-            # the current window, in one pass over dcp + 1 shards.
-            shard_out, shard_lse = self._dcp_exchange(hist_out, hist_lse)
-        else:
-            # [T, H * dcp, D] -> ([T, H, D], [T, H] float32 natural log)
-            hist_out, hist_lse = self._dcp_merge(hist_out, hist_lse, return_lse=True)
+        hist_out, hist_lse = self._dcp_history_exchange_or_merge(hist_out, hist_lse)
 
         return self._dcp_verify_current_and_merge(
             q_nope, q_rope, k_nope, k_rope, layer, w, bs, hist_out, hist_lse
         )
+
+    def _dcp_history_exchange_or_merge(
+        self, hist_out: torch.Tensor, hist_lse: torch.Tensor
+    ):
+        """Cross-rank step of the verify history, whichever op produced it.
+
+        With SGLANG_NPU_DCP_VERIFY_FUSED_MERGE this only exchanges: the shards
+        come back per-rank and are merged later in one pass that also takes the
+        current window as the (dcp + 1)-th shard. Otherwise they are merged
+        here and the window is merged against the result. Both history forms go
+        through this, so choosing the FlashMLA form cannot quietly turn the
+        fused merge off.
+        """
+        if self.dcp_verify_fused_merge:
+            return self._dcp_exchange(hist_out, hist_lse)
+        # [T, H * dcp, D] -> ([T, H, D], [T, H] float32 natural log)
+        return self._dcp_merge(hist_out, hist_lse, return_lse=True)
 
     def _dcp_verify_current_and_merge(
         self,
@@ -3479,8 +3490,8 @@ class AscendAttnBackend(AttentionBackend):
         # the window always attends to itself), so only the LSEs are sanitised.
         if self.dcp_verify_fused_merge:
             merged = dcp_merge_shards(
-                shard_out,
-                shard_lse,
+                hist_out,
+                hist_lse,
                 self.dcp_merge_impl,
                 extra_out=cur_out,
                 extra_lse=cur_lse,
