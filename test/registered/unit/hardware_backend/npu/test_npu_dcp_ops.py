@@ -1266,6 +1266,68 @@ class TestDcpTargetBackendInit(CustomTestCase):
         self.assertTrue(backend.use_fias_v2_bsnd)
         self.assertFalse(backend.flash_mla_serves_verify)
 
+    def test_prefill_lengths_never_come_from_the_device_tensors(self):
+        """The DCP prefix path runs an all-gather per request per chunk, and the
+        chunk count comes from these lengths. forward_batch_info builds the
+        device ones with a pinned, non-blocking copy from a temporary nothing
+        keeps alive, so on the host-free path a rank can read one before it
+        lands, pick a different chunk count, and hang the whole group on an
+        exchange it never reaches. The scheduler's own lists never went to the
+        device, so they are settled and identical on every rank -- this asserts
+        the path reads those and touches the device tensors not at all."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        dcp = 2
+        backend_mod, backend, mr = _real_ascend_backend(
+            dcp_size=dcp, allocator_page_size=self.PAGE * dcp, page=self.PAGE
+        )
+        prefix_lens, seq_lens = [8, 20], [3, 5]
+
+        class _Poisoned:
+            """Stands in for a device tensor whose copy has not landed: any
+            read is the bug this test is about."""
+
+            def __getattr__(self, name):
+                raise AssertionError(
+                    f"the prefill path read the device length tensor (.{name}); "
+                    "it must use the scheduler's *_cpu list"
+                )
+
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            seq_lens=torch.tensor([p + s for p, s in zip(prefix_lens, seq_lens)]),
+            seq_lens_cpu=torch.tensor([p + s for p, s in zip(prefix_lens, seq_lens)]),
+            spec_info=None,
+            spec_algorithm=None,
+            req_pool_indices=torch.tensor([1, 0]),
+            extend_seq_lens=_Poisoned(),
+            extend_seq_lens_cpu=seq_lens,
+            extend_prefix_lens=_Poisoned(),
+            extend_prefix_lens_cpu=prefix_lens,
+            out_cache_loc=None,
+        )
+        with patch.object(torch, "tensor", _cpu_tensor):
+            backend.init_forward_metadata(fb)
+
+        md = backend.forward_metadata
+        self.assertEqual(md.extend_seq_lens_cpu_int.tolist(), seq_lens)
+        self.assertEqual(md.prefix_lens.tolist(), prefix_lens)
+
+        # And the flattened prefix table matches what those lengths imply.
+        stride = self.PAGE * dcp
+        rows = mr.req_to_token_pool.req_to_token[torch.tensor([1, 0])]
+        expect = torch.cat(
+            [
+                torch.flatten(rows[i, :n][::stride] // stride)
+                for i, n in enumerate(prefix_lens)
+            ]
+        )
+        self.assertTrue(
+            torch.equal(md.flatten_prefix_block_tables, expect),
+            (md.flatten_prefix_block_tables, expect),
+        )
+
     def test_host_free_decode_block_table_keeps_the_dcp_stride(self):
         """The zero-bubble path has no host length to truncate on, so the table
         spans the whole req_to_token row -- but the stride is still the virtual

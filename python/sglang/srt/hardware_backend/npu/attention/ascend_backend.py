@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import torch_npu
@@ -653,6 +653,31 @@ class AscendAttnBackend(AttentionBackend):
         self.attn_cp_size = model_runner.ps.attn_cp_size
 
     @staticmethod
+    def _host_extend_lens(
+        host_lens: Optional[Sequence[int]], device_lens: torch.Tensor
+    ) -> torch.Tensor:
+        """Extend lengths as int32 on the host, from the scheduler's own list.
+
+        The DCP prefix path runs an all-gather per request per chunk, and the
+        chunk count comes from these lengths -- so every rank in the group must
+        read the same ones or the collectives desynchronise and the group
+        blocks with no message. Copying the device tensor back is not safe for
+        that: forward_batch_info builds extend_seq_lens / extend_prefix_lens
+        with ``torch.tensor(..., pin_memory=...).to(device, non_blocking=True)``
+        from a temporary nothing keeps alive, so on the host-free path -- where
+        pinned staging makes that copy genuinely asynchronous -- a rank can
+        read it before it lands and pick a different chunk count.
+
+        The ``*_cpu`` mirrors are the lists the scheduler built; they never
+        went to the device, so they are settled by construction, identical on
+        every rank, and free to read. The device round-trip stays only for the
+        gpu_only path, which hands tensors in directly and leaves no mirror.
+        """
+        if host_lens is not None:
+            return torch.tensor(list(host_lens), dtype=torch.int32)
+        return device_lens.cpu().int()
+
+    @staticmethod
     def _dcp_needs_host_seq_lens(dcp_attn_impl: str) -> bool:
         """Whether this DCP attention form reads its KV lengths as a host list.
 
@@ -818,8 +843,10 @@ class AscendAttnBackend(AttentionBackend):
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
-            self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
+            # The scheduler's own list, not a copy back from the device one.
+            # See _host_extend_lens for why that distinction is load-bearing.
+            self.forward_metadata.extend_seq_lens_cpu_int = self._host_extend_lens(
+                forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens
             )
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
@@ -942,29 +969,29 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         ):
-            self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
-                "cpu"
+            self.forward_metadata.prefix_lens = self._host_extend_lens(
+                forward_batch.extend_prefix_lens_cpu, forward_batch.extend_prefix_lens
             )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
-            self.forward_metadata.flatten_prefix_block_tables = torch.empty(
-                0, dtype=torch.int32
-            ).to(self.device)
             # Under DCP a virtual page of page_size * dcp_size tokens maps to
             # physical page of the same id on every rank.
             block_stride = self.page_size * self.dcp_size
-            for req_idx, seq_len in zip(
-                forward_batch.req_pool_indices.tolist(), seq_prefix_lens
-            ):
-                req_indices = self.req_to_token_pool.req_to_token[req_idx]
-                req_prefix_block_tables = (
-                    req_indices[:seq_len][::block_stride] // block_stride
-                )
-                self.forward_metadata.flatten_prefix_block_tables = torch.cat(
-                    (
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        torch.flatten(req_prefix_block_tables),
-                    )
-                )
+            # Gather the rows on device once. Indexing with the device tensor
+            # rather than a .tolist() of it keeps the last per-step host read
+            # out of this path: req_pool_indices is built the same pinned,
+            # non-blocking way the extend lengths are, and ForwardBatch carries
+            # no settled mirror of it. The loop that remains walks only the
+            # scheduler's own prefix lengths.
+            rows = self.req_to_token_pool.req_to_token[forward_batch.req_pool_indices]
+            parts = [
+                torch.flatten(rows[i, :seq_len][::block_stride] // block_stride)
+                for i, seq_len in enumerate(seq_prefix_lens)
+            ]
+            self.forward_metadata.flatten_prefix_block_tables = (
+                torch.cat(parts)
+                if parts
+                else torch.empty(0, dtype=torch.int32, device=self.device)
+            )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             self.forward_metadata.swa_out_cache_loc = (
