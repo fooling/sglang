@@ -799,6 +799,14 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
+        # Needed on both paths below: the DCP verify branch sizes its device
+        # lengths with it, and that branch runs with or without a host mirror.
+        # It is a field of the batch, not a length read off the device.
+        spec_tokens_per_req = (
+            int(forward_batch.spec_info.draft_token_num)
+            if forward_batch.forward_mode.is_target_verify()
+            else 0
+        )
         if self.needs_cpu_seq_lens:
             # Empty attention-DP ranks still participate in the target forward.
             if self.dcp_size > 1 and forward_batch.batch_size:
@@ -810,7 +818,6 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch.seq_lens.max() if forward_batch.batch_size else 0
                 )
             if forward_batch.forward_mode.is_target_verify():
-                spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
                 # Overlap scheduling can publish the CPU sequence length one step
                 # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
                 # derive the block-table width from the same source. Otherwise a

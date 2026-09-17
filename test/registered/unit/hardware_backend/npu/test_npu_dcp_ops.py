@@ -1471,6 +1471,49 @@ class TestDcpTargetBackendInit(CustomTestCase):
         # And no host mirror was built for the run to lean on.
         self.assertIsNone(backend.forward_metadata.seq_lens_cpu_int)
 
+    def test_host_free_eager_verify_metadata_needs_no_host_length(self):
+        """The DCP verify branch sizes this rank's history lengths with the
+        window width, and that width was only ever assigned inside the
+        host-length block -- so an eager target verify on the host-free path
+        died on an unbound name before it built anything. The width is a field
+        of the batch; it is set for both paths now, and the branch builds its
+        device lengths without a host mirror."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        dcp, w = 2, 3
+        with envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.override(False):
+            backend_mod, backend, mr = _real_ascend_backend(
+                dcp_size=dcp, allocator_page_size=self.PAGE * dcp, page=self.PAGE
+            )
+            backend.needs_cpu_seq_lens = False
+            seen = {}
+
+            def flash_metadata(kv_lens, global_seq_lens, q_len):
+                seen["kv_lens"], seen["q_len"] = kv_lens.tolist(), q_len
+
+            backend._init_dcp_flash_mla_metadata = flash_metadata
+            fb = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=2,
+                # DSPARK's lengths already count the window.
+                seq_lens=torch.tensor([5 + w, 19 + w]),
+                seq_lens_cpu=None,
+                spec_info=SimpleNamespace(draft_token_num=w),
+                spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
+                req_pool_indices=torch.tensor([1, 0]),
+                extend_seq_lens=None,
+                extend_seq_lens_cpu=None,
+                out_cache_loc=None,
+            )
+            with patch.object(torch, "tensor", _cpu_tensor):
+                backend.init_forward_metadata(fb)
+
+        self.assertEqual(seen["q_len"], w)
+        # rank 0 of 2 holds ceil(n / 2) of a history of n tokens.
+        self.assertEqual(seen["kv_lens"], [3, 10])
+        self.assertIsNone(backend.forward_metadata.seq_lens_cpu_int)
+        self.assertIsNone(backend.forward_metadata.dcp_local_seq_lens)
+
     def test_eager_decode_block_table_width_from_host_lens(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
