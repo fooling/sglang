@@ -177,14 +177,34 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # call keeps actual_seq_kvlen=[w]*bs baked at capture.
         return self._is_dcp_target() and self.capture_forward_mode.is_target_verify()
 
+    def _dcp_reads_host_seq_lens(self):
+        """Whether this DCP target's captured attention takes its KV lengths
+        from the host.
+
+        Only the FIA and torch forms do: FIA reads actual_seq_lengths_kv as a
+        host list, so every replay has to hand it this rank's shard lengths.
+        The FlashMLA form reads dcp_kv_lens_device, which replay prep fills on
+        the device, and the verify window's FIAS v2 lengths are the constant
+        w -- so nothing in that graph is a function of a host length, and
+        execute() must not go and fetch one. A backend that does not say (an
+        older one, or a test double) is taken to be the FIA form.
+        """
+        backend = getattr(self.model_runner, "attn_backend", None)
+        backend = getattr(backend, "full_attn_backend", backend)
+        impl = getattr(backend, "dcp_attn_impl", None)
+        return impl is None or backend._dcp_needs_host_seq_lens(impl)
+
     def _uses_v2_seq_len_update(self):
         # IDLE DP ranks replay the same target-verify graph as active ranks.
         # Select the handler from the captured graph, not the runtime mode;
         # a V1 update key is ignored by V2 and leaves stale KV lengths behind.
         if self._is_dcp_target_verify_graph():
-            # The V1 update key rebinds only the history FIA v1 ops; the
-            # current FIAS v2 ops (actual_seq_kvlen=[w]*bs) stay as captured.
-            return False
+            # FIA form: the V1 update key rebinds only the history FIA v1 ops;
+            # the current FIAS v2 ops (actual_seq_kvlen=[w]*bs) stay as
+            # captured. FlashMLA form: the window's FIAS v2 call is the only
+            # updatable op there is, so the key is its own, whatever
+            # SGLANG_NPU_USE_FIAS_V2_BSND says about the non-DCP verify.
+            return not self._dcp_reads_host_seq_lens()
         return self.if_use_v2 or (
             self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify()
         )
@@ -271,7 +291,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify():
+            if self._is_dcp_target() and not self._dcp_reads_host_seq_lens():
+                # No host length to read and none to fetch. The one updatable
+                # op a FlashMLA DCP graph can hold is the verify window's FIAS
+                # v2 call, whose KV length is the window itself; a decode graph
+                # holds none, and the update then has nothing to rebind.
+                # Chosen by the captured graph, not the runtime mode: an idle
+                # rank replays the verify graph too.
+                is_verify = self.capture_forward_mode.is_target_verify()
+                seq_lens = [self.captured_req_width if is_verify else 0] * self.bs
+            elif forward_batch.forward_mode.is_target_verify():
                 if self.model_runner.spec_algorithm.is_dspark():
                     # DSpark publishes the final verify KV boundary on CPU.
                     # Do not add the speculative width a second time.

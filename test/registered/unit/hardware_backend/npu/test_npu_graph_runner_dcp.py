@@ -92,6 +92,73 @@ class TestNpuGraphRunnerDcpSeqLens(CustomTestCase):
             )
             self.assertEqual(lens, [0, 0, 11, 0])
 
+    def _flash_mla_runner(self, capture_mode, hybrid):
+        """A DCP target whose attention backend is the FlashMLA form, reached
+        directly or through the hybrid (KDA + MLA) wrapper K3 uses."""
+        runner = self._runner(capture_mode, False)
+        full = SimpleNamespace(
+            dcp_attn_impl="flash_mla",
+            _dcp_needs_host_seq_lens=lambda impl: impl in ("fia", "torch"),
+        )
+        runner.model_runner.attn_backend = (
+            SimpleNamespace(full_attn_backend=full) if hybrid else full
+        )
+        return runner
+
+    def _execute_without_host_lens(self, runner, mode):
+        """Any read of a length -- host mirror or device tensor -- fails the
+        test: on the host-free path the first is not published and the second
+        is a device sync."""
+
+        class _Unreadable:
+            def __getattr__(self, name):
+                raise AssertionError(f"execute() read a sequence length (.{name})")
+
+            def __getitem__(self, key):
+                raise AssertionError("execute() sliced a sequence length")
+
+        parallel = SimpleNamespace(dcp_enabled=True, attn_dcp_size=2, attn_dcp_rank=1)
+        fb = SimpleNamespace(
+            needs_forward_metadata_init=lambda: False,
+            input_ids=torch.zeros(runner.raw_num_token, dtype=torch.long),
+            positions=torch.zeros(runner.raw_num_token, dtype=torch.long),
+            input_embeds=None,
+            mrope_positions=None,
+            forward_mode=mode,
+            seq_lens=_Unreadable(),
+            seq_lens_cpu=_Unreadable(),
+        )
+        with patch.object(ngr, "get_parallel", return_value=parallel):
+            runner.execute(fb)
+        return runner.backend.calls[-1]
+
+    def test_flash_mla_dcp_verify_replays_without_any_host_length(self):
+        """FlashMLA reads dcp_kv_lens_device and the window's FIAS v2 lengths
+        are the constant w, so a DCP FlashMLA graph is not a function of any
+        host length. The replay used to fetch one anyway and rebind a V1 key no
+        op in the graph reads -- and on the host-free path that value is only
+        DSPARK's upper bound, which DCP sharding could not have used."""
+        for hybrid in (False, True):
+            runner = self._flash_mla_runner(ForwardMode.TARGET_VERIFY, hybrid)
+            self.assertFalse(runner._dcp_reads_host_seq_lens())
+            for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.IDLE):
+                lens, key = self._execute_without_host_lens(runner, mode)
+                self.assertEqual((lens, key), ([self.W] * 4, "actual_seq_kvlen"))
+
+    def test_flash_mla_dcp_decode_replays_without_a_device_sync(self):
+        runner = self._flash_mla_runner(ForwardMode.DECODE, hybrid=True)
+        lens, key = self._execute_without_host_lens(runner, ForwardMode.DECODE)
+        self.assertEqual((lens, key), ([0] * 4, "actual_seq_lengths_kv"))
+
+    def test_fia_form_still_gets_this_ranks_host_lengths(self):
+        runner = self._flash_mla_runner(ForwardMode.TARGET_VERIFY, hybrid=True)
+        runner.model_runner.attn_backend.full_attn_backend.dcp_attn_impl = "fia"
+        self.assertTrue(runner._dcp_reads_host_seq_lens())
+        lens, key = self._execute(
+            runner, ForwardMode.TARGET_VERIFY, [8, 9, 30], dcp=True
+        )
+        self.assertEqual((lens, key), ([0, 0, 11, 0], "actual_seq_lengths_kv"))
+
     def test_non_dcp_target_verify_unchanged(self):
         seq_lens = [8, 9, 30]
         runner = self._runner(ForwardMode.TARGET_VERIFY, False, True)
