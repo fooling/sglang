@@ -2068,6 +2068,28 @@ def init_world_group(
     )
 
 
+def _dcp_collective_backend(backend: str) -> str:
+    """The backend the DCP attention reduction builds its group on.
+
+    Every model-parallel group inherits the world group's backend, and on NPU
+    that becomes "zbal" as soon as SGLANG_ZBAL_LOCAL_MEM_SIZE is set -- see
+    platforms/device_mixin.py. That switch exists for the allocator and the
+    DeepEP buffer; nothing in-tree treats it as a general collective backend.
+    The DCP reduction does an all_to_all_single per layer, so it keeps the
+    device's own collective backend rather than inheriting that one. A process
+    may hold groups on different backends, so zbal keeps the groups it is for.
+    """
+    if backend != "zbal":
+        return backend
+    logger.info(
+        "DCP builds its group on hccl rather than the inherited zbal backend: "
+        "SGLANG_ZBAL_LOCAL_MEM_SIZE repoints every group's backend, and the "
+        "per-layer all_to_all_single of the DCP attention reduction is not "
+        "part of what that backend covers."
+    )
+    return "hccl"
+
+
 def init_model_parallel_group(
     group_ranks: List[List[int]],
     local_rank: int,
@@ -2708,7 +2730,7 @@ def initialize_model_parallel(
         _DCP = init_model_parallel_group(
             dcp_group_ranks,
             get_world_group().local_rank,
-            backend,
+            _dcp_collective_backend(backend),
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,

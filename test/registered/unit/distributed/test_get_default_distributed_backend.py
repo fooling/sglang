@@ -73,5 +73,28 @@ class TestGetDefaultDistributedBackend(CustomTestCase):
         self.assertEqual(get_default_distributed_backend("unobtanium"), "gloo")
 
 
+
+class TestDcpCollectiveBackend(CustomTestCase):
+    """The DCP group does not inherit the zbal backend.
+
+    SGLANG_ZBAL_LOCAL_MEM_SIZE repoints _DEVICE_TO_DISTRIBUTED_BACKEND["npu"]
+    to "zbal", and every model-parallel group is built from the world group's
+    backend, so the switch reaches groups that have nothing to do with the
+    allocator or the DeepEP buffer it exists for. The DCP attention reduction
+    does an all_to_all_single per layer, so its group keeps hccl.
+    """
+
+    def test_zbal_is_not_inherited(self):
+        from sglang.srt.distributed.parallel_state import _dcp_collective_backend
+
+        self.assertEqual(_dcp_collective_backend("zbal"), "hccl")
+
+    def test_every_other_backend_is_left_alone(self):
+        from sglang.srt.distributed.parallel_state import _dcp_collective_backend
+
+        for backend in ("hccl", "nccl", "gloo", "mooncake", "xccl"):
+            self.assertEqual(_dcp_collective_backend(backend), backend, backend)
+
+
 if __name__ == "__main__":
     unittest.main()
