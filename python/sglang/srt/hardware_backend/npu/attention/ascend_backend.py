@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch_npu
@@ -91,6 +91,19 @@ def _reshape_kv_for_fia_nz(
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
+
+
+def _split_mla_kv_buffer(
+    kv_cache: torch.Tensor, kv_lora_rank: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(c_kv, k_rope) halves of the MLA pool's merged kv_buffer row.
+
+    NPUMLATokenToKVPool keeps the latent and the RoPE key in one contiguous
+    buffer, so get_kv_buffer hands back a single tensor whose last dim is
+    kv_lora_rank + qk_rope_head_dim. Both halves are strided views, not
+    contiguous blocks.
+    """
+    return kv_cache[..., :kv_lora_rank], kv_cache[..., kv_lora_rank:]
 
 
 @dataclass
@@ -723,6 +736,15 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.use_fias_v2_bsnd and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Eager counterpart of the FlashMLA graph metadata. Graph capture
+            # needs a fixed-size buffer it can copy into every replay; eager can
+            # just keep what the host op returns.
+            self._init_flash_mla_metadata_eager(self.forward_metadata.seq_lens)
+
         if (
             self.use_mla
             and forward_batch.forward_mode.is_extend()
@@ -1037,6 +1059,28 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         self.graph_mode = True
+
+    def _init_flash_mla_metadata_eager(self, seq_lens: torch.Tensor) -> None:
+        """seqused_q + host tiling metadata for an eager FlashMLA verify.
+
+        Mirrors the graph path: one query block of speculative_num_draft_tokens
+        per live request, zero for a padded one.
+        """
+        seqused_q = (seq_lens > 0).to(torch.int32) * self.speculative_num_draft_tokens
+        self.forward_metadata.seqused_q = seqused_q
+        self.forward_metadata.metadata_flash_mla = flash_mla_with_kvcache_metadata(
+            cache_seqlens=seq_lens.to(torch.int32),
+            num_heads_q=self.tp_q_head_num,
+            num_heads_kv=1,
+            cu_seqlens_q=None,
+            seqused_q=seqused_q,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            head_dim_qk=576,
+            head_dim_v=512,
+            mask_mode=3,
+            layout_q="BSND",
+        )
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -2624,19 +2668,28 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output
         else:
+            # FlashMLA consumes the merged row whole; the torch_npu FIA path
+            # below wants the two halves, so keep both spellings available.
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            # c_kv = kv_cache[..., : self.kv_lora_rank]
-            # k_rope = kv_cache[..., self.kv_lora_rank :]
-            # if is_fia_nz():
-            #     k_rope_cache = _reshape_kv_for_fia_nz(
-            #         k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
-            #     )
-            #     c_kv_cache = _reshape_kv_for_fia_nz(
-            #         c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
-            #     )
-            # else:
-            #     k_rope_cache = k_rope
-            #     c_kv_cache = c_kv
+            if not self.use_fias_v2_bsnd:
+                c_kv, k_rope = _split_mla_kv_buffer(kv_cache, self.kv_lora_rank)
+                if is_fia_nz():
+                    k_rope_cache = _reshape_kv_for_fia_nz(
+                        k_rope,
+                        layer.tp_k_head_num,
+                        self.qk_rope_head_dim,
+                        self.page_size,
+                    )
+                    c_kv_cache = _reshape_kv_for_fia_nz(
+                        c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
+                    )
+                else:
+                    k_rope_cache = k_rope.view(
+                        -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
+                    )
+                    c_kv_cache = c_kv.view(
+                        -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
+                    )
 
             q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
@@ -2701,7 +2754,6 @@ class AscendAttnBackend(AttentionBackend):
 
             num_query_heads = q_nope.shape[1]
             if self.use_fias_v2_bsnd:
-                # print(f"xxxxxxxxxxxxxxxxxx",flush=True)
                 # The existing paged MLA cache is [block, KV_N, page, D].
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
@@ -2752,10 +2804,7 @@ class AscendAttnBackend(AttentionBackend):
                         .reshape(-1, num_query_heads, self.kv_lora_rank)
                     )
             else:
-                assert False
-                assert True
-                print(f"yyyyyyyyyyyyyyyyyyyyyyyyyyyy",flush=True)
-
+                # FlashMLA off: the torch_npu FIA target-verify path, unchanged.
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                         q_nope,
@@ -2949,7 +2998,9 @@ class AscendAttnBackend(AttentionBackend):
         kv_heads = layer.tp_k_head_num
 
         # 1. history: all heads x this rank's KV shard before the window.
-        c_kv, k_rope_buf = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        c_kv, k_rope_buf = _split_mla_kv_buffer(
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id), self.kv_lora_rank
+        )
         if is_fia_nz():
             k_rope_cache = _reshape_kv_for_fia_nz(
                 k_rope_buf, kv_heads, d_r, self.page_size
@@ -3063,7 +3114,9 @@ class AscendAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         bs, num_heads = q_nope.shape[:2]
         kv_heads = layer.tp_k_head_num
-        c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        c_kv, k_rope = _split_mla_kv_buffer(
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id), self.kv_lora_rank
+        )
         if is_fia_nz():
             k_rope_cache = _reshape_kv_for_fia_nz(
                 k_rope, kv_heads, self.qk_rope_head_dim, self.page_size
@@ -3128,7 +3181,10 @@ class AscendAttnBackend(AttentionBackend):
         if self.dcp_attn_impl == "torch":
             # Eager reference: read the pages named by the block table in
             # logical order and run softmax attention per request.
-            c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            c_kv, k_rope = _split_mla_kv_buffer(
+                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                self.kv_lora_rank,
+            )
             block_ids = metadata.block_tables.flatten()
             output, lse = mla_decode_with_lse_torch(
                 q_nope,

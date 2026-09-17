@@ -1242,10 +1242,16 @@ class TestNpuMlaPoolDcpHelpers(CustomTestCase):
         pool.kv_cache_dim, pool.kr_cache_dim = self.D_C, self.D_R
         pool.dsa_kv_cache_store_fp8 = False
         pool.cpu_offloading_chunk_size = 3
-        shape = (self.LAYERS, pages + 1, self.P, 1)
-        pool.k_buffer = torch.zeros(*shape, self.D_C)
-        pool.v_buffer = torch.zeros(*shape, self.D_R)
+        # c_kv and k_rope share one contiguous kv_buffer row.
+        pool.kv_buffer = torch.zeros(
+            self.LAYERS, pages + 1, self.P, 1, self.D_C + self.D_R
+        )
         return pool
+
+    def _halves(self, pool, layer):
+        """(c_kv rows, k_rope rows) of one layer, as [slot, D] views."""
+        rows = pool.kv_buffer[layer].view(-1, self.D_C + self.D_R)
+        return rows[:, : self.D_C], rows[:, self.D_C :]
 
     def test_cpu_copy_roundtrip_and_move_guard(self):
         from sglang.srt.hardware_backend.npu import memory_pool_npu
@@ -1266,20 +1272,19 @@ class TestNpuMlaPoolDcpHelpers(CustomTestCase):
             v_rows = torch.randn(self.LAYERS, seq_len, self.D_R)
             for layer in range(self.LAYERS):
                 phys = old_virtual[owned] // c
-                pool.k_buffer[layer].view(-1, self.D_C)[phys] = k_rows[layer][owned]
-                pool.v_buffer[layer].view(-1, self.D_R)[phys] = v_rows[layer][owned]
+                k_view, v_view = self._halves(pool, layer)
+                k_view[phys] = k_rows[layer][owned]
+                v_view[phys] = v_rows[layer][owned]
             with patch.object(
                 memory_pool_npu, "get_parallel", return_value=parallel
             ), patch.object(torch, "npu", fake_npu, create=True):
                 backup = pool.get_cpu_copy(old_virtual)
-                pool.k_buffer.zero_()
-                pool.v_buffer.zero_()
+                pool.kv_buffer.zero_()
                 pool.load_cpu_copy(backup, new_virtual)
                 with self.assertRaisesRegex(NotImplementedError, "decode context"):
                     pool.move_kv_cache(new_virtual, old_virtual)
             for layer in range(self.LAYERS):
-                k_view = pool.k_buffer[layer].view(-1, self.D_C)
-                v_view = pool.v_buffer[layer].view(-1, self.D_R)
+                k_view, v_view = self._halves(pool, layer)
                 phys = new_virtual[owned] // c
                 self.assertTrue(torch.equal(k_view[phys], k_rows[layer][owned]))
                 self.assertTrue(torch.equal(v_view[phys], v_rows[layer][owned]))
@@ -1547,9 +1552,13 @@ class TestAscendBackendVerifySplit(CustomTestCase):
                         [block_tables, torch.zeros_like(block_tables[:1])]
                     ),
                 )
+            # The MLA pool keeps c_kv and k_rope in one row; get_kv_buffer
+            # returns that single tensor and the backend slices it.
             backend.token_to_kv_pool = SimpleNamespace(
                 set_kv_buffer=set_kv_buffer,
-                get_kv_buffer=lambda _: (c_kv, c_rope),
+                get_kv_buffer=lambda _: torch.cat([c_kv, c_rope], dim=-1).view(
+                    num_pages, page_size, 1, self.D_C + self.D_R
+                ),
             )
             forward_batch = SimpleNamespace(
                 forward_mode=SimpleNamespace(
@@ -1934,6 +1943,12 @@ class TestDsparkWithoutDcp(CustomTestCase):
             backend_mod, "DllmConfig", MagicMock(from_server_args=lambda _: None)
         ), patch.object(
             backend_mod, "is_fia_nz", return_value=False
+        ), patch.object(
+            # The FlashMLA custom op is an NPU-only vendor package; the startup
+            # probe cannot pass on a CPU test host.
+            backend_mod,
+            "require_flash_mla",
+            lambda reason: None,
         ), envs.SGLANG_NPU_USE_FIAS_V2_BSND.override(fias_v2):
             backend = cls(model_runner)
         return backend_mod, backend, model_runner
@@ -1961,9 +1976,24 @@ class TestDsparkWithoutDcp(CustomTestCase):
                 num_token_non_padded_cpu=2 * self.W,
             )
             boom = MagicMock(side_effect=AssertionError("DCP path used"))
+            # FlashMLA stand-ins: the op consumes [B, S, N, Dc + Dr] and returns
+            # the Dc half, the metadata op returns an opaque int32 blob.
+            fake_flash = MagicMock(
+                side_effect=lambda q, *a, **kw: (
+                    q[..., : self.D_C].contiguous(),
+                    None,
+                )
+            )
+            fake_flash_meta = MagicMock(
+                side_effect=lambda **kw: torch.zeros(8, dtype=torch.int32)
+            )
             with patch.object(backend_mod, "dcp_block_tables", boom), patch.object(
                 backend_mod, "dcp_verify_history_local_lens", boom
-            ), patch.object(backend_mod, "dcp_local_seq_lens", boom):
+            ), patch.object(
+                backend_mod, "dcp_local_seq_lens", boom
+            ), patch.object(
+                backend_mod, "flash_mla_with_kvcache_metadata", fake_flash_meta
+            ):
                 backend.init_forward_metadata(fb)
             md = backend.forward_metadata
             # Without DCP the backend follows the env default
@@ -1981,9 +2011,8 @@ class TestDsparkWithoutDcp(CustomTestCase):
 
             num_pages = 64 // self.PAGE + 4
             backend.token_to_kv_pool = SimpleNamespace(
-                get_kv_buffer=lambda _: (
-                    torch.zeros(num_pages * self.PAGE, 1, self.D_C),
-                    torch.zeros(num_pages * self.PAGE, 1, self.D_R),
+                get_kv_buffer=lambda _: torch.zeros(
+                    num_pages, self.PAGE, 1, self.D_C + self.D_R
                 )
             )
             fake_npu = MagicMock()
@@ -2002,8 +2031,13 @@ class TestDsparkWithoutDcp(CustomTestCase):
             with patch.object(backend_mod, "torch_npu", fake_npu), patch.object(
                 backend_mod, "is_fia_nz", return_value=False
             ), patch.object(
+                backend_mod, "flash_mla_with_kvcache", fake_flash
+            ), patch.object(
+                backend_mod, "flash_mla_with_kvcache_metadata", fake_flash_meta
+            ), patch.object(
                 backend_mod.AscendAttnBackend, "_forward_verify_mla_dcp", boom
             ):
+                backend.init_forward_metadata(fb)
                 out = backend.forward_mtp(
                     torch.zeros(T, self.HEADS * self.D_C),
                     torch.zeros(T, self.D_C),
@@ -2016,15 +2050,31 @@ class TestDsparkWithoutDcp(CustomTestCase):
                 )
             self.assertEqual(out.shape, (T, self.HEADS * self.D_C))
             if fias_v2:
-                call = fake_npu.npu_fused_infer_attention_score_v2.call_args
-                self.assertEqual(call.kwargs["actual_seq_kvlen"], seq_lens)
-                self.assertEqual(call.kwargs["num_query_heads"], self.HEADS)
+                # The FlashMLA custom op replaces the torch_npu verify call, and
+                # gets the metadata this same forward built.
+                fake_npu.npu_fused_infer_attention_score.out.assert_not_called()
+                meta = fake_flash_meta.call_args.kwargs
+                self.assertEqual(meta["num_heads_q"], self.HEADS)
+                self.assertEqual(meta["seqused_q"].tolist(), [self.W] * 2)
+                self.assertEqual(meta["cache_seqlens"].tolist(), seq_lens)
+                call = fake_flash.call_args
+                self.assertEqual(call.kwargs["seqused_q"].tolist(), [self.W] * 2)
+                self.assertEqual(call.kwargs["cache_seqlens"].tolist(), seq_lens)
+                self.assertTrue(
+                    torch.equal(
+                        call.kwargs["metadata"], torch.zeros(8, dtype=torch.int32)
+                    )
+                )
+                self.assertTrue(torch.equal(call.kwargs["block_table"], expect))
             else:
+                # FlashMLA off: unchanged torch_npu FIA verify, op never touched.
+                fake_flash.assert_not_called()
+                fake_flash_meta.assert_not_called()
                 call = fake_npu.npu_fused_infer_attention_score.out.call_args
                 self.assertEqual(call.kwargs["actual_seq_lengths_kv"], seq_lens)
                 self.assertEqual(call.kwargs["num_heads"], self.HEADS)
-            self.assertEqual(call.kwargs["block_size"], self.PAGE)
-            self.assertTrue(torch.equal(call.kwargs["block_table"], expect))
+                self.assertEqual(call.kwargs["block_size"], self.PAGE)
+                self.assertTrue(torch.equal(call.kwargs["block_table"], expect))
 
     def test_draft_backend_is_plain_dcp1(self):
         _, backend, _ = self._backend(True)

@@ -613,6 +613,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        if self.kr_cache_dim and get_bool_env_var("SGLANG_USE_FIA_NZ"):
+            # c_kv and k_rope now share one row, so neither half is a contiguous
+            # block and neither can be reinterpreted in FIA's NZ tile order --
+            # the writer and every reader would fail inside .view(). Refuse here
+            # instead of crashing in the first forward.
+            raise ValueError(
+                "SGLANG_USE_FIA_NZ is not supported by the merged MLA kv_buffer: "
+                "the NZ tile order needs c_kv and k_rope in separately "
+                "contiguous buffers. Run without SGLANG_USE_FIA_NZ."
+            )
         self.k_store_dtype = self.store_dtype
         self.v_store_dtype = self.store_dtype
         if self.dsa_kv_cache_store_fp8:
