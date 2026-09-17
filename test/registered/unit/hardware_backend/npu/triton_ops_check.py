@@ -110,6 +110,36 @@ def split_qk_rmsnorm_bf16():
 
 
 @check
+def split_qk_rmsnorm_tiles_and_programs():
+    """Every launch shape the tiling can take at the K3 widths: a single partial
+    tile, exactly one tile, tiles that leave a ragged last one, and enough rows
+    that every program gets its own chunk whose end cuts a tile short."""
+    from sglang.srt.hardware_backend.npu.triton_ops import split_qk_norm as mod
+
+    q_dim, k_dim, r_dim = 1536, 512, 64
+    assert mod._pow2_split(q_dim) == (1024, 512), "K3 q width must split unmasked"
+    assert mod._pow2_split(k_dim) == (512, 0)
+    assert mod._pow2_split(96) == (64, 32) and mod._pow2_split(100) == (64, 64)
+    assert mod._launch_shape(4) == (1, 4), "a bs=1 verify step is one tile"
+    worst = 0.0
+    for t in (1, 3, 4, 7, 203):
+        torch.manual_seed(t)
+        x = torch.randn(t, q_dim + k_dim + r_dim)
+        qw, kw = torch.randn(q_dim), torch.randn(k_dim)
+        q, k_nope, k_pe = split_qk_rmsnorm(x, qw, kw, q_dim, k_dim, r_dim, 1e-6, 1e-5)
+        worst = max(
+            worst,
+            _rel_err(q, _rms_norm_ref(x[:, :q_dim], qw, 1e-6)),
+            _rel_err(
+                k_nope.squeeze(1), _rms_norm_ref(x[:, q_dim : q_dim + k_dim], kw, 1e-5)
+            ),
+        )
+        assert torch.equal(k_pe.squeeze(1), x[:, q_dim + k_dim :]), f"rope, t={t}"
+    assert worst < FP32_SLACK, worst
+    return f"t in 1,3,4,7,203: worst {worst:.2e} rel, rope slices bit-exact"
+
+
+@check
 def dcp_kv_store():
     """Owner filter + both writes, against the torch reference."""
     torch.manual_seed(2)
