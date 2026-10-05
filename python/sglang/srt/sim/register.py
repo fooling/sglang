@@ -46,9 +46,23 @@ _unpatchers: List[Callable[[], None]] = []
 # ---------------------------------------------------------------------------
 # 1. Execution interception: scheduler.py:956/960 worker-class selection
 # ---------------------------------------------------------------------------
+def _free_tcp_init_method() -> str:
+    """A rendezvous address nobody else is on.
+
+    A single rank has no peer to meet, so the port only has to be free. Pinning
+    one made runs fail with EADDRINUSE whenever an earlier run left a listener
+    behind -- which is noise, not information.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.bind(("127.0.0.1", 0))
+        return f"tcp://127.0.0.1:{sk.getsockname()[1]}"
+
+
 def _init_sim_parallel_state(
     rank: int = 0, world_size: int = 1, tp_size: int = 1,
-    ep_size: int = 1, init_method: str = "tcp://127.0.0.1:29591",
+    ep_size: int = 1, init_method: str | None = None,
 ) -> None:
     """A gloo process group, as the real worker would set up.
 
@@ -62,6 +76,12 @@ def _init_sim_parallel_state(
 
     if parallel_state._TP is not None:
         return
+    if init_method is None:
+        # Several ranks have to agree on where to meet, so they need it given
+        # (the runner passes SIM_DIST_INIT); one rank can just take a free port.
+        init_method = (
+            "tcp://127.0.0.1:29591" if world_size > 1 else _free_tcp_init_method()
+        )
     if not dist.is_initialized():
         dist.init_process_group(
             backend="gloo", init_method=init_method,
@@ -75,6 +95,22 @@ def _init_sim_parallel_state(
         tensor_model_parallel_size=tp_size,
         expert_model_parallel_size=ep_size,
         backend="gloo",
+    )
+
+
+def _init_sim_dp_attention(server_args, model_config) -> None:
+    """SGLang's own dp-attention init, which the real startup also calls.
+
+    Skipping it leaves _ATTN_DP_SIZE unset, and the PD decode role asserts on
+    it (layers/dp_attention.py:401). Calling SGLang's own function rather than
+    setting the globals ourselves.
+    """
+    from sglang.srt.layers import dp_attention
+
+    if dp_attention._ATTN_DP_SIZE is not None:
+        return
+    dp_attention.initialize_dp_attention(
+        server_args=server_args, model_config=model_config
     )
 
 
@@ -106,10 +142,9 @@ class SimTpModelWorker:
         rank = int(getattr(ps, "tp_rank", 0) or 0)
         _init_sim_parallel_state(
             rank=rank, world_size=tp_size, tp_size=tp_size, ep_size=ep_size,
-            init_method=os.environ.get(
-                "SIM_DIST_INIT", "tcp://127.0.0.1:29591"
-            ),
+            init_method=os.environ.get("SIM_DIST_INIT"),
         )
+        _init_sim_dp_attention(server_args, model_config)
         model_runner = MockModelRunner(
             model_config=model_config, device="cpu", ps=ps
         )

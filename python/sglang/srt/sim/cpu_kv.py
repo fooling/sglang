@@ -138,9 +138,42 @@ class SimKVCache:
         self.device = device
         self.page_size = 1
         self.layer_num = 0
+        # layer range, same meaning as the real pool: PD's prefill role reads
+        # start_layer to decide which layers it transfers
+        self.start_layer = 0
+        self.end_layer = 0
+        # shape fields PD reads off the pool when it builds its kv_args
+        self.head_num = 0
+        self.head_dim = 0
         self.post_capture_active = False
         self.enable_memory_saver = False
         self.size = 0  # set by the builder
+
+    def get_contiguous_buf_infos(self):
+        """(ptrs, lens, item_lens) for PD KV transfer -- empty here, on purpose.
+
+        The real pool hands the transfer engine the device addresses of the KV
+        tensors so they can be registered for RDMA. This sim allocates KV
+        *indices* for real but has no tensors behind them, so there are no
+        regions to register and nothing to move. Returning empty lists states
+        that plainly: PD's control plane can come up, its data plane has
+        nothing to carry.
+
+        Not a value accessor, so it does not raise -- but it is the boundary
+        where PD stops being simulable without real KV memory.
+        """
+        return [], [], []
+
+    def maybe_get_custom_mem_pool(self):
+        """No custom device allocator here, so None -- same as the real path
+        when one is not configured. The PD disaggregation setup asks for it
+        while registering KV memory with the transfer engine.
+
+        Note this is a *pool* accessor, not a value accessor: the ones that
+        hand out KV contents still raise, because zeros there would hide a
+        real dependency.
+        """
+        return None
 
     def _no_values(self, *_a, **_k):
         raise NotImplementedError(

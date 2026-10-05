@@ -162,6 +162,23 @@ class MockModelRunner:
         self.memory_pool_config = result.memory_pool_config
         return result
 
+    @property
+    def effective_max_total_num_tokens(self):
+        """Same derivation as the real runner (model_runner.py:1337).
+
+        Read by the PD prefill role (disaggregation/prefill.py:169). Derived
+        here rather than stored so it cannot drift from the pools.
+        """
+        capacity = self.max_total_num_tokens
+        pool = getattr(self, "req_to_token_pool", None)
+        if pool is not None and hasattr(pool, "schedulable_token_capacity"):
+            return pool.schedulable_token_capacity(capacity)
+        return capacity
+
+    @property
+    def max_token_pool_size(self):
+        return self.effective_max_total_num_tokens
+
     # -- the two methods the task asks for -----------------------------
     def forward(self, forward_batch: Any) -> torch.Tensor:
         """Return zero logits shaped [batch_size, vocab_size].
