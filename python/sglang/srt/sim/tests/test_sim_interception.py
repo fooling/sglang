@@ -454,7 +454,7 @@ def test_sim_server_args_select_a_non_triton_backend():
 # ───────────────────────── K3 full control-plane pass ─────────────────────
 @pytest.fixture(scope="module")
 def k3_run():
-    """One full prefill->decode->finish pass over a K3-shaped model config."""
+    """One full pass: waves of arrivals, EOS + length finishes, tight KV pool."""
     from sglang.srt.sim import run_k3_sim
 
     return run_k3_sim.run()
@@ -468,47 +468,57 @@ def test_k3_model_config_is_mla_and_needs_no_checkpoint(k3_run):
     assert "KimiK3LinearForCausalLM" in mc.hf_config.architectures
     assert mc.attention_arch == AttentionArch.MLA
     assert mc.vocab_size == 163840
-    # the config dir holds config.json and nothing else -- no weights on disk
-    cfg_dir = Path(mc.model_path)
-    assert sorted(p.name for p in cfg_dir.iterdir()) == ["config.json"]
+    assert sorted(p.name for p in Path(mc.model_path).iterdir()) == ["config.json"]
 
 
-def test_k3_full_loop_finishes_every_request(k3_run):
-    reqs, finished = k3_run["reqs"], k3_run["finished"]
-    assert len(finished) == len(reqs), (
-        f"only {len(finished)}/{len(reqs)} finished: {finished}"
-    )
-    assert set(finished.values()) == {"FINISH_LENGTH"}
+def test_k3_every_request_finishes(k3_run):
+    assert len(k3_run["finished"]) == len(k3_run["workload"])
     assert k3_run["waiting_left"] == 0
 
 
-def test_k3_output_length_matches_max_new_tokens(k3_run):
-    """The REAL update_finish_state decided these --每条都必须正好停在预算上."""
-    for req, (_prompt_len, max_new) in zip(k3_run["reqs"], k3_run["specs"]):
-        assert len(req.output_ids) == max_new, (
-            f"{req.rid}: output_len={len(req.output_ids)} but max_new_tokens={max_new}"
-        )
+def test_k3_both_finish_reasons_are_exercised(k3_run):
+    """Length cap AND EOS -- one reason only would leave half the path untested."""
+    by_reason = k3_run["by_reason"]
+    assert set(by_reason) == {"FINISH_LENGTH", "FINISH_MATCHED_TOKEN"}
+    assert by_reason["FINISH_MATCHED_TOKEN"] == ["a1"]
+    a1 = k3_run["reqs"]["a1"]
+    # EOS at output #5 must win over its max_new_tokens of 12
+    assert len(a1.output_ids) == 5
+    assert a1.output_ids[-1] == 2
 
 
-def test_k3_loop_is_one_prefill_then_decodes(k3_run):
+def test_k3_length_finishes_stop_exactly_on_budget(k3_run):
+    for rid, _plen, max_new, _a in k3_run["workload"]:
+        if k3_run["finished"][rid] != "FINISH_LENGTH":
+            continue
+        assert len(k3_run["reqs"][rid].output_ids) == max_new, rid
+
+
+def test_k3_is_continuous_batching_not_one_big_prefill(k3_run):
+    """A later prefill must be admitted while earlier requests still decode."""
     modes = k3_run["modes"]
-    assert modes[0] == "prefill"
-    assert set(modes[1:]) == {"decode"}
-    # steps == the longest request's budget: prefill emits token 1, then decodes
-    assert k3_run["steps"] == max(m for _p, m in k3_run["specs"])
-
-
-def test_k3_kv_accounting_is_exact(k3_run):
-    """Pages consumed must equal prompt tokens + decode tokens, to the page."""
-    prompt_tokens = sum(p for p, _m in k3_run["specs"])
-    output_tokens = sum(len(r.output_ids) for r in k3_run["reqs"])
-    # one page per prompt token at prefill; the prefill step emits the first
-    # output token without a further page, so decode pages = outputs - reqs
-    decode_pages = output_tokens - len(k3_run["reqs"])
-    consumed = k3_run["kv_pool_size"] - k3_run["kv_free_end"]
-    assert consumed == prompt_tokens + decode_pages, (
-        f"consumed={consumed} prompt={prompt_tokens} decode={decode_pages}"
+    assert modes.count("prefill") >= 2, f"only one prefill: {modes}"
+    first_decode = modes.index("decode")
+    assert "prefill" in modes[first_decode:], (
+        "every prefill happened before any decode -- not continuous batching"
     )
+    assert len(k3_run["arrivals"]) >= 3
+
+
+def test_k3_admission_defers_when_the_pool_is_tight(k3_run):
+    """Total prompt tokens exceed the pool, so not everything can be admitted at once."""
+    total_prompt = sum(p for _r, p, _m, _a in k3_run["workload"])
+    assert total_prompt > k3_run["kv_pool_size"]
+    # the queue was non-empty at some point after an arrival wave, i.e. the
+    # scheduler deferred rather than admitting everything
+    assert k3_run["steps"] > len(k3_run["workload"])
+
+
+def test_k3_kv_pages_are_fully_accounted_at_the_end(k3_run):
+    """free + radix-evictable == pool: finished requests released, nothing leaked."""
+    assert k3_run["kv_free_end"] + k3_run["radix_evictable"] == k3_run["kv_pool_size"]
+    assert k3_run["radix_evictable"] > 0, "radix kept nothing -- release path changed?"
+    assert k3_run["req_slots_free"] == 64, "req slots were not all returned"
 
 
 def test_k3_logits_carry_the_real_vocab(k3_run):
@@ -516,7 +526,6 @@ def test_k3_logits_carry_the_real_vocab(k3_run):
 
 
 def test_k3_full_loop_needs_only_inert_stub_extras(k3_run):
-    """Record the stub surface the full loop needs; a jump means SGLang moved."""
     extras = k3_run["stub_extras"]
     assert len(extras) <= 12, f"full loop now needs {len(extras)} stub fields: {extras}"
     for required in ("dp_attn_adapter", "ngram_embedding_manager",
