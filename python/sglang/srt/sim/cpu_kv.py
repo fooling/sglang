@@ -60,6 +60,46 @@ def build_cpu_req_to_token_pool(size: int, max_context_len: int) -> ReqToTokenPo
     )
 
 
+def build_req_to_token_pool(model_config, size: int, max_context_len: int):
+    """Plain pool, or the hybrid one when the model carries recurrent state.
+
+    Kimi-K3 is hybrid: KimiK3DeltaAttention is linear attention with state, so
+    the KV side needs MLA pages *and* a linear-attention state pool. Which one
+    to build, and every parameter of it, comes from SGLang's own
+    ``mambaish_config`` -- the sim only moves the device to CPU.
+    """
+    try:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+    except Exception:
+        return build_cpu_req_to_token_pool(size=size, max_context_len=max_context_len)
+
+    try:
+        spec = mambaish_config(model_config)
+    except Exception:
+        spec = None
+    if spec is None:
+        return build_cpu_req_to_token_pool(size=size, max_context_len=max_context_len)
+
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    cache_params = spec.mamba2_cache_params
+    return HybridReqToTokenPool(
+        size=size,
+        mamba_size=size,
+        mamba_spec_state_size=size,
+        max_context_len=max_context_len,
+        device="cpu",
+        enable_memory_saver=False,
+        cache_params=cache_params,
+        mamba_layer_ids=list(cache_params.layers),
+        enable_mamba_extra_buffer=False,
+        enable_mamba_extra_buffer_lazy=False,
+        speculative_num_draft_tokens=None,
+        speculative_eagle_topk=None,
+        enable_overlap_schedule=False,
+    )
+
+
 def selftest() -> None:
     """Prints real alloc/free/available_size output -- run directly:
 

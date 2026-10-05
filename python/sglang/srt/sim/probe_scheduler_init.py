@@ -17,7 +17,7 @@ What it took to get here, and why neither step is a mock shortcut:
    recurrent state, and configs/kimi_linear.py carries KimiLinearCacheParams /
    kda_layers. build_kv_cache therefore asserts HybridReqToTokenPool, and the
    sim used to hand it a plain ReqToTokenPool. Fixed by building the pool from
-   SGLang's own mambaish_config(model_config) (mock_worker._build_req_pool) --
+   SGLang's own mambaish_config(model_config) (cpu_kv.build_req_to_token_pool) --
    the sim only moves the device to CPU; the shape comes off the config.
    So K3's KV side is MLA pages PLUS a linear-attention state pool, not MLA
    alone.

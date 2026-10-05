@@ -112,6 +112,32 @@ def test_the_decision_methods_on_a_real_instance_are_sglangs(sched):
             )
 
 
+def test_the_pool_size_is_sglangs_arithmetic_not_the_sims(sched):
+    """The sim answers "how many bytes are free", never "how many tokens".
+
+    Pool size is an admission input. The seam is _profile_available_bytes;
+    everything after it -- the pool configurator, the --max-total-tokens cap,
+    page alignment, _derive_pool_sizes -- is SGLang's. Proof: the cap set in
+    ServerArgs is what came out the other end.
+    """
+    import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+
+    assert kvc_mod.KVCacheConfigurator._profile_available_bytes.__module__.startswith(
+        "sglang.srt.sim"
+    )
+    for name in ("_resolve_memory_pool_config", "config_from_budget",
+                 "_apply_token_constraints", "resolve_max_num_reqs",
+                 "_derive_pool_sizes"):
+        fn = getattr(kvc_mod.KVCacheConfigurator, name)
+        assert fn.__module__ == "sglang.srt.mem_cache.kv_cache_configurator", (
+            f"{name} now comes from {fn.__module__} -- that is pool sizing, "
+            "which feeds admission"
+        )
+    cap = sched.server_args.max_total_tokens
+    assert cap == 144
+    assert sched.token_to_kv_pool_allocator.available_size() == cap
+
+
 def test_overlap_is_off_by_config_not_by_patching(sched):
     """Overlap wants device streams, so the sim runs without it.
 
@@ -149,11 +175,27 @@ def test_output_lengths_match_the_stopping_rule(run):
 
 def test_the_waves_produce_more_than_one_prefill(run):
     """Three arrival waves must interleave with decode, not front-load."""
-    assert run["modes"].count("prefill") == 3
-    assert run["modes"].count("decode") >= 5
+    assert run["modes"].count("prefill") == 4
+    assert run["modes"].count("decode") == 8
     assert run["modes"][0] == "prefill"
     # a prefill after decode has started is what continuous batching means
     assert "prefill" in run["modes"][run["modes"].index("decode") :]
+
+
+def test_admission_actually_refused_and_deferred(run):
+    """The pool is smaller than the prompts, so someone must be made to wait.
+
+    Without this the run would only show that everything fits -- which is the
+    easy case and proves nothing about admission.
+    """
+    waits = run["waits"]
+    assert max(waits) > 0, f"nobody was ever deferred: {waits}"
+    # and the deferral resolves: a later prefill picks the waiters up
+    first_wait = next(i for i, w in enumerate(waits) if w > 0)
+    assert "prefill" in run["modes"][first_wait + 1 :], (
+        "someone waited and no later prefill admitted them"
+    )
+    assert waits[-1] == 0 and run["waiting_left"] == 0
 
 
 def test_kv_accounting_closes_at_the_end(run):
@@ -161,4 +203,4 @@ def test_kv_accounting_closes_at_the_end(run):
     total = run["kv_free_end"] + run["radix_evictable"]
     assert run["kv_free_end"] > 0
     assert run["radix_evictable"] > 0
-    assert total == 256, f"pool does not close: {total}"
+    assert total == 144, f"pool does not close: {total}"

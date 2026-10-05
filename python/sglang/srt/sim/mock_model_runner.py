@@ -41,9 +41,14 @@ class MockModelRunner:
         model_config,
         device: str = "cpu",
         vocab_size: int | None = None,
+        ps=None,
     ):
         self.model_config = model_config
         self.device = device
+        # The parallel state the worker was handed. Not decoration: SGLang's
+        # own resolve_max_num_reqs divides by ps.attn_dp_size, so a sim that
+        # invented a number here would be deciding an admission input.
+        self.ps = ps
         self.vocab_size = vocab_size or getattr(model_config, "vocab_size", 32000)
 
         # Read by schedule_policy / scheduler admission code
@@ -67,6 +72,95 @@ class MockModelRunner:
         self.ngram_embedding_manager = None
         self.canary_manager = None
         self.mtp_draft_device_pools = {}
+
+    # -- pool allocation: SGLang's own, not ours -----------------------
+    def alloc_memory_pool(self, memory_pool_config=None):
+        """Run SGLang's own ``KVCacheConfigurator.configure``.
+
+        Mirrors ModelRunner.alloc_memory_pool (model_runner.py:872). The sim
+        does not get to decide how big the pool is: configure() ->
+        config_from_budget -> the pool configurator -> _apply_token_constraints
+        (which is where ``--max-total-tokens`` lands) -> _derive_pool_sizes all
+        run as SGLang wrote them. Only two steps inside are answered by the
+        sim, both shimmed in register.py and both genuinely device-bound:
+        _profile_available_bytes (how many bytes are free for KV -- there is no
+        device to profile) and _init_pools (which pool classes to construct).
+
+        Every field below is either read off the real ModelConfig / ServerArgs
+        or derived by the same call the real runner uses; the stand-ins are the
+        device stream and the model object, neither of which exists here.
+        """
+        from sglang.srt.configs.model_config import AttentionArch
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.model_runner_components.layer_setup import (
+            resolve_layer_indices,
+        )
+        from sglang.srt.runtime_context import get_model, get_schedule, get_server_args
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if memory_pool_config is not None:
+            self.memory_pool_config = memory_pool_config
+
+        mc = self.model_config
+        server_args = get_server_args()
+        # same derivations as ModelRunner.__init__ (:361-377, :1212)
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
+        self.page_size = get_schedule().page_size
+        self.is_hybrid_swa = mc.is_hybrid_swa
+        self.is_hybrid_swa_compress = mc.is_hybrid_swa_compress
+        self.use_mla_backend = mc.attention_arch == AttentionArch.MLA
+        self.is_draft_worker = False
+        self.draft_model_idx = 0
+        self.dtype = mc.dtype
+        self.sliding_window_size = None
+        self.spec_aux_config = None
+        self.gpu_id = 0
+        self.layer_info = resolve_layer_indices(
+            model=None, model_config=mc,
+            is_draft_worker=self.is_draft_worker,
+            spec_algorithm=self.spec_algorithm,
+        )
+        # dtype of the KV store: the server arg if set, else the model dtype
+        self.kv_cache_dtype_str = get_model().kv_cache_dtype or "auto"
+        self.kv_cache_dtype = mc.dtype
+
+        configurator = KVCacheConfigurator(
+            device=self.device,
+            gpu_id=self.gpu_id,
+            ps=self.ps,
+            pp_group=None,
+            model=None,  # stand-in: no weights are loaded
+            model_config=mc,
+            server_args=server_args,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype_str=self.kv_cache_dtype_str,
+            model_dtype=self.dtype,
+            page_size=self.page_size,
+            sliding_window_size=self.sliding_window_size,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+            post_capture_kv_active=False,
+            spec_aux_config=self.spec_aux_config,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_swa_compress=self.is_hybrid_swa_compress,
+            use_mla_backend=self.use_mla_backend,
+            layer_info=self.layer_info,
+            forward_stream=None,  # stand-in: no device stream
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
+            draft_model_idx=self.draft_model_idx,
+        )
+        self.kv_cache_configurator = configurator
+        result = configurator.configure(pre_model_load_memory=0)
+
+        self.max_total_num_tokens = result.max_total_num_tokens
+        self.max_running_requests = result.max_running_requests
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool = result.token_to_kv_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.memory_pool_config = result.memory_pool_config
+        return result
 
     # -- the two methods the task asks for -----------------------------
     def forward(self, forward_batch: Any) -> torch.Tensor:

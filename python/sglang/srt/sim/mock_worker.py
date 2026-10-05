@@ -42,27 +42,32 @@ class MockWorker:
         self.weight_load_time = 0.0
 
     # -- exercised by run_smoke.py / Scheduler.init_memory_pools --------
-    def alloc_memory_pool(self) -> None:
-        """Build the CPU pools the worker is supposed to own.
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ) -> None:
+        """Allocate the pools. Same signature as TpModelWorker (:407).
 
-        Allocating pools is the worker's job (backend side); the sizes are
-        whatever the model config carries. The standalone harness builds its
-        own pools on the Scheduler stub instead, in which case this is a no-op
-        because the runner already has them.
+        Allocating pools is the worker's job (backend side), but how big they
+        are is not -- that is an admission input. The standalone harness builds
+        its own pools on the Scheduler stub instead, in which case this is a
+        no-op because the runner already has them.
         """
-        from sglang.srt.sim.cpu_kv import build_cpu_token_to_kv_pool_allocator
-
+        if req_to_token_pool is not None:
+            self.model_runner.req_to_token_pool = req_to_token_pool
+        if token_to_kv_pool_allocator is not None:
+            self.model_runner.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         if self.model_runner.token_to_kv_pool_allocator is not None:
             return None
-        mc = self.model_runner.model_config
-        size = getattr(mc, "_sim_max_total_num_tokens", 256)
-        max_ctx = getattr(mc, "_sim_max_context_len", None) or getattr(
-            mc, "context_len", 128
-        )
-        self.model_runner.req_to_token_pool = _build_req_pool(mc, size, max_ctx)
-        allocator = build_cpu_token_to_kv_pool_allocator(size=size)
-        self.model_runner.token_to_kv_pool_allocator = allocator
-        self.model_runner.token_to_kv_pool = allocator.get_kvcache()
+        # Hand it back to the runner, which runs SGLang's own
+        # KVCacheConfigurator (mirrors TpModelWorker.alloc_memory_pool ->
+        # ModelRunner.alloc_memory_pool, tp_worker.py:420). The sim must not
+        # pick the pool size here: that number is an admission input.
+        self.model_runner.alloc_memory_pool(memory_pool_config)
+        self.req_to_token_pool = self.model_runner.req_to_token_pool
+        self.token_to_kv_pool_allocator = self.model_runner.token_to_kv_pool_allocator
         return None
 
     def get_memory_pool(self):
@@ -199,43 +204,3 @@ MockWorker.forward_batch_generation = _sim_forward_batch_generation
 MockWorker.is_hybrid_swa = property(lambda self: False)
 
 
-def _build_req_pool(model_config, size: int, max_context_len: int):
-    """Plain pool, or the hybrid one when the model carries recurrent state.
-
-    Kimi-K3 is hybrid: KimiK3DeltaAttention is linear attention with state, so
-    the KV side needs MLA pages *and* a linear-attention state pool. Which one
-    to build, and every parameter of it, comes from SGLang's own
-    ``mambaish_config`` -- the sim only moves the device to CPU.
-    """
-    from sglang.srt.sim.cpu_kv import build_cpu_req_to_token_pool
-
-    try:
-        from sglang.srt.configs.hybrid_arch import mambaish_config
-    except Exception:
-        return build_cpu_req_to_token_pool(size=size, max_context_len=max_context_len)
-
-    try:
-        spec = mambaish_config(model_config)
-    except Exception:
-        spec = None
-    if spec is None:
-        return build_cpu_req_to_token_pool(size=size, max_context_len=max_context_len)
-
-    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-
-    cache_params = spec.mamba2_cache_params
-    return HybridReqToTokenPool(
-        size=size,
-        mamba_size=size,
-        mamba_spec_state_size=size,
-        max_context_len=max_context_len,
-        device="cpu",
-        enable_memory_saver=False,
-        cache_params=cache_params,
-        mamba_layer_ids=list(cache_params.layers),
-        enable_mamba_extra_buffer=False,
-        enable_mamba_extra_buffer_lazy=False,
-        speculative_num_draft_tokens=None,
-        speculative_eagle_topk=None,
-        enable_overlap_schedule=False,
-    )

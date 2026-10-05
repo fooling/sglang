@@ -67,6 +67,16 @@ def build_real_scheduler():
         skip_tokenizer_init=True,
         disable_cuda_graph=True,
         disable_overlap_schedule=True,  # overlap needs device streams
+        # Tight on purpose: the six prompts want 456 pages, so admission
+        # has to refuse and defer. A user cap SGLang already
+        # has -- _apply_token_constraints applies it to whatever the
+        # memory profile reports, and _derive_pool_sizes still runs.
+        max_total_tokens=144,
+        # Required, not a sim convenience: with a hybrid model and this
+        # left at None, SGLang's own resolve_max_num_reqs divides it by
+        # the mamba ratio (kv_cache_configurator.py:2004) and raises.
+        # A real K3 deployment has to pass it too.
+        max_mamba_cache_size=64,
         tp_size=1,
     )
     set_global_server_args_for_scheduler(server_args)
@@ -123,6 +133,8 @@ def main(prebuilt=None) -> int:
     last_batch, steps, idle = None, 0, 0
     finished: dict[str, str] = {}
     modes: list[str] = []
+    # per-step queue depth: how the page can claim admission deferred anyone
+    waits: list[int] = []
     print(f"  {'step':>4} {'mode':<8} {'bs':>3} {'kvfree':>7} {'wait':>5}  "
           f"{'batch':<30} events")
     while steps < 60:
@@ -148,6 +160,7 @@ def main(prebuilt=None) -> int:
             last_batch = None
             continue
         idle = 0
+        waits.append(len(sched.waiting_queue))
         mode = "prefill" if batch.forward_mode.is_extend() else "decode"
         modes.append(mode)
         in_batch = list(batch.reqs)
@@ -195,7 +208,8 @@ def main(prebuilt=None) -> int:
         scheduler_cls=type(sched).__name__,
         worker_cls=type(sched.tp_worker).__name__,
         req_pool_cls=type(sched.req_to_token_pool).__name__,
-        steps=steps, modes=modes, finished=finished, by_reason=by_reason,
+        steps=steps, modes=modes, waits=waits, finished=finished,
+        by_reason=by_reason,
         reqs=reqs, workload=WORKLOAD, kv_free_end=kv_free,
         radix_evictable=evictable, waiting_left=len(sched.waiting_queue),
     )

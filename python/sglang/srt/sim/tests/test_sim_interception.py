@@ -614,9 +614,18 @@ def test_the_seams_the_shims_do_take_are_the_backend_ones():
     assert kvc_mod.KVCacheConfigurator._init_pools.__module__.startswith(
         "sglang.srt.sim"
     )
-    assert kvc_mod.KVCacheConfigurator._resolve_memory_pool_config.__module__.startswith(
+    # The KV seam is the memory probe, not the sizing. Cutting at
+    # _resolve_memory_pool_config would have taken the user cap, page
+    # alignment and _derive_pool_sizes with it -- all admission inputs.
+    assert kvc_mod.KVCacheConfigurator._profile_available_bytes.__module__.startswith(
         "sglang.srt.sim"
     )
+    for name in ("_resolve_memory_pool_config", "config_from_budget",
+                 "_apply_token_constraints", "resolve_max_num_reqs",
+                 "_derive_pool_sizes"):
+        assert getattr(kvc_mod.KVCacheConfigurator, name).__module__ == (
+            "sglang.srt.mem_cache.kv_cache_configurator"
+        ), f"{name} is no longer SGLang's -- that is pool sizing, not a backend"
     # the clock seam swaps the module's time source, not any scheduler method
     assert scheduler_mod.time.__class__.__name__ == "_ClockShim"
 
