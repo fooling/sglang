@@ -83,6 +83,72 @@ def test_k3_gets_a_hybrid_request_pool(sched):
     )
 
 
+def test_the_layer_pattern_is_1_based_and_counted_by_sglang(run):
+    """How many layers are linear is SGLang's answer, not a number we typed.
+
+    ``kda_layers`` is 1-BASED: is_kda_layer tests ``(layer_idx + 1) in
+    kda_layers`` (configs/kimi_linear.py:172). Written 0-based the whole
+    pattern shifts by one and the counts come out wrong while everything
+    still runs -- which is exactly what happened before. So the counts here
+    come from the config object's own linear_layer_ids /
+    full_attention_layer_ids, and the ratio is asserted.
+    """
+    lin, full = run["linear_layer_ids"], run["full_attn_layer_ids"]
+    n = run["num_hidden_layers"]
+    assert len(lin) + len(full) == n
+    assert not set(lin) & set(full)
+    assert sorted(lin + full) == list(range(n))
+    # one full-attention layer every FULL_ATTN_EVERY, and it is the last of
+    # each group -- so 3 linear to 1 full
+    from sglang.srt.sim.run_k3_sim import FULL_ATTN_EVERY
+
+    assert full == [i for i in range(n) if (i + 1) % FULL_ATTN_EVERY == 0]
+    assert len(lin) == len(full) * (FULL_ATTN_EVERY - 1)
+
+
+def test_the_layer_count_is_the_config_classs_own_default():
+    """32 layers because KimiLinearConfig says 32, not because we picked it."""
+    from sglang.srt.configs.kimi_linear import KimiLinearConfig
+    from sglang.srt.sim.run_k3_sim import K3_TEXT_CONFIG
+
+    assert K3_TEXT_CONFIG["num_hidden_layers"] == (
+        KimiLinearConfig().num_hidden_layers
+    )
+
+
+def test_a_real_config_json_can_be_dropped_in(tmp_path):
+    """The example config is a stand-in, not a requirement.
+
+    build_k3_model_config takes a path (or SIM_K3_CONFIG_JSON) and uses the
+    file verbatim, so a released config.json needs no code change -- the
+    layer pattern, dims and dtype all come off whatever it says.
+    """
+    import json
+
+    from sglang.srt.sim.run_k3_sim import K3_TEXT_CONFIG, build_k3_model_config
+
+    text = dict(K3_TEXT_CONFIG)
+    text["num_hidden_layers"] = 12
+    text["linear_attn_config"] = {
+        **K3_TEXT_CONFIG["linear_attn_config"],
+        "kda_layers": [1, 2, 3, 5, 6, 7, 9, 10, 11],
+        "full_attn_layers": [4, 8, 12],
+    }
+    real = tmp_path / "config.json"
+    real.write_text(json.dumps({
+        "model_type": "kimi_k3",
+        "architectures": ["KimiK3LinearForCausalLM"],
+        "torch_dtype": "bfloat16",
+        "text_config": text,
+    }))
+
+    mc, _d = build_k3_model_config(config_path=real)
+    tc = mc.hf_text_config
+    assert tc.num_hidden_layers == 12
+    assert tc.full_attention_layer_ids == [3, 7, 11]
+    assert len(tc.linear_layer_ids) == 9
+
+
 def test_the_decision_methods_on_a_real_instance_are_sglangs(sched):
     """Same guarantee as the stub tests, now on the constructed object."""
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -137,7 +203,11 @@ def test_the_pool_size_is_sglangs_arithmetic_not_the_sims(sched):
         )
     cap = sched.server_args.max_total_tokens
     assert cap == 256
-    assert sched.token_to_kv_pool_allocator.available_size() == cap
+    # order-independent: whatever the run has consumed, the pages are all
+    # still accounted for between the free list and the radix tree
+    accounted = (sched.token_to_kv_pool_allocator.available_size()
+                 + sched.tree_cache.evictable_size())
+    assert accounted == cap, f"pool is {accounted}, cap is {cap}"
 
 
 def test_overlap_is_off_by_config_not_by_patching(sched):

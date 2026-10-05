@@ -511,6 +511,11 @@ def main(prebuilt=None) -> int:
         outputs_were_read=bool(driver.completion),
         finished_from_reqs=driver.finished_from_reqs,
         req_cls_module=type(next(iter(driver.seen.values()))).__module__,
+        num_hidden_layers=mr.model_config.hf_text_config.num_hidden_layers,
+        linear_layer_ids=list(mr.model_config.hf_text_config.linear_layer_ids),
+        full_attn_layer_ids=list(
+            mr.model_config.hf_text_config.full_attention_layer_ids
+        ),
         clock_elapsed=clock_now, clock_expected=expected, timing=timing,
         decode_moment_totals=list(sched.decode_moment_totals),
         total_prefill_busy_us=sched.total_prefill_busy_us,

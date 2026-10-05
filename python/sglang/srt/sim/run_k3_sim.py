@@ -32,6 +32,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import warnings
 from array import array
@@ -53,7 +54,8 @@ K3_TEXT_CONFIG = {
     "vocab_size": 163840,
     "hidden_size": 4096,
     "intermediate_size": 11008,
-    "num_hidden_layers": 8,
+    # the class's own default, not a number of ours (configs/kimi_linear.py:21)
+    "num_hidden_layers": 32,
     "num_attention_heads": 32,
     "num_key_value_heads": 8,
     "max_position_embeddings": 4096,
@@ -69,13 +71,38 @@ K3_TEXT_CONFIG = {
     # K3 is a hybrid: most layers are KDA (linear attention, carrying a state
     # instead of KV pages), a few stay full attention. SGLang reads this off
     # the config and hands the scheduler a HybridReqToTokenPool.
-    "linear_attn_config": {
-        "num_heads": 32,
-        "head_dim": 128,
-        "short_conv_kernel_size": 4,
-        "kda_layers": [0, 1, 2, 4, 5, 6],
-        "full_attn_layers": [3, 7],
-    },
+    # Filled in below by kda_layer_pattern() -- the layer numbers are 1-BASED
+    # (is_kda_layer does `(layer_idx + 1) in kda_layers`,
+    # configs/kimi_linear.py:172), which is easy to get wrong by one.
+    "linear_attn_config": None,
+}
+
+# How many layers per full-attention layer. One example of the config format,
+# not a sourced fact about any released checkpoint: the format itself is two
+# explicit layer lists, so a real config.json drops straight in (see
+# build_k3_model_config's config_path argument).
+FULL_ATTN_EVERY = 4
+
+
+def kda_layer_pattern(num_layers: int, full_every: int = FULL_ATTN_EVERY) -> dict:
+    """The two 1-based layer lists the config format wants.
+
+    1-based because is_kda_layer tests ``(layer_idx + 1) in kda_layers``.
+    Writing them 0-based silently shifts the whole pattern -- which is exactly
+    what happened before this helper existed.
+    """
+    layers = range(1, num_layers + 1)
+    return {
+        "kda_layers": [i for i in layers if i % full_every != 0],
+        "full_attn_layers": [i for i in layers if i % full_every == 0],
+    }
+
+
+K3_TEXT_CONFIG["linear_attn_config"] = {
+    "num_heads": 32,
+    "head_dim": 128,
+    "short_conv_kernel_size": 4,
+    **kda_layer_pattern(K3_TEXT_CONFIG["num_hidden_layers"]),
 }
 
 EOS_ID = 2
@@ -305,8 +332,29 @@ def banner(t: str) -> None:
     print(f"\n{'=' * 18} {t} {'=' * 18}")
 
 
-def build_k3_model_config():
-    """A real ModelConfig for a K3-shaped model -- config.json only, no weights."""
+def build_k3_model_config(config_path: "str | Path | None" = None):
+    """A real ModelConfig for a K3-shaped model -- config.json only, no weights.
+
+    ``config_path`` takes a real released config.json and uses it verbatim.
+    Nothing downstream cares where the shapes came from: ModelConfig parses it,
+    mambaish_config reads the layer pattern off it, and the pools are sized
+    from whatever it says. The example below exists because the real file is
+    not in this offline environment, not because it could not be used.
+
+    Also settable from the environment, so a run can be pointed at a real
+    config without editing code:
+
+        SIM_K3_CONFIG_JSON=/path/to/config.json
+    """
+    from sglang.srt.configs.model_config import ModelConfig
+
+    path = config_path or os.environ.get("SIM_K3_CONFIG_JSON")
+    if path:
+        src = Path(path)
+        d = Path(tempfile.mkdtemp(prefix="k3-cfg-real-"))
+        (d / "config.json").write_text(src.read_text())
+        return ModelConfig(model_path=str(d), trust_remote_code=True), d
+
     d = Path(tempfile.mkdtemp(prefix="k3-cfg-"))
     (d / "config.json").write_text(
         json.dumps(
@@ -318,8 +366,6 @@ def build_k3_model_config():
             }
         )
     )
-    from sglang.srt.configs.model_config import ModelConfig
-
     return ModelConfig(model_path=str(d), trust_remote_code=True), d
 
 
