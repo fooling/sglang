@@ -29,6 +29,7 @@ run_smoke.py's admission/decode path):
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -211,6 +212,31 @@ def _charge_forward_time(batch) -> float:
     return cost
 
 
+def _write_kv(model_runner, batch) -> None:
+    """Call the KV write operator for this forward, at the real shape.
+
+    The operator body is empty -- nothing is stored -- but the call happens for
+    every KV layer with the slots this batch allocated, so the write path is
+    exercised rather than skipped. That is the difference between a mock and a
+    hole: swap in a costed or a real operator later and nothing above it
+    changes.
+    """
+    import torch
+
+    kv = getattr(model_runner, "token_to_kv_pool", None)
+    if kv is None or not getattr(kv, "layer_num", 0):
+        return
+    loc = getattr(batch, "out_cache_loc", None)
+    if loc is None or not hasattr(loc, "shape") or loc.shape[0] == 0:
+        return
+    n = int(loc.shape[0])
+    shaped = torch.zeros((n, kv.head_num, kv.head_dim), dtype=kv.dtype)
+    for layer_id in range(kv.layer_num):
+        kv.set_kv_buffer(
+            SimpleNamespace(layer_id=layer_id), loc, shaped, shaped
+        )
+
+
 def _sim_forward_batch_generation(self, batch, **kwargs):
     """What the real TpModelWorker returns, with mocked numbers.
 
@@ -229,6 +255,7 @@ def _sim_forward_batch_generation(self, batch, **kwargs):
     bs = batch.batch_size()
     vocab = self.model_runner.vocab_size
     _charge_forward_time(batch)
+    _write_kv(self.model_runner, batch)
     logits = torch.zeros((bs, vocab), dtype=torch.float32, device="cpu")
     next_token_ids = self.model_runner.sample_for_batch(logits, batch)
     return GenerationBatchResult(

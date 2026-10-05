@@ -528,6 +528,17 @@ def main(prebuilt=None) -> int:
         ),
         clock_elapsed=clock_now, clock_expected=expected, timing=timing,
         decode_moment_totals=list(sched.decode_moment_totals),
+        kv_ops_called=dict(
+            sched.token_to_kv_pool_allocator.get_kvcache().ops_called
+        ),
+        kv_write_shapes=list(
+            sched.token_to_kv_pool_allocator.get_kvcache()
+            .op_shapes.get("set_kv_buffer", [])
+        ),
+        kv_layers=sched.token_to_kv_pool_allocator.get_kvcache().layer_num,
+        kv_bytes_per_token=(
+            sched.token_to_kv_pool_allocator.get_kvcache().bytes_per_token
+        ),
         total_prefill_busy_us=sched.total_prefill_busy_us,
         prefill_slice_s=PREFILL_SLICE_S, decode_slice_s=DECODE_SLICE_S,
         stop_reason=driver.stop_reason,

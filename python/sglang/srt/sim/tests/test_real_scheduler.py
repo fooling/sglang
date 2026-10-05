@@ -392,6 +392,33 @@ def test_the_engine_spends_the_slice_in_its_own_step_ledger(run):
     assert run["total_prefill_busy_us"] == 0
 
 
+def test_the_kv_write_operator_really_ran_for_every_forward(run):
+    """The write path is exercised, not skipped -- the operator body is empty.
+
+    One call per KV layer per forward, with the slots that forward allocated.
+    An operator that is never invoked would leave this at zero, which is the
+    failure a mock has to be able to detect about itself.
+    """
+    layers, forwards = run["kv_layers"], len(run["rows"])
+    assert layers > 0
+    assert run["kv_ops_called"].get("set_kv_buffer") == layers * forwards
+    shapes = run["kv_write_shapes"]
+    assert {s["layer"] for s in shapes} == set(range(layers))
+    assert all(s["slots"] > 0 for s in shapes)
+    # every layer sees the same slot count within one forward
+    per_forward = [shapes[i:i + layers] for i in range(0, len(shapes), layers)]
+    for group in per_forward:
+        assert len({s["slots"] for s in group}) == 1
+
+
+def test_the_kv_byte_count_is_real_so_a_transfer_can_be_costed(run):
+    """bytes per token times layers is what a PD transfer would cost."""
+    assert run["kv_bytes_per_token"] == 576 * 2      # MLA latent, fp16
+    assert run["kv_layers"] == 8                     # full-attention layers only
+    moved = run["kv_bytes_per_token"] * run["kv_layers"]
+    assert moved == 9216                             # one token, all KV layers
+
+
 def test_the_clock_face_is_observability_not_decision():
     """Why the slice needs nothing from SGLang's scheduling logic.
 
