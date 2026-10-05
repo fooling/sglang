@@ -449,3 +449,76 @@ def test_sim_server_args_select_a_non_triton_backend():
     assert decode is None or support_triton(decode) is False, (
         f"decode backend {decode!r} routes through the Triton kernel"
     )
+
+
+# ───────────────────────── K3 full control-plane pass ─────────────────────
+@pytest.fixture(scope="module")
+def k3_run():
+    """One full prefill->decode->finish pass over a K3-shaped model config."""
+    from sglang.srt.sim import run_k3_sim
+
+    return run_k3_sim.run()
+
+
+def test_k3_model_config_is_mla_and_needs_no_checkpoint(k3_run):
+    from sglang.srt.configs.model_config import AttentionArch
+
+    mc = k3_run["model_config"]
+    assert mc.hf_config.model_type == "kimi_k3"
+    assert "KimiK3LinearForCausalLM" in mc.hf_config.architectures
+    assert mc.attention_arch == AttentionArch.MLA
+    assert mc.vocab_size == 163840
+    # the config dir holds config.json and nothing else -- no weights on disk
+    cfg_dir = Path(mc.model_path)
+    assert sorted(p.name for p in cfg_dir.iterdir()) == ["config.json"]
+
+
+def test_k3_full_loop_finishes_every_request(k3_run):
+    reqs, finished = k3_run["reqs"], k3_run["finished"]
+    assert len(finished) == len(reqs), (
+        f"only {len(finished)}/{len(reqs)} finished: {finished}"
+    )
+    assert set(finished.values()) == {"FINISH_LENGTH"}
+    assert k3_run["waiting_left"] == 0
+
+
+def test_k3_output_length_matches_max_new_tokens(k3_run):
+    """The REAL update_finish_state decided these --每条都必须正好停在预算上."""
+    for req, (_prompt_len, max_new) in zip(k3_run["reqs"], k3_run["specs"]):
+        assert len(req.output_ids) == max_new, (
+            f"{req.rid}: output_len={len(req.output_ids)} but max_new_tokens={max_new}"
+        )
+
+
+def test_k3_loop_is_one_prefill_then_decodes(k3_run):
+    modes = k3_run["modes"]
+    assert modes[0] == "prefill"
+    assert set(modes[1:]) == {"decode"}
+    # steps == the longest request's budget: prefill emits token 1, then decodes
+    assert k3_run["steps"] == max(m for _p, m in k3_run["specs"])
+
+
+def test_k3_kv_accounting_is_exact(k3_run):
+    """Pages consumed must equal prompt tokens + decode tokens, to the page."""
+    prompt_tokens = sum(p for p, _m in k3_run["specs"])
+    output_tokens = sum(len(r.output_ids) for r in k3_run["reqs"])
+    # one page per prompt token at prefill; the prefill step emits the first
+    # output token without a further page, so decode pages = outputs - reqs
+    decode_pages = output_tokens - len(k3_run["reqs"])
+    consumed = k3_run["kv_pool_size"] - k3_run["kv_free_end"]
+    assert consumed == prompt_tokens + decode_pages, (
+        f"consumed={consumed} prompt={prompt_tokens} decode={decode_pages}"
+    )
+
+
+def test_k3_logits_carry_the_real_vocab(k3_run):
+    assert k3_run["logits_shape"][1] == k3_run["model_config"].vocab_size == 163840
+
+
+def test_k3_full_loop_needs_only_inert_stub_extras(k3_run):
+    """Record the stub surface the full loop needs; a jump means SGLang moved."""
+    extras = k3_run["stub_extras"]
+    assert len(extras) <= 12, f"full loop now needs {len(extras)} stub fields: {extras}"
+    for required in ("dp_attn_adapter", "ngram_embedding_manager",
+                     "prefill_decode_interval"):
+        assert required in extras

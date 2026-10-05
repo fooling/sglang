@@ -383,3 +383,65 @@ cd ~/repo/sglang && HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 no_proxy='*' \
 2. 去掉 `attention_backend="torch_native"` → G2 红；
 3. 把真实 `TokenToKVPoolAllocator.available_size()` 改成恒返回 `10**9` → **8 条红**
    （准入确定性、准入消耗账本、小池零准入、retract、KV 拦截面 selftest 等全部命中）。
+
+---
+
+## K3 完整流程（`run_k3_sim.py`）
+
+**问题**：`run_smoke.py` 只跑一次准入就停，`run_batch` 之后的循环没走过。
+**现在**：`run_k3_sim.py` 用真实 `Scheduler.get_next_batch_to_run` 逐步驱动
+prefill → decode → … → 全部结束，模型用 Kimi-K3 形状，**不下载任何权重**。
+
+```
+cd ~/repo/sglang && HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 no_proxy='*' \
+  perl -e 'alarm 600; exec @ARGV' python/.venv/bin/python python/sglang/srt/sim/run_k3_sim.py
+```
+
+**模型配置怎么来的**：临时目录写一个 `config.json`（`model_type: kimi_k3`，
+text_config 用仓库自己的 `KimiLinearConfig` 类默认值 vocab 163840 / hidden 4096 / 32 头，
+外加自洽的 MLA 维度），`ModelConfig` 只读 config、不碰权重 ——
+拿到的是**真的 `AttentionArch.MLA`**，`head_dim=72` 由 SGLang 自己按 K3 分支定。
+这些是示例参数，不指向任何已发布的 checkpoint；磁盘上只有一个 config.json。
+
+**实跑结果**：
+
+```
+  step mode      bs  kv_free  reqs                               finished
+     1 prefill    6     3712  ['k3-0'..'k3-5']                   []
+     2 decode     6     3706  ['k3-0'..'k3-5']                   ['k3-4']
+     3 decode     5     3701  ['k3-0','k3-1','k3-2','k3-3','k3-5'] ['k3-2']
+     4 decode     4     3697  ['k3-0','k3-1','k3-3','k3-5']      ['k3-0','k3-5']
+     5 decode     2     3695  ['k3-1','k3-3']                    ['k3-3']
+     6 decode     1     3694  ['k3-1']                           ['k3-1']
+  finished: 6 / 6，全部 FINISH_LENGTH，output_len 分别 4/6/3/5/2/4 = 各自的 max_new_tokens
+  logits (1, 163840)  kv 3694/4096
+```
+
+**数字自洽，不是"看着像跑通了"**：
+- prefill 消耗 384 页 = 24+40+56+72+88+104，正好是六条 prompt 的 token 数；
+- decode 共 18 页 = 24 个输出 token − 6（prefill 那一轮已出第一个 token）；
+- 384+18=402，4096−402=**3694**，与末尾读数一致；
+- 步数 6 = 最长请求的 `max_new_tokens`，每条都正好停在自己的预算上——
+  这是**真实 `update_finish_state`** 判的，不是脚本安排的。
+
+**走到了哪、没走到哪**：
+- 走到了：`get_next_batch_to_run`（含 last_batch 合并、prefill→decode 转换、
+  `update_running_batch`）、`ScheduleBatch.prepare_for_decode`、`filter_batch`、
+  `Req.update_finish_state`；
+- 仍没走：`Scheduler.run_batch` / `process_batch_result` 本体（本脚本自己做 mock forward + sample
+  并把 token 喂回去），以及 `Scheduler.__init__`（stub 仍是 `Scheduler.__new__`）。
+
+**完整循环额外需要的 stub 字段：10 个**，全部是惰性开关（把 dllm / hisparse / dp-attn /
+ngram / prefill-decode interval 等特性关掉），其中两个必须是对象而非 None：
+`dp_attn_adapter`（两个 hook 原样返回 batch）、`ngram_embedding_manager`（同理）。
+另外 `new_token_ratio_tracker` 需要一个 `decay_step()` 空实现（scheduler.py:3789 每步调）。
+**仍然没有改动任何既有 SGLang 源文件。**
+
+**两处非 stub 的真实前提**（值得记，接真环境时会再遇到）：
+1. `SamplingParams.stop_strs` 默认是 `None`，真实 `update_finish_state` 会 `len(None)` 炸——
+   真实链路里由 tokenizer_manager 调 `normalize(tokenizer)` 补成 `[]`，脚本里显式调了 `normalize(None)`。
+2. `ScheduleBatch.batch_size` 是**方法**不是属性，喂给 mock forward 时要 `batch_size()`。
+
+**测试**：上面每一条都在 `tests/test_sim_interception.py` 里有断言（K3 相关 7 条，共 37 条）。
+产品级注入自检：把真实 `update_finish_state` 的长度判据改成 `if False` → **3 条红**
+（全部完成 / 输出长度等于预算 / 一次 prefill 后全是 decode）。
