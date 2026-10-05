@@ -35,18 +35,69 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
 def build_cpu_token_to_kv_pool_allocator(
-    size: int, dtype: torch.dtype = torch.float16
+    size: int, dtype: torch.dtype = torch.float16, model_config=None,
+    page_size: int = 1,
 ) -> TokenToKVPoolAllocator:
-    """The real allocator class, unmodified, device='cpu', kvcache=None."""
+    """The real allocator class, unmodified, device='cpu'.
+
+    ``model_config`` is what makes the KV *shape* real: without it the cache
+    object would report zero layers and zero bytes per token, and anything
+    that costs a KV transfer would get zero. Passing it makes the counts right
+    while still holding no tensors.
+    """
     return TokenToKVPoolAllocator(
         size=size, dtype=dtype, device="cpu",
-        kvcache=_sized_kv(dtype, size), need_sort=False,
+        kvcache=_sized_kv(dtype, size, model_config, page_size), need_sort=False,
     )
 
 
-def _sized_kv(dtype, size: int) -> "SimKVCache":
-    kv = SimKVCache(dtype=dtype)
+def kv_shape_from_config(model_config, dtype) -> dict:
+    """How many layers hold KV, and how many bytes one token takes in each.
+
+    Mirrors the real pools' arithmetic rather than inventing one:
+
+    * MLA keeps a single latent entry per token, so head_num is 1 and head_dim
+      is ``kv_lora_rank + qk_rope_head_dim`` (MLATokenToKVPool:4068).
+    * MHA keeps K and V per head, so the per-token span is
+      ``2 * num_key_value_heads * head_dim``.
+    * On a hybrid model only the full-attention layers hold KV pages -- the
+      linear-attention layers keep state in the mamba pool instead -- so the
+      layer count comes off ``full_attention_layer_ids`` when the config has
+      one.
+
+    Returns a dict, not a tensor: the sim needs the sizes, not the storage.
+    """
+    tc = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", model_config
+    )
+    nlayers = int(getattr(tc, "num_hidden_layers", 0) or 0)
+    full_ids = getattr(tc, "full_attention_layer_ids", None)
+    kv_layers = len(full_ids) if full_ids else nlayers
+
+    kv_lora_rank = getattr(tc, "kv_lora_rank", None)
+    qk_rope = getattr(tc, "qk_rope_head_dim", None)
+    if kv_lora_rank and qk_rope:
+        head_num, head_dim = 1, int(kv_lora_rank) + int(qk_rope)
+        per_token_elems = head_dim
+    else:
+        head_num = int(getattr(tc, "num_key_value_heads", 0)
+                       or getattr(tc, "num_attention_heads", 0) or 0)
+        hidden = int(getattr(tc, "hidden_size", 0) or 0)
+        nheads = int(getattr(tc, "num_attention_heads", 0) or 0)
+        head_dim = int(getattr(tc, "head_dim", 0) or (hidden // nheads if nheads else 0))
+        per_token_elems = 2 * head_num * head_dim      # K and V
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    return dict(
+        kv_layers=kv_layers, total_layers=nlayers, head_num=head_num,
+        head_dim=head_dim, bytes_per_token=per_token_elems * itemsize,
+    )
+
+
+def _sized_kv(dtype, size: int, model_config=None, page_size: int = 1) -> "SimKVCache":
+    kv = SimKVCache(dtype=dtype, page_size=page_size)
     kv.size = size
+    if model_config is not None:
+        kv.apply_shape(kv_shape_from_config(model_config, dtype))
     return kv
 
 
@@ -133,10 +184,10 @@ class SimKVCache:
     silently get zeros, which would hide a real dependency.
     """
 
-    def __init__(self, dtype, device: str = "cpu"):
+    def __init__(self, dtype, device: str = "cpu", page_size: int = 1):
         self.dtype = dtype
         self.device = device
-        self.page_size = 1
+        self.page_size = page_size
         self.layer_num = 0
         # layer range, same meaning as the real pool: PD's prefill role reads
         # start_layer to decide which layers it transfers
@@ -145,24 +196,63 @@ class SimKVCache:
         # shape fields PD reads off the pool when it builds its kv_args
         self.head_num = 0
         self.head_dim = 0
+        self.bytes_per_token = 0
         self.post_capture_active = False
         self.enable_memory_saver = False
         self.size = 0  # set by the builder
 
-    def get_contiguous_buf_infos(self):
-        """(ptrs, lens, item_lens) for PD KV transfer -- empty here, on purpose.
+    def apply_shape(self, shape: dict) -> None:
+        """Take the real shape off the model config (kv_shape_from_config).
 
-        The real pool hands the transfer engine the device addresses of the KV
-        tensors so they can be registered for RDMA. This sim allocates KV
-        *indices* for real but has no tensors behind them, so there are no
-        regions to register and nothing to move. Returning empty lists states
-        that plainly: PD's control plane can come up, its data plane has
-        nothing to carry.
-
-        Not a value accessor, so it does not raise -- but it is the boundary
-        where PD stops being simulable without real KV memory.
+        Without this the object reports zeros, and then a KV transfer costs
+        nothing -- which would make PD look free in a performance run. The
+        bytes still do not exist; only the counts are real.
         """
-        return [], [], []
+        self.layer_num = shape["kv_layers"]
+        self.end_layer = shape["kv_layers"]
+        self.head_num = shape["head_num"]
+        self.head_dim = shape["head_dim"]
+        self.bytes_per_token = shape["bytes_per_token"]
+
+    def kv_bytes_for(self, num_tokens: int) -> int:
+        """How many bytes moving ``num_tokens`` of KV would be, all layers.
+
+        This is the number a transfer cost model needs; it is right even though
+        nothing is stored.
+        """
+        return int(num_tokens) * self.bytes_per_token * self.layer_num
+
+    # Synthetic base address for the per-layer regions. Deliberately a value
+    # no real allocation returns, so a pointer that escapes to a real transfer
+    # engine fails loudly instead of corrupting memory. In the sim the engine
+    # is always the sim's own (register.MockTransferEngine), which records the
+    # byte counts and never dereferences.
+    SYNTHETIC_BASE = 0x5100_0000_0000
+
+    def get_contiguous_buf_infos(self):
+        """(ptrs, lens, item_lens) for PD KV transfer.
+
+        The lengths are REAL -- bytes per token per layer and the whole span --
+        because that is what a transfer cost model computes from, and a pool
+        reporting zero would make PD look free. The pointers are synthetic:
+        the sim holds no tensors, so there is nothing to dereference, and the
+        only engine that ever sees them is the sim's own.
+
+        Nothing moves. The counts being right is the point; the bytes being
+        absent is the stated limit.
+        """
+        if not self.layer_num or not self.bytes_per_token:
+            # No model config was supplied, so the shape is unknown. Say so
+            # rather than reporting zero-byte regions that a cost model would
+            # silently believe.
+            raise RuntimeError(
+                "SimKVCache has no shape: build it with model_config so the "
+                "KV byte counts are real (cpu_kv.kv_shape_from_config)."
+            )
+        item_len = self.bytes_per_token * self.page_size
+        span = self.size * self.bytes_per_token
+        ptrs = [self.SYNTHETIC_BASE + i * span for i in range(self.layer_num)]
+        return ptrs, [span] * self.layer_num, [item_len] * self.layer_num
 
     def maybe_get_custom_mem_pool(self):
         """No custom device allocator here, so None -- same as the real path

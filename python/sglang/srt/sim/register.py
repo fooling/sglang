@@ -235,7 +235,15 @@ def _sim_init_pools(self, *, sizes, req_to_token_pool, token_to_kv_pool_allocato
     max_context_len = getattr(self.model_config, "_sim_max_context_len", None) or (
         getattr(self.model_config, "context_len", 128)
     )
-    allocator = build_cpu_token_to_kv_pool_allocator(size=sizes.max_total_num_tokens)
+    # Hand the model config over: it is what makes the KV byte counts real,
+    # which is what a transfer cost model reads (cpu_kv.kv_shape_from_config).
+    from sglang.srt.runtime_context import get_schedule
+
+    allocator = build_cpu_token_to_kv_pool_allocator(
+        size=sizes.max_total_num_tokens,
+        model_config=self.model_config,
+        page_size=get_schedule().page_size or 1,
+    )
     return _InitializedPools(
         req_to_token_pool=req_to_token_pool
         or build_req_to_token_pool(

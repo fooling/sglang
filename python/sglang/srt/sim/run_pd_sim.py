@@ -85,12 +85,17 @@ def build_role(mode: str) -> int:
         ok = ok and got == cls
         print(f"[{mode}] {attr}: {got} (want {cls})", flush=True)
 
-    # The data plane: nothing to register, because there are no KV tensors.
+    # The data plane: the SIZES are real (that is what a transfer cost model
+    # reads), the bytes are not stored and nothing moves.
     kv = scheduler.token_to_kv_pool_allocator.get_kvcache()
     ptrs, lens, item_lens = kv.get_contiguous_buf_infos()
-    print(f"[{mode}] kv buffers to register: {len(ptrs)} "
-          f"(sim has indices, no tensors)", flush=True)
-    ok = ok and (len(ptrs), len(lens), len(item_lens)) == (0, 0, 0)
+    print(f"[{mode}] kv regions={len(ptrs)} (one per full-attention layer) "
+          f"item={item_lens[0]}B span={lens[0]}B total={sum(lens)}B", flush=True)
+    print(f"[{mode}] moving a 48-token prompt would be "
+          f"{kv.kv_bytes_for(48)}B -- counts real, bytes not stored", flush=True)
+    ok = ok and len(ptrs) == kv.layer_num > 0
+    ok = ok and item_lens[0] == kv.bytes_per_token * kv.page_size
+    ok = ok and sum(lens) == kv.size * kv.bytes_per_token * kv.layer_num
 
     # The transfer engine PD picked must be the sim's, not a real one.
     import sglang.srt.disaggregation.ascend.conn as conn_mod

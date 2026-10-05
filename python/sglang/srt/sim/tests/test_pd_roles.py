@@ -61,10 +61,60 @@ def test_pd_picked_the_transfer_face_the_sim_occupies(pd_out):
         assert f"[{role}] transfer engine class from: sglang.srt.sim" in pd_out
 
 
-def test_the_kv_transfer_has_nothing_to_carry(pd_out):
-    """Stated, not papered over: zero buffers to register, on both roles."""
+def test_the_kv_counts_are_real_even_though_nothing_moves(pd_out):
+    """The sizes have to be right, or PD would look free in a timing run.
+
+    A cost model computes a transfer from bytes. A pool reporting zero bytes
+    would make every PD handoff cost nothing -- so the shape comes off the
+    model config: one region per full-attention layer, bytes per token from
+    the MLA latent width, and the span consistent with the pool size.
+    """
+    import re
+
     for role in ("prefill", "decode"):
-        assert f"[{role}] kv buffers to register: 0" in pd_out
+        m = re.search(
+            rf"\[{role}\] kv regions=(\d+) \(one per full-attention layer\) "
+            rf"item=(\d+)B span=(\d+)B total=(\d+)B", pd_out)
+        assert m, f"{role} 没报 KV 字节数：{pd_out[-600:]}"
+        regions, item, span, total = (int(x) for x in m.groups())
+        assert regions > 0 and item > 0
+        assert total == regions * span
+        assert f"[{role}] moving a 48-token prompt would be" in pd_out
+
+
+def test_the_kv_shape_is_the_configs_not_ours():
+    """Derived from the model config, including the hybrid layer split.
+
+    On K3 only the full-attention layers hold KV pages -- the linear-attention
+    layers keep state in the mamba pool -- so the KV layer count is 8, not 32.
+    MLA keeps one latent entry per token, so head_num is 1 and head_dim is
+    kv_lora_rank + qk_rope_head_dim.
+    """
+    import torch
+
+    from sglang.srt.configs.kimi_linear import KimiLinearConfig
+    from sglang.srt.sim.cpu_kv import kv_shape_from_config
+    from sglang.srt.sim.run_k3_sim import K3_TEXT_CONFIG
+
+    cfg = KimiLinearConfig(**{k: v for k, v in K3_TEXT_CONFIG.items()
+                              if k != "architectures"})
+    shape = kv_shape_from_config(cfg, torch.float16)
+    assert shape["total_layers"] == 32
+    assert shape["kv_layers"] == len(cfg.full_attention_layer_ids) == 8
+    assert shape["head_num"] == 1
+    assert shape["head_dim"] == cfg.kv_lora_rank + cfg.qk_rope_head_dim == 576
+    assert shape["bytes_per_token"] == 576 * 2        # fp16
+
+
+def test_a_shapeless_kv_cache_refuses_rather_than_reporting_zero():
+    """Zero bytes would be believed by a cost model, so it has to raise."""
+    import torch
+
+    from sglang.srt.sim.cpu_kv import SimKVCache
+
+    bare = SimKVCache(dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="no shape"):
+        bare.get_contiguous_buf_infos()
 
 
 def test_sglang_ships_its_own_fake_pd_transfer_path():
@@ -144,7 +194,12 @@ def test_the_sim_kv_cache_still_refuses_to_hand_out_values():
     from sglang.srt.sim.cpu_kv import SimKVCache
 
     kv = SimKVCache(dtype=torch.float16)
-    assert kv.get_contiguous_buf_infos() == ([], [], [])
+    kv.size = 64
+    kv.apply_shape(dict(kv_layers=2, head_num=1, head_dim=576,
+                        bytes_per_token=1152))
+    ptrs, lens, item_lens = kv.get_contiguous_buf_infos()
+    assert len(ptrs) == len(lens) == len(item_lens) == 2
+    assert item_lens == [1152, 1152] and lens == [64 * 1152] * 2
     assert kv.maybe_get_custom_mem_pool() is None
     raisers = [n for n in ("get_key_buffer", "get_value_buffer", "get_kv_buffer",
                            "set_kv_buffer")
