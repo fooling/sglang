@@ -352,3 +352,34 @@ is_out_of_tree()`、`get_exec().kernel.attention_backend=="ascend"`、
    本不是零。
 3. KV/传输两个拦截面若要支撑真实引擎启动(而不只是 harness 直接构造对象),还需
    要补一层"伪造最小 `ModelRunner` 配置"的工作,这部分本轮诚实地标为没验到。
+
+---
+
+## 测试
+
+`run_smoke.py` 只打印数字——账本、准入或退避一旦悄悄变了，它照样 exit 0。
+断言在 `tests/test_sim_interception.py`（30 条，pytest）：
+
+```
+cd ~/repo/sglang && HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 no_proxy='*' \
+  perl -e 'alarm 600; exec @ARGV' python/.venv/bin/python -m pytest \
+  python/sglang/srt/sim/tests/ -q
+```
+
+覆盖：
+
+| 命题 | 测的是什么 |
+|---|---|
+| C1 | `torch.cuda.is_available() is False`、`torch_npu` 不在 `sys.modules`、10 个控制面模块逐个 import |
+| C2 | 四个拦截面各自的 selftest；虚拟钟驱动真实 `_abort_on_waiting_timeout` / `_abort_on_running_timeout`，并断言默认关闭时不许 abort |
+| C3 | 准入名额随 `req_to_token_pool` 账本下降；两次相同输入组出相同 batch（确定性）；准入真的消耗 KV 页；4 页的池必须一个都不准入 |
+| C4 | 真实分配器 `device='cpu'` 下 alloc/free/available_size 数值正确；超额 alloc 返回 `None` 且不消耗页；`available_size()` 恒等于两个 free list 的长度和 |
+| C5 | 把池抽到剩 1 页 → `check_decode_mem()` 为 False → 真实 `retract_decode()` 退请求、batch 变小、页还回来 |
+| G1 | `git diff 5b33b51793..HEAD` 不许出现 `sim/` 之外的文件；工作区也不许有对既有文件的未提交改动 |
+| G2 | `support_triton(None) is True`（不点名后端就会选 Triton）；`alloc_for_extend` 仍按它分支；sim 选出的 `attention_backends()` 必须是非 Triton |
+
+**注入自检（证明测试不是摆设，三次都真红了）**：
+1. 往 `schedule_policy.py` 追加一行 → G1 红；
+2. 去掉 `attention_backend="torch_native"` → G2 红；
+3. 把真实 `TokenToKVPoolAllocator.available_size()` 改成恒返回 `10**9` → **8 条红**
+   （准入确定性、准入消耗账本、小池零准入、retract、KV 拦截面 selftest 等全部命中）。
