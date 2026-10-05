@@ -33,6 +33,8 @@ monkeypatches already-existing module/class attributes.
 
 from __future__ import annotations
 
+import os
+
 from types import SimpleNamespace
 from typing import Callable, List
 
@@ -44,11 +46,16 @@ _unpatchers: List[Callable[[], None]] = []
 # ---------------------------------------------------------------------------
 # 1. Execution interception: scheduler.py:956/960 worker-class selection
 # ---------------------------------------------------------------------------
-def _init_sim_parallel_state() -> None:
-    """Single-rank gloo process group, as the real worker would set up.
+def _init_sim_parallel_state(
+    rank: int = 0, world_size: int = 1, tp_size: int = 1,
+    ep_size: int = 1, init_method: str = "tcp://127.0.0.1:29591",
+) -> None:
+    """A gloo process group, as the real worker would set up.
 
     The scheduler reads the TP group (scheduler.py:1107); a sim that skipped it
-    would be hiding a real dependency. tp=1 on gloo needs no accelerator.
+    would be hiding a real dependency. gloo needs no accelerator, so this works
+    for one rank and for several -- several means several processes, one per
+    rank, same as a real deployment.
     """
     import torch.distributed as dist
     from sglang.srt.distributed import parallel_state
@@ -57,14 +64,18 @@ def _init_sim_parallel_state() -> None:
         return
     if not dist.is_initialized():
         dist.init_process_group(
-            backend="gloo", init_method="tcp://127.0.0.1:29591",
-            world_size=1, rank=0,
+            backend="gloo", init_method=init_method,
+            world_size=world_size, rank=rank,
         )
     parallel_state.init_distributed_environment(
-        world_size=1, rank=0, local_rank=0,
-        distributed_init_method="tcp://127.0.0.1:29591", backend="gloo",
+        world_size=world_size, rank=rank, local_rank=rank,
+        distributed_init_method=init_method, backend="gloo",
     )
-    parallel_state.initialize_model_parallel(backend="gloo")
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        expert_model_parallel_size=ep_size,
+        backend="gloo",
+    )
 
 
 class SimTpModelWorker:
@@ -90,7 +101,15 @@ class SimTpModelWorker:
                 model_config = ModelConfig.from_server_args(server_args)
             except Exception:
                 model_config = SimpleNamespace(vocab_size=32000, context_len=8192)
-        _init_sim_parallel_state()
+        tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+        ep_size = int(getattr(server_args, "ep_size", 1) or 1)
+        rank = int(getattr(ps, "tp_rank", 0) or 0)
+        _init_sim_parallel_state(
+            rank=rank, world_size=tp_size, tp_size=tp_size, ep_size=ep_size,
+            init_method=os.environ.get(
+                "SIM_DIST_INIT", "tcp://127.0.0.1:29591"
+            ),
+        )
         model_runner = MockModelRunner(
             model_config=model_config, device="cpu", ps=ps
         )

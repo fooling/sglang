@@ -234,6 +234,10 @@ class SimDriver:
     """
 
     def __init__(self, scheduler, push, pull, max_iters: int = 4000):
+        # push/pull are None on a TP rank that does not own the IPC: in a real
+        # deployment only rank 0 talks to the tokenizer, the others get the
+        # requests through _broadcast_reqs_across_ranks. Such a rank still runs
+        # the whole loop and still watches it, it just has nothing to send.
         self.sched = scheduler
         self.push = push
         self.pull = pull
@@ -261,7 +265,8 @@ class SimDriver:
 
         newly = [rid for rid, _p, _m, a in WORKLOAD if a == self.iter]
         if newly:
-            deliver_async(self.push, newly)
+            if self.push is not None:
+                deliver_async(self.push, newly)
             self.arrived[self.iter] = newly
             self.sent.update(newly)
 
@@ -276,14 +281,17 @@ class SimDriver:
             # Nothing left to launch: block on the output socket instead of
             # spinning, so a result that is still in flight is not mistaken
             # for a result that never came.
-            if len(self.finished) < len(WORKLOAD):
+            if self.pull is not None and len(self.finished) < len(WORKLOAD):
                 self.pull.poll(timeout=OUTPUT_POLL_MS)
                 self._drain_outputs()
+            elif self.pull is None:
+                time.sleep(OUTPUT_POLL_MS / 1000.0 / 10)
             self.idle_rounds += 1
         else:
             self.idle_rounds = 0
 
-        done = len(self.finished) == len(WORKLOAD)
+        ledger = self.finished if self.pull is not None else self.finished_from_reqs
+        done = len(ledger) == len(WORKLOAD)
         if done or self.idle_rounds > IDLE_ROUNDS_BEFORE_GIVING_UP or (
             self.iter > self.max_iters
         ):
@@ -334,6 +342,8 @@ class SimDriver:
 
     # ---- reading what the engine published ----
     def _drain_outputs(self) -> None:
+        if self.pull is None:
+            return
         import zmq
 
         from sglang.srt.managers.io_struct import sock_recv
