@@ -16,6 +16,7 @@ kernels. Everything about the control plane is.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 import warnings
 
@@ -47,6 +48,11 @@ from sglang.srt.sim.run_k3_sim import (
 )
 
 LAST_RUN: dict = {}
+
+# How long to wait on the output socket once the engine has gone idle, and
+# how many such waits before calling a missing result missing.
+OUTPUT_POLL_MS = 200
+IDLE_ROUNDS_BEFORE_GIVING_UP = 25
 
 
 def open_input_socket(scheduler):
@@ -176,13 +182,172 @@ def build_real_scheduler():
     # tokenizer manager process. The driver below binds a PUSH and takes
     # that position, so arrivals go through the real socket.
     scheduler.sim_input_ipc_name = str(port_args.scheduler_input_ipc_name)
+    # With skip_tokenizer_init the scheduler sends results straight to
+    # tokenizer_ipc_name (ipc_channels:58), not to the detokenizer.
+    scheduler.sim_output_ipc_name = str(port_args.tokenizer_ipc_name)
     return scheduler, cfg_dir
 
 
+def open_output_socket(scheduler):
+    """Bind the side the tokenizer / detokenizer process binds.
+
+    The scheduler's output socket is a zmq.PUSH that CONNECTS (ipc_channels:58),
+    so without a bound peer the results go nowhere. Binding it here means
+    process_batch_result's stream really lands somewhere and can be read back.
+    """
+    import zmq
+
+    from sglang.srt.server_args import get_global_server_args
+
+    ctx = zmq.Context()
+    pull = ctx.socket(zmq.PULL)
+    pull.bind(scheduler.sim_output_ipc_name)
+    return ctx, pull
+
+
+class SimDriver:
+    """Scripts the arrivals and watches each iteration from inside the loop.
+
+    Both methods are SGLang's own scheduler-hook interface: run_batch calls
+    on_run_batch (scheduler.py:3874) and recv_requests calls step(). Using them
+    means event_loop_normal runs for real -- this object only sends requests,
+    reads the outputs the engine publishes, and decides when to stop.
+    """
+
+    def __init__(self, scheduler, push, pull, max_iters: int = 4000):
+        self.sched = scheduler
+        self.push = push
+        self.pull = pull
+        self.max_iters = max_iters
+        self.iter = 0
+        self.rows: list[dict] = []
+        self.finished: dict[str, str] = {}
+        self.completion: dict[str, int] = {}
+        self.arrived: dict[int, list] = {}
+        self.sent: set = set()
+        # Reqs the engine put in a batch, kept so finishes can be attributed to
+        # the batch that produced them. The authoritative ledger is still what
+        # the engine published on the output socket; the two are reconciled at
+        # the end.
+        self.seen: dict = {}
+        self.finished_from_reqs: dict[str, str] = {}
+        self.idle_rounds = 0
+        self.stop_reason = "not stopped"
+
+    # ---- SGLang calls this at the top of recv_requests ----
+    def step(self) -> None:
+        self.iter += 1
+        self._drain_outputs()
+        self._attribute_finishes()
+
+        newly = [rid for rid, _p, _m, a in WORKLOAD if a == self.iter]
+        if newly:
+            deliver_async(self.push, newly)
+            self.arrived[self.iter] = newly
+            self.sent.update(newly)
+
+        # Yield so zmq's I/O thread can actually move the messages. Without
+        # this the loop spins through every iteration in a few milliseconds
+        # and the outputs arrive late or not at all -- a real deployment has a
+        # tokenizer process on the other end polling its own socket.
+        time.sleep(0.001)
+
+        all_sent = len(self.sent) == len(WORKLOAD)
+        if all_sent and self.sched.is_fully_idle():
+            # Nothing left to launch: block on the output socket instead of
+            # spinning, so a result that is still in flight is not mistaken
+            # for a result that never came.
+            if len(self.finished) < len(WORKLOAD):
+                self.pull.poll(timeout=OUTPUT_POLL_MS)
+                self._drain_outputs()
+            self.idle_rounds += 1
+        else:
+            self.idle_rounds = 0
+
+        done = len(self.finished) == len(WORKLOAD)
+        if done or self.idle_rounds > IDLE_ROUNDS_BEFORE_GIVING_UP or (
+            self.iter > self.max_iters
+        ):
+            # the loop checks this at the top of the next iteration
+            self.stop_reason = (
+                "all finished" if done
+                else "idle with outputs missing"
+                if self.idle_rounds > IDLE_ROUNDS_BEFORE_GIVING_UP
+                else "iteration cap"
+            )
+            self.sched.gracefully_exit = True
+
+    # ---- SGLang calls this inside run_batch ----
+    def on_run_batch(self, batch) -> None:
+        for req in batch.reqs:
+            self.seen[req.rid] = req
+        self.rows.append(
+            dict(
+                forward_iter=batch.forward_iter,
+                mode="prefill" if batch.forward_mode.is_extend() else "decode",
+                bs=batch.batch_size(),
+                rids=[r.rid for r in batch.reqs],
+                wait=len(self.sched.waiting_queue),
+                # free pages at the moment this batch is launched
+                kvfree=self.sched.token_to_kv_pool_allocator.available_size(),
+                arrived=self.arrived.get(self.iter, []),
+                events=[],
+            )
+        )
+
+    def _attribute_finishes(self) -> None:
+        """Pin each finish to the batch that produced it.
+
+        step() runs right after the previous iteration's process_batch_result,
+        so rows[-1] is the batch whose forward produced this finish.
+        """
+        for rid, req in self.seen.items():
+            if rid in self.finished_from_reqs or not req.finished():
+                continue
+            name = type(req.finished_reason).__name__
+            self.finished_from_reqs[rid] = name
+            if self.rows:
+                self.rows[-1]["events"].append(
+                    f"{rid} {name.replace('FINISH_', '')}"
+                )
+
+    # ---- reading what the engine published ----
+    def _drain_outputs(self) -> None:
+        import zmq
+
+        from sglang.srt.managers.io_struct import sock_recv
+
+        while True:
+            try:
+                out = sock_recv(self.pull, zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            rids = getattr(out, "rids", None)
+            if not rids:
+                continue
+            reasons = getattr(out, "finished_reasons", [None] * len(rids))
+            done = getattr(out, "completion_tokens", [None] * len(rids))
+            for i, rid in enumerate(rids):
+                if done[i] is not None:
+                    self.completion[rid] = done[i]
+                reason = reasons[i] if i < len(reasons) else None
+                if reason and rid not in self.finished:
+                    name = reason.get("type") if isinstance(reason, dict) else str(reason)
+                    self.finished[rid] = str(name)
+
+
+def deliver_async(push, rids) -> None:
+    """Send without waiting: the engine's own recv_requests picks them up."""
+    from sglang.srt.managers.io_struct import sock_send
+
+    spec = {rid: (plen, mnt) for rid, plen, mnt, _a in WORKLOAD}
+    for rid in rids:
+        plen, mnt = spec[rid]
+        sock_send(push, tokenized_request(rid, plen, mnt))
+
+
 def main(prebuilt=None) -> int:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     banner("step 1: build a real Scheduler (mock backend, no weights)")
     # One Scheduler per process: it holds a gloo group and ZMQ sockets, so a
@@ -193,120 +358,102 @@ def main(prebuilt=None) -> int:
     print(f"  worker={type(sched.tp_worker).__name__} runner={type(mr).__name__}")
     print(f"  config dir holds: {sorted(p.name for p in cfg_dir.iterdir())}")
     print(f"  req pool: {type(sched.req_to_token_pool).__name__}"
-          f" (hybrid = K3's linear attention needs a state pool)")
+          f" size={sched.req_to_token_pool.size}"
+          f" (hybrid: K3's linear attention needs a state pool)")
     print(f"  kv allocator: {type(sched.token_to_kv_pool_allocator).__name__}"
           f" size={sched.token_to_kv_pool_allocator.available_size()}")
+    print(f"  max_running_requests: {sched.max_running_requests}")
     print(f"  torch.cuda.is_available()={torch.cuda.is_available()}")
 
-    banner("step 2: workload (arrives in waves, through the real socket)")
-    reqs: dict = {}
+    banner("step 2: wire both ends of the real IPC")
+    ctx_in, push = open_input_socket(sched)
+    ctx_out, pull = open_output_socket(sched)
+    print(f"  input  <- {sched.sim_input_ipc_name}")
+    print(f"  output -> {sched.sim_output_ipc_name}")
     for rid, plen, mnt, arrive in WORKLOAD:
         eos = f", EOS at output #{EOS_SCRIPT[rid]}" if rid in EOS_SCRIPT else ""
-        print(f"  {rid}: prompt={plen} max_new={mnt} arrives before step {arrive}{eos}")
-    ctx, push = open_input_socket(sched)
-    print(f"  driver bound {sched.sim_input_ipc_name}"
-          f" (the tokenizer manager's position)")
-    sched.waiting_queue = []
+        print(f"  {rid}: prompt={plen} max_new={mnt} arrives at iter {arrive}{eos}")
 
-    banner("step 3: scheduler loop on the real Scheduler")
-    running_batch = ScheduleBatch(
-        reqs=[], batch_is_full=False, device="cpu",
-        spec_algorithm=SpeculativeAlgorithm.NONE,
+    banner("step 3: run SGLang's own event_loop_normal")
+    driver = SimDriver(sched, push, pull)
+    # SGLang's own scheduler-hook attribute: run_batch calls on_run_batch and
+    # recv_requests calls step(). The loop below is SGLang's, start to finish.
+    assert sched.scripted_scheduler_hook is None
+    sched.scripted_scheduler_hook = driver
+    # The receiver is a frozen dataclass that captured the hook at __init__
+    # time. Rebuild it with dataclasses.replace -- still SGLang's own class
+    # and every other field untouched, which is exactly what
+    # init_request_receiver would have handed it had the hook existed then.
+    sched.request_receiver = dataclasses.replace(
+        sched.request_receiver, scripted_scheduler_hook=driver
     )
-    last_batch, steps, idle = None, 0, 0
-    finished: dict[str, str] = {}
-    modes: list[str] = []
-    # per-step queue depth: how the page can claim admission deferred anyone
-    waits: list[int] = []
-    print(f"  {'step':>4} {'mode':<8} {'bs':>3} {'kvfree':>7} {'wait':>5}  "
+    sched.gracefully_exit = False
+
+    Scheduler.event_loop_normal(sched)
+    driver._drain_outputs()  # whatever the last batch published
+    driver._attribute_finishes()
+    # The two records must agree: what the Reqs say and what the engine
+    # published on the socket. A mismatch means the output path dropped a
+    # result, which would otherwise pass unnoticed.
+    assert set(driver.finished) == set(driver.finished_from_reqs), (
+        f"output stream says {sorted(driver.finished)} but the Reqs say "
+        f"{sorted(driver.finished_from_reqs)}"
+    )
+
+    print(f"  {'fwd':>4} {'mode':<8} {'bs':>3} {'kvfree':>7} {'wait':>5}  "
           f"{'batch':<30} events")
-    while steps < 60:
-        steps += 1
-        newly = [rid for rid, _p, _m, a in WORKLOAD if a == steps]
-        if newly:
-            # real socket -> recv_requests -> process_input_requests ->
-            # handle_generate_request: the Req objects are SGLang's own
-            for req in deliver(sched, push, newly):
-                reqs[req.rid] = req
+    for row in driver.rows:
+        ev = []
+        if row["arrived"]:
+            ev.append(f"arrived {row['arrived']}")
+        ev += row["events"]
+        kv = row.get("kvfree")
+        print(f"  {row['forward_iter']:>4} {row['mode']:<8} {row['bs']:>3} "
+              f"{(kv if kv is not None else '-'):>7} {row['wait']:>5}  "
+              f"{str(row['rids']):<30} {'; '.join(ev)}")
 
-        plan = Scheduler.get_next_batch_to_run(
-            sched, running_batch=running_batch, last_batch=last_batch
-        )
-        running_batch, batch = plan.running_batch, plan.batch_to_run
-        kvfree = sched.token_to_kv_pool_allocator.available_size()
-        if batch is None:
-            print(f"  {steps:>4} {'(idle)':<8} {'-':>3} {kvfree:>7} "
-                  f"{len(sched.waiting_queue):>5}  {'--':<30} "
-                  f"{'arrived ' + str(newly) if newly else ''}")
-            # event_loop_normal calls this on the no-batch branch (:3825);
-            # calling it keeps every step of the loop body covered.
-            Scheduler.on_idle(sched)
-            idle += 1
-            if not sched.waiting_queue or (
-                idle >= 3 and not [a for _r, _p, _m, a in WORKLOAD if a > steps]
-            ):
-                break
-            last_batch = None
-            continue
-        idle = 0
-        waits.append(len(sched.waiting_queue))
-        mode = "prefill" if batch.forward_mode.is_extend() else "decode"
-        modes.append(mode)
-        in_batch = list(batch.reqs)
-
-        result = Scheduler.run_batch(sched, batch)
-        Scheduler.process_batch_result(sched, batch, result)
-
-        events = []
-        if newly:
-            events.append(f"arrived {newly}")
-        for req in in_batch:
-            if req.finished() and req.rid not in finished:
-                finished[req.rid] = type(req.finished_reason).__name__
-                events.append(f"{req.rid} {finished[req.rid].replace('FINISH_', '')}")
-        print(f"  {steps:>4} {mode:<8} {batch.batch_size():>3} "
-              f"{sched.token_to_kv_pool_allocator.available_size():>7} "
-              f"{len(sched.waiting_queue):>5}  "
-              f"{str([r.rid for r in batch.reqs]):<30} {'; '.join(events)}")
-        last_batch = batch
-        if len(finished) == len(WORKLOAD):
-            break
-
-    banner("step 4: result")
+    banner("step 4: result, read off what the engine published")
+    modes = [r["mode"] for r in driver.rows]
+    finished = driver.finished
     by_reason: dict = {}
     for rid, reason in finished.items():
         by_reason.setdefault(reason, []).append(rid)
-    print(f"  steps: {steps}  prefills: {modes.count('prefill')}  "
-          f"decodes: {modes.count('decode')}")
+    print(f"  loop iterations: {driver.iter}  forward batches: {len(driver.rows)}"
+          f"  prefills: {modes.count('prefill')}  decodes: {modes.count('decode')}")
     print(f"  finished: {len(finished)} / {len(WORKLOAD)}")
     for reason, rids in sorted(by_reason.items()):
         print(f"    {reason}: {sorted(rids)}")
     for rid, _plen, mnt, _a in WORKLOAD:
-        print(f"    {rid}: output_len={len(reqs[rid].output_ids)} (max_new={mnt}) "
-              f"reason={finished.get(rid, 'NOT FINISHED')}")
+        print(f"    {rid}: completion_tokens={driver.completion.get(rid)} "
+              f"(max_new={mnt}) reason={finished.get(rid, 'NOT FINISHED')}")
     kv_free = sched.token_to_kv_pool_allocator.available_size()
     evictable = sched.tree_cache.evictable_size()
     print(f"  kv at end: free={kv_free} + radix evictable={evictable} "
           f"= {kv_free + evictable}")
     print(f"  waiting_queue left: {len(sched.waiting_queue)}")
+    print(f"  loop exited by: {driver.stop_reason} (gracefully_exit={sched.gracefully_exit})")
 
-    push.close()
-    ctx.term()
+    push.close(); ctx_in.term()
+    pull.close(); ctx_out.term()
 
     ok = len(finished) == len(WORKLOAD)
-    print(f"\n  ALL REQUESTS FINISHED ON A REAL SCHEDULER: {ok}")
+    print(f"\n  ALL REQUESTS FINISHED ON A REAL SCHEDULER LOOP: {ok}")
     LAST_RUN.clear()
     LAST_RUN.update(
         scheduler_cls=type(sched).__name__,
         worker_cls=type(sched.tp_worker).__name__,
         req_pool_cls=type(sched.req_to_token_pool).__name__,
-        steps=steps, modes=modes, waits=waits, finished=finished,
-        by_reason=by_reason,
-        reqs=reqs, workload=WORKLOAD, kv_free_end=kv_free,
-        radix_evictable=evictable, waiting_left=len(sched.waiting_queue),
+        loop_iters=driver.iter, rows=driver.rows, modes=modes,
+        waits=[r["wait"] for r in driver.rows],
+        finished=finished, by_reason=by_reason, completion=driver.completion,
+        workload=WORKLOAD, kv_free_end=kv_free, radix_evictable=evictable,
+        waiting_left=len(sched.waiting_queue),
         max_running_requests=sched.max_running_requests,
         req_pool_size=sched.req_to_token_pool.size,
-        req_cls_module=type(next(iter(reqs.values()))).__module__,
+        outputs_were_read=bool(driver.completion),
+        finished_from_reqs=driver.finished_from_reqs,
+        req_cls_module=type(next(iter(driver.seen.values()))).__module__,
+        stop_reason=driver.stop_reason,
     )
     return 0 if ok else 2
 

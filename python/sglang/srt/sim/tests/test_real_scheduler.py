@@ -199,19 +199,40 @@ def test_concurrency_is_capped_by_the_state_pool_not_by_us(run, sched):
     assert run["req_pool_size"] != sched.server_args.max_mamba_cache_size
 
 
-def test_the_output_path_is_real_but_has_no_reader(sched):
-    """Outputs leave through SGLang's streamer; nothing reads them, no detok.
+def test_the_output_path_runs_and_is_read_back(sched, run):
+    """Outputs leave through SGLang's own streamer and are read off the socket.
 
-    Recorded as a constraint rather than papered over: the page may not claim
-    the output side was verified.
+    The scheduler's output socket is a PUSH that connects, so the driver binds
+    the peer the tokenizer/detokenizer process would bind. completion_tokens
+    and the finish reasons in the result come from those messages, which is
+    why this is a path and not a claim.
     """
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
 
     assert type(sched.output_streamer) is SchedulerOutputStreamer
-    assert sched.server_args.skip_tokenizer_init is True
-    assert sched.tokenizer is None
+    assert type(sched.output_streamer).stream_output.__module__ == (
+        "sglang.srt.managers.scheduler_components.output_streamer"
+    )
+    assert run["outputs_were_read"] is True
+    assert sorted(run["completion"]) == ["a0", "a1", "a2", "b0", "b1", "c0"]
+
+
+def test_the_loop_itself_is_sglangs(sched, run):
+    """event_loop_normal ran; the driver only observes through its own hook.
+
+    The hook interface (on_run_batch / step) is what SGLang calls from inside
+    run_batch and recv_requests, so using it does not displace any loop code.
+    """
+    from sglang.srt.managers.scheduler import Scheduler
+
+    assert Scheduler.event_loop_normal.__module__ == "sglang.srt.managers.scheduler"
+    assert Scheduler.on_idle.__module__ == "sglang.srt.managers.scheduler"
+    # the run went through the loop, not through a hand-rolled while
+    assert run["loop_iters"] >= len(run["rows"])
+    assert run["stop_reason"] == "all finished"
+    assert len(run["rows"]) == 12
 
 
 # ─────────────────────────────── what the run did ────────────────────────────
@@ -223,19 +244,42 @@ def test_every_request_finishes(run):
 
 
 def test_both_finish_reasons_are_reached(run):
-    """Length cutoff on five, a scripted EOS on a1 -- not one path twice."""
-    assert sorted(run["by_reason"]) == ["FINISH_LENGTH", "FINISH_MATCHED_TOKEN"]
-    assert run["by_reason"]["FINISH_MATCHED_TOKEN"] == ["a1"]
+    """Length cutoff on five, a scripted EOS on a1 -- not one path twice.
+
+    by_reason comes off the output messages (the engine's public wording);
+    finished_from_reqs comes off the Req objects. Both are checked because
+    they are two different records of the same event.
+    """
+    assert sorted(run["by_reason"]) == ["length", "stop"]
+    assert run["by_reason"]["stop"] == ["a1"]
+    assert run["finished_from_reqs"]["a1"] == "FINISH_MATCHED_TOKEN"
+    assert sorted(set(run["finished_from_reqs"].values())) == [
+        "FINISH_LENGTH", "FINISH_MATCHED_TOKEN"
+    ]
+
+
+def test_the_two_finish_records_reconcile(run):
+    """What the engine published and what the Reqs hold must be the same set.
+
+    A result dropped on the output path would otherwise pass unnoticed.
+    """
+    assert set(run["finished"]) == set(run["finished_from_reqs"])
+    assert len(run["finished"]) == 6
 
 
 def test_output_lengths_match_the_stopping_rule(run):
-    """LENGTH requests stop exactly at max_new; a1 stops early at its EOS."""
+    """LENGTH requests stop exactly at max_new; a1 stops early at its EOS.
+
+    The counts are the engine's own completion_tokens, read back off the
+    output socket -- not something the harness counted.
+    """
     from sglang.srt.sim.run_k3_sim import EOS_SCRIPT
 
+    assert run["outputs_were_read"] is True
     for rid, _plen, max_new, _arrive in run["workload"]:
-        got = len(run["reqs"][rid].output_ids)
+        got = run["completion"][rid]
         want = EOS_SCRIPT[rid] if rid in EOS_SCRIPT else max_new
-        assert got == want, f"{rid}: output_len={got} want={want}"
+        assert got == want, f"{rid}: completion_tokens={got} want={want}"
 
 
 def test_the_waves_produce_more_than_one_prefill(run):
