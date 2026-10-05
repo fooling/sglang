@@ -147,7 +147,6 @@ def build_real_scheduler():
         device="cpu",
         attention_backend="torch_native",  # keeps KV writes off the Triton kernel
         skip_tokenizer_init=True,
-        disable_cuda_graph=True,
         disable_overlap_schedule=True,  # overlap needs device streams
         # Tight on purpose: the six prompts want 456 pages, so admission
         # has to refuse and defer. A user cap SGLang already
