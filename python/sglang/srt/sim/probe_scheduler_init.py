@@ -6,18 +6,27 @@ Not a test -- a measuring stick. Run it to see the current blocker:
       perl -e 'alarm 420; exec @ARGV' python/.venv/bin/python \
       python/sglang/srt/sim/probe_scheduler_init.py
 
-State at last run: gets through ZMQ/port args, the single-rank gloo TP group,
-the real ModelConfig, init_model_worker and the memory-pool wiring, then stops
-in build_kv_cache with:
+State at last run: clears __init__ end to end and prints SCHEDULER INIT OK.
+The run itself lives in run_k3_server_sim.py; this file stays as the place a
+future blocker gets measured.
 
-    AssertionError: MambaComponent requires HybridReqToTokenPool,
-                    got ReqToTokenPool
+What it took to get here, and why neither step is a mock shortcut:
 
-That is NOT a mock gap. Kimi-K3 is a hybrid architecture -- KimiK3DeltaAttention
-(models/kimi_k3.py:1584) is linear attention with recurrent state, and
-configs/kimi_linear.py carries KimiLinearCacheParams / kda_layers. So its KV side
-needs a HybridReqToTokenPool (MLA pages + linear-attention state), which the sim
-does not build yet. Supporting K3 end to end means providing that second pool.
+1. The hybrid request pool. Kimi-K3 is a hybrid architecture --
+   KimiK3DeltaAttention (models/kimi_k3.py:1584) is linear attention carrying
+   recurrent state, and configs/kimi_linear.py carries KimiLinearCacheParams /
+   kda_layers. build_kv_cache therefore asserts HybridReqToTokenPool, and the
+   sim used to hand it a plain ReqToTokenPool. Fixed by building the pool from
+   SGLang's own mambaish_config(model_config) (mock_worker._build_req_pool) --
+   the sim only moves the device to CPU; the shape comes off the config.
+   So K3's KV side is MLA pages PLUS a linear-attention state pool, not MLA
+   alone.
+
+2. Overlap off. run_batch's overlap branch (scheduler.py:3901) calls
+   forward_stream.wait_stream, and there is no device stream here. Turned off
+   through the server arg SGLang already has (disable_overlap_schedule), not by
+   patching run_batch -- the test suite asserts run_batch stays the module's own
+   function.
 """
 import warnings, traceback; warnings.filterwarnings('ignore')
 # 平台探测：macOS 没有 lscpu。与 get_available_gpu_memory 同类，按 backend 处理。

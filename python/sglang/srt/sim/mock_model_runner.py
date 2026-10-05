@@ -64,6 +64,8 @@ class MockModelRunner:
         # the device KV store; the sim has indices but no tensors
         self.token_to_kv_pool = None
         self.attn_backend = None
+        self.ngram_embedding_manager = None
+        self.canary_manager = None
         self.mtp_draft_device_pools = {}
 
     # -- the two methods the task asks for -----------------------------

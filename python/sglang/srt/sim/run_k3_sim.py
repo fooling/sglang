@@ -66,6 +66,16 @@ K3_TEXT_CONFIG = {
     "qk_nope_head_dim": 128,
     "qk_rope_head_dim": 64,
     "v_head_dim": 128,
+    # K3 is a hybrid: most layers are KDA (linear attention, carrying a state
+    # instead of KV pages), a few stay full attention. SGLang reads this off
+    # the config and hands the scheduler a HybridReqToTokenPool.
+    "linear_attn_config": {
+        "num_heads": 32,
+        "head_dim": 128,
+        "short_conv_kernel_size": 4,
+        "kda_layers": [0, 1, 2, 4, 5, 6],
+        "full_attn_layers": [3, 7],
+    },
 }
 
 EOS_ID = 2
