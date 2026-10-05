@@ -43,9 +43,29 @@ class MockWorker:
 
     # -- exercised by run_smoke.py / Scheduler.init_memory_pools --------
     def alloc_memory_pool(self) -> None:
-        """No-op: KV pools live on the Scheduler stub directly in this
-        prototype (see run_smoke.py build_scheduler_stub), so there is
-        nothing for the worker to allocate."""
+        """Build the CPU pools the worker is supposed to own.
+
+        Allocating pools is the worker's job (backend side); the sizes are
+        whatever the model config carries. The standalone harness builds its
+        own pools on the Scheduler stub instead, in which case this is a no-op
+        because the runner already has them.
+        """
+        from sglang.srt.sim.cpu_kv import (
+            build_cpu_req_to_token_pool,
+            build_cpu_token_to_kv_pool_allocator,
+        )
+
+        if self.model_runner.token_to_kv_pool_allocator is not None:
+            return None
+        mc = self.model_runner.model_config
+        size = getattr(mc, "_sim_max_total_num_tokens", 256)
+        max_ctx = getattr(mc, "_sim_max_context_len", 128)
+        self.model_runner.req_to_token_pool = build_cpu_req_to_token_pool(
+            size=size, max_context_len=max_ctx
+        )
+        allocator = build_cpu_token_to_kv_pool_allocator(size=size)
+        self.model_runner.token_to_kv_pool_allocator = allocator
+        self.model_runner.token_to_kv_pool = allocator.get_kvcache()
         return None
 
     def get_memory_pool(self):
@@ -55,11 +75,38 @@ class MockWorker:
         )
 
     def get_worker_info(self):
-        return {
-            "model_runner": "MockModelRunner",
-            "device": self.model_runner.device,
-            "weights_loaded": False,
-        }
+        """Same 12-tuple the real TpModelWorker returns (tp_worker.py:542-563).
+
+        Shapes and limits come from the pools and the model config, not from
+        invented numbers -- the scheduler derives admission limits from these.
+        """
+        rt = self.model_runner.req_to_token_pool
+        kv = self.model_runner.token_to_kv_pool
+        max_total = getattr(self.model_runner, "max_total_num_tokens", None) or (
+            self.model_runner.token_to_kv_pool_allocator.available_size()
+        )
+        ctx = getattr(self.model_runner.model_config, "context_len", 4096)
+        max_req_len = min(ctx - 1, max_total - 1)
+        from sglang.srt.runtime_context import get_schedule
+
+        schedule = get_schedule()
+        return (
+            rt.schedulable_token_capacity(max_total)
+            if hasattr(rt, "schedulable_token_capacity")
+            else max_total,
+            schedule.max_prefill_tokens,
+            getattr(self.model_runner, "max_running_requests", max_total),
+            schedule.max_queued_requests,
+            max_req_len,
+            max_req_len - 5,
+            0,                      # random_seed
+            self.model_runner.device,
+            None,                   # forward_stream: no device stream in the sim
+            rt.size,
+            rt.max_context_len,
+            getattr(kv, "size", max_total),
+        )
+
 
     def get_pad_input_ids_func(self):
         return None
@@ -73,10 +120,20 @@ class MockWorker:
         )
 
     def init_attention_backends(self, *a, **kw):
+        """No attention backend in the sim: nothing to initialise.
+
+        model_runner.attn_backend stays None, so scheduler.py:3461's
+        hasattr(attn_backend, "extend_attention_block_m") is False and the
+        prefill tile budget takes the documented fallback of 64 -- the same
+        branch the real Ascend backend takes.
+        """
+        return None
+
+    def _unused_init_attention_backends(self, *a, **kw):
         self._unimplemented("init_attention_backends")
 
     def init_cuda_graphs(self, *a, **kw):
-        self._unimplemented("init_cuda_graphs")
+        return None
 
     def forward_batch_embedding(self, *a, **kw):
         self._unimplemented("forward_batch_embedding")
@@ -138,3 +195,6 @@ def _sim_forward_batch_generation(self, batch, **kwargs):
 
 
 MockWorker.forward_batch_generation = _sim_forward_batch_generation
+
+
+MockWorker.is_hybrid_swa = property(lambda self: False)

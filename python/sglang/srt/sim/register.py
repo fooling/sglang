@@ -44,6 +44,29 @@ _unpatchers: List[Callable[[], None]] = []
 # ---------------------------------------------------------------------------
 # 1. Execution interception: scheduler.py:956/960 worker-class selection
 # ---------------------------------------------------------------------------
+def _init_sim_parallel_state() -> None:
+    """Single-rank gloo process group, as the real worker would set up.
+
+    The scheduler reads the TP group (scheduler.py:1107); a sim that skipped it
+    would be hiding a real dependency. tp=1 on gloo needs no accelerator.
+    """
+    import torch.distributed as dist
+    from sglang.srt.distributed import parallel_state
+
+    if parallel_state._TP is not None:
+        return
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo", init_method="tcp://127.0.0.1:29591",
+            world_size=1, rank=0,
+        )
+    parallel_state.init_distributed_environment(
+        world_size=1, rank=0, local_rank=0,
+        distributed_init_method="tcp://127.0.0.1:29591", backend="gloo",
+    )
+    parallel_state.initialize_model_parallel(backend="gloo")
+
+
 class SimTpModelWorker:
     """Drop-in for TpModelWorker's constructor signature (tp_worker.py:315-328).
 
@@ -56,9 +79,18 @@ class SimTpModelWorker:
         from sglang.srt.sim.mock_model_runner import MockModelRunner
         from sglang.srt.sim.mock_worker import MockWorker
 
-        model_config = getattr(server_args, "_sim_model_config", None) or SimpleNamespace(
-            vocab_size=32000, context_len=8192
-        )
+        # Same thing the real TpModelWorker does: resolve the model config
+        # from server_args. Only the weights are skipped -- a sim worker that
+        # invented its own config would be deciding shapes for the scheduler.
+        model_config = getattr(server_args, "_sim_model_config", None)
+        if model_config is None:
+            try:
+                from sglang.srt.configs.model_config import ModelConfig
+
+                model_config = ModelConfig.from_server_args(server_args)
+            except Exception:
+                model_config = SimpleNamespace(vocab_size=32000, context_len=8192)
+        _init_sim_parallel_state()
         model_runner = MockModelRunner(model_config=model_config, device="cpu")
         self._mock_worker = MockWorker(
             model_runner=model_runner, server_args=server_args, gpu_id=gpu_id

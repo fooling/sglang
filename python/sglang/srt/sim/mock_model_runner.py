@@ -61,6 +61,10 @@ class MockModelRunner:
         self.memory_pool_config = None
         self.req_to_token_pool = None
         self.token_to_kv_pool_allocator = None
+        # the device KV store; the sim has indices but no tensors
+        self.token_to_kv_pool = None
+        self.attn_backend = None
+        self.mtp_draft_device_pools = {}
 
     # -- the two methods the task asks for -----------------------------
     def forward(self, forward_batch: Any) -> torch.Tensor:

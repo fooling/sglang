@@ -39,8 +39,15 @@ def build_cpu_token_to_kv_pool_allocator(
 ) -> TokenToKVPoolAllocator:
     """The real allocator class, unmodified, device='cpu', kvcache=None."""
     return TokenToKVPoolAllocator(
-        size=size, dtype=dtype, device="cpu", kvcache=None, need_sort=False
+        size=size, dtype=dtype, device="cpu",
+        kvcache=_sized_kv(dtype, size), need_sort=False,
     )
+
+
+def _sized_kv(dtype, size: int) -> "SimKVCache":
+    kv = SimKVCache(dtype=dtype)
+    kv.size = size
+    return kv
 
 
 def build_cpu_req_to_token_pool(size: int, max_context_len: int) -> ReqToTokenPool:
@@ -74,3 +81,32 @@ def selftest() -> None:
 
 if __name__ == "__main__":
     selftest()
+
+
+class SimKVCache:
+    """Placeholder for the device KV store.
+
+    The sim allocates *indices* for real (that is the whole point of C4), but
+    there is no tensor behind them. Control-plane code only ever asks this
+    object what type it is, so a placeholder is enough -- and anything that
+    tries to actually read or write KV values must blow up here rather than
+    silently get zeros, which would hide a real dependency.
+    """
+
+    def __init__(self, dtype, device: str = "cpu"):
+        self.dtype = dtype
+        self.device = device
+        self.page_size = 1
+        self.layer_num = 0
+        self.post_capture_active = False
+        self.enable_memory_saver = False
+        self.size = 0  # set by the builder
+
+    def _no_values(self, *_a, **_k):
+        raise NotImplementedError(
+            "SimKVCache holds no tensors: the sim proves index bookkeeping, "
+            "not KV contents. Something asked for real KV values."
+        )
+
+    get_key_buffer = get_value_buffer = get_kv_buffer = _no_values
+    set_kv_buffer = get_cpu_copy = load_cpu_copy = _no_values
