@@ -200,6 +200,13 @@ class SimKVCache:
         self.post_capture_active = False
         self.enable_memory_saver = False
         self.size = 0  # set by the builder
+        # per-layer regions, allocated on first touch at the real shape
+        self._buffers: dict = {}
+        # which KV operators were actually invoked, and with what shapes.
+        # This is what replaces "raise" as the guard against self-deception:
+        # a test asserts the operator ran, not that it was avoided.
+        self.ops_called: dict = {}
+        self.op_shapes: dict = {}
 
     def apply_shape(self, shape: dict) -> None:
         """Take the real shape off the model config (kv_shape_from_config).
@@ -265,11 +272,93 @@ class SimKVCache:
         """
         return None
 
-    def _no_values(self, *_a, **_k):
-        raise NotImplementedError(
-            "SimKVCache holds no tensors: the sim proves index bookkeeping, "
-            "not KV contents. Something asked for real KV values."
-        )
+    # ---- the KV operators: really called, with real shapes, bodies empty ----
+    #
+    # These used to raise, on the reasoning that returning zeros would hide a
+    # dependency. That was the wrong cut for a simulator: raising blocks the
+    # call path, so the KV write, the PD transfer and the offload never get
+    # exercised at all. The seam belongs at the OPERATOR, not at the call site:
+    # the shapes are real, the call really happens, and the operator body is
+    # empty for now -- later it can be a costed or a real one.
+    #
+    # What keeps that from becoming self-deception is counting: every call is
+    # recorded with the shape it was given, so a test can assert the operator
+    # was invoked rather than quietly skipped. See ops_called / op_shapes.
 
-    get_key_buffer = get_value_buffer = get_kv_buffer = _no_values
-    set_kv_buffer = get_cpu_copy = load_cpu_copy = _no_values
+    def _layer_buffer(self, layer_id: int) -> "torch.Tensor":
+        """The layer's KV region, allocated on first touch at the real shape.
+
+        Lazily, because a modelled pool can be far larger than this host; at
+        simulation scale the allocation is small (one region is
+        size * head_num * head_dim elements).
+        """
+        if self.head_num <= 0 or self.head_dim <= 0:
+            raise RuntimeError(
+                "SimKVCache has no shape: build it with model_config so the KV "
+                "shapes are real (cpu_kv.kv_shape_from_config)."
+            )
+        buf = self._buffers.get(layer_id)
+        if buf is None:
+            buf = torch.zeros(
+                (self.size, self.head_num, self.head_dim),
+                dtype=self.dtype, device=self.device,
+            )
+            self._buffers[layer_id] = buf
+        return buf
+
+    def _record(self, op: str, **shapes) -> None:
+        self.ops_called[op] = self.ops_called.get(op, 0) + 1
+        if shapes:
+            self.op_shapes.setdefault(op, []).append(shapes)
+
+    def get_kv_buffer_shape(self):
+        one = torch.Size((self.size, self.head_num, self.head_dim))
+        return one, one
+
+    def get_key_buffer(self, layer_id: int):
+        self._record("get_key_buffer", layer=layer_id)
+        return self._layer_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        self._record("get_value_buffer", layer=layer_id)
+        # MLA keeps one latent entry per token, so K and V are the same region.
+        return self._layer_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        self._record("get_kv_buffer", layer=layer_id)
+        buf = self._layer_buffer(layer_id)
+        return buf, buf
+
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v=None) -> None:
+        """The KV write operator. Called for real; the write itself is empty.
+
+        Shapes are checked rather than used: a caller handing in the wrong
+        number of slots is a bug worth hearing about, and an empty operator
+        that silently accepts anything would hide it.
+        """
+        layer_id = getattr(layer, "layer_id", layer)
+        n = int(loc.shape[0]) if hasattr(loc, "shape") else len(loc)
+        if hasattr(cache_k, "shape") and int(cache_k.shape[0]) != n:
+            raise ValueError(
+                f"set_kv_buffer: {n} slots but cache_k has "
+                f"{int(cache_k.shape[0])} rows"
+            )
+        self._layer_buffer(layer_id if isinstance(layer_id, int) else 0)
+        self._record("set_kv_buffer", layer=layer_id, slots=n)
+        # operator body intentionally empty -- nothing is stored
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        """The KV offload operator (device -> host). Called; copies nothing.
+
+        Returns one correctly shaped placeholder per layer so the caller's own
+        bookkeeping (how many layers, how many slots) still runs.
+        """
+        n = len(indices)
+        self._record("get_cpu_copy", slots=n, layers=self.layer_num)
+        return [torch.empty((n, self.head_num, self.head_dim), dtype=self.dtype)
+                for _ in range(self.layer_num)]
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None) -> None:
+        """The reload operator (host -> device). Called; copies nothing."""
+        self._record("load_cpu_copy", slots=len(indices),
+                     layers=len(kv_cache_cpu) if kv_cache_cpu is not None else 0)

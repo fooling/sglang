@@ -182,12 +182,17 @@ def test_the_transfer_engine_reports_a_move_and_can_be_charged_for_it():
     assert register.virtual_clock().perf_counter() == before
 
 
-def test_the_sim_kv_cache_still_refuses_to_hand_out_values():
-    """The buffer-info accessor returning empty must not have softened the rest.
+def test_the_kv_operators_are_really_called_with_real_shapes():
+    """The seam is the operator body, not the call site.
 
-    get_contiguous_buf_infos and maybe_get_custom_mem_pool are pool accessors
-    and answer honestly. Anything that hands out KV *contents* must still
-    raise, or zeros would silently stand in for real attention state.
+    These accessors used to raise, on the reasoning that returning zeros would
+    hide a dependency. For a simulator that is the wrong cut: raising blocks
+    the path, so the KV write, the PD transfer and the offload never get
+    exercised. What a mock needs is the real shape, the call actually
+    happening, and an empty operator behind it.
+
+    Counting is what replaces raising as the guard: the test asserts the
+    operator ran and with which shapes, so a silently skipped call fails here.
     """
     import torch
 
@@ -195,16 +200,41 @@ def test_the_sim_kv_cache_still_refuses_to_hand_out_values():
 
     kv = SimKVCache(dtype=torch.float16)
     kv.size = 64
-    kv.apply_shape(dict(kv_layers=2, head_num=1, head_dim=576,
+    kv.apply_shape(dict(kv_layers=8, head_num=1, head_dim=576,
                         bytes_per_token=1152))
-    ptrs, lens, item_lens = kv.get_contiguous_buf_infos()
-    assert len(ptrs) == len(lens) == len(item_lens) == 2
-    assert item_lens == [1152, 1152] and lens == [64 * 1152] * 2
-    assert kv.maybe_get_custom_mem_pool() is None
-    raisers = [n for n in ("get_key_buffer", "get_value_buffer", "get_kv_buffer",
-                           "set_kv_buffer")
-               if hasattr(kv, n)]
-    assert raisers, "SimKVCache has no value accessors left to guard"
-    for name in raisers:
-        with pytest.raises(NotImplementedError):
-            getattr(kv, name)(0)
+
+    # real shapes out
+    k = kv.get_key_buffer(0)
+    assert tuple(k.shape) == (64, 1, 576) and k.dtype is torch.float16
+    assert tuple(kv.get_kv_buffer_shape()[0]) == (64, 1, 576)
+
+    # the write operator is callable, and the call is recorded
+    layer = type("L", (), {"layer_id": 3})()
+    kv.set_kv_buffer(layer, torch.arange(8),
+                     torch.zeros((8, 1, 576), dtype=torch.float16))
+    assert kv.ops_called["set_kv_buffer"] == 1
+    assert kv.op_shapes["set_kv_buffer"] == [{"layer": 3, "slots": 8}]
+
+    # the offload operators too, one entry per KV layer
+    copied = kv.get_cpu_copy(list(range(5)))
+    assert len(copied) == 8 and tuple(copied[0].shape) == (5, 1, 576)
+    kv.load_cpu_copy(copied, list(range(5)))
+    assert kv.ops_called["get_cpu_copy"] == kv.ops_called["load_cpu_copy"] == 1
+
+    # an empty operator must still refuse a shape that cannot be right
+    with pytest.raises(ValueError, match="slots but cache_k"):
+        kv.set_kv_buffer(layer, torch.arange(8),
+                         torch.zeros((7, 1, 576), dtype=torch.float16))
+
+
+def test_a_shapeless_kv_cache_still_refuses():
+    """No model config means no shape, and a zero shape is not an answer."""
+    import torch
+
+    from sglang.srt.sim.cpu_kv import SimKVCache
+
+    bare = SimKVCache(dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="no shape"):
+        bare.get_contiguous_buf_infos()
+    with pytest.raises(RuntimeError, match="no shape"):
+        bare.get_key_buffer(0)
