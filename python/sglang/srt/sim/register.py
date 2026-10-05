@@ -347,16 +347,59 @@ def selftest_kv_shim() -> bool:
 # 3. Transfer interception: disaggregation/ascend/conn.py:42
 # ---------------------------------------------------------------------------
 class MockTransferEngine:
-    """Replaces AscendTransferEngine; no memfabric / NPU dependency."""
+    """Replaces AscendTransferEngine; no memfabric / NPU dependency.
+
+    This is the object that moves KV bytes between a prefill and a decode
+    instance. Replacing it is what makes PD runnable without device memory:
+    the handshake, the queue transitions and both schedulers' bookkeeping are
+    SGLang's own, and this reports the move as done.
+
+    What that costs is stated plainly: no bytes actually move, so the transfer
+    cannot verify correctness or real bandwidth. Its *duration* comes from the
+    same seam the forward slice does, which is what a performance simulation
+    needs from it.
+    """
 
     def __init__(self, hostname, npu_id, disaggregation_mode):
         self.hostname = hostname
         self.npu_id = npu_id
         self.disaggregation_mode = disaggregation_mode
         self.registered = []
+        self.transfers = []
 
     def batch_register(self, ptrs, lens):
         self.registered.append((list(ptrs), list(lens)))
+
+    def batch_deregister(self, ptrs):
+        self.registered = [(p, l) for p, l in self.registered if p != list(ptrs)]
+
+    def get_session_id(self) -> str:
+        return f"sim-session-{self.hostname}-{self.npu_id}"
+
+    def batch_transfer_sync(self, session_id, src_addrs, dst_addrs, lengths):
+        """0 means the move succeeded -- the same value SGLang's own code
+        returns when a layer has nothing to transfer (conn.py:1140).
+
+        Charged the transfer cost on the shared clock, so a simulated PD
+        handoff takes the time the cost library says it takes.
+        """
+        nbytes = int(sum(lengths)) if lengths else 0
+        self.transfers.append((session_id, len(src_addrs or []), nbytes))
+        cost = TRANSFER_COST(nbytes) if TRANSFER_COST else 0.0
+        if cost:
+            _shared_clock.advance(float(cost))
+        return 0
+
+
+# How long a KV transfer of n bytes takes, in seconds. The real design fills
+# this from the same offline cost library the forward slice comes from;
+# install it with transfer_cost_hook().
+TRANSFER_COST = None
+
+
+def transfer_cost_hook(fn) -> None:
+    global TRANSFER_COST
+    TRANSFER_COST = fn
 
 
 def install_transfer_shim() -> Callable[[], None]:
