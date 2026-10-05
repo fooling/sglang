@@ -338,16 +338,47 @@ def selftest_transfer_shim() -> bool:
 _shared_clock = VirtualClock()
 
 
-def install_clock_shim() -> Callable[[], None]:
-    import sglang.srt.managers.scheduler as scheduler_mod
+# Modules whose ``time`` name the clock face covers. scheduler.py is where the
+# timeout deadlines are read; req_time_stats.py is where SGLang stamps every
+# per-request timestamp it later reports as queue / prefill / decode duration.
+# Both have to be on the same clock, or the engine would time a forward that
+# the sim decided takes 40 ms against a real wall clock and report ~0.
+CLOCK_FACE_MODULES = (
+    "sglang.srt.managers.scheduler",
+    "sglang.srt.observability.req_time_stats",
+)
 
-    original = scheduler_mod.time
-    patch_module_clock(scheduler_mod, _shared_clock)
+
+def install_clock_shim() -> Callable[[], None]:
+    import importlib
+
+    originals = {}
+    for name in CLOCK_FACE_MODULES:
+        mod = importlib.import_module(name)
+        originals[name] = mod.time
+        patch_module_clock(mod, _shared_clock)
 
     def unpatch():
-        scheduler_mod.time = original
+        for name, original in originals.items():
+            importlib.import_module(name).time = original
 
     return unpatch
+
+
+def forward_cost_hook(fn) -> None:
+    """Install what decides how long a forward takes.
+
+    This is the seam the real design fills from the offline cost library: it
+    is handed the batch and returns seconds. Nothing here computes a duration
+    from the model -- the number is supplied, which is the whole point.
+    """
+    import sglang.srt.sim.mock_worker as mw
+
+    mw.FORWARD_COST = fn
+
+
+def virtual_clock() -> "VirtualClock":
+    return _shared_clock
 
 
 def selftest_clock_shim() -> bool:

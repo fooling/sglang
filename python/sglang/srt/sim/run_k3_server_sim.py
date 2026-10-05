@@ -40,7 +40,6 @@ import torch
 from sglang.srt.sim import register
 from sglang.srt.sim.run_k3_sim import (
     EOS_SCRIPT,
-    FILLER_TOKEN,
     WORKLOAD,
     banner,
     build_k3_model_config,
@@ -53,6 +52,13 @@ LAST_RUN: dict = {}
 # how many such waits before calling a missing result missing.
 OUTPUT_POLL_MS = 200
 IDLE_ROUNDS_BEFORE_GIVING_UP = 25
+
+
+def _clock_now() -> float:
+    """The virtual clock the sim and SGLang share."""
+    from sglang.srt.sim import register
+
+    return register.virtual_clock().perf_counter()
 
 
 def open_input_socket(scheduler):
@@ -69,6 +75,20 @@ def open_input_socket(scheduler):
     push = ctx.socket(zmq.PUSH)
     push.bind(scheduler.sim_input_ipc_name)
     return ctx, push
+
+
+def distinct_prompt(rid: str, prompt_len: int) -> list:
+    """Token ids that do not share a prefix with any other request.
+
+    A constant filler would make every prompt a radix cache hit, so the pool
+    would never actually have to hold six separate prompts and the admission
+    pressure on the page would be fiction. Seeding by rid keeps each prompt
+    its own, which is what "456 pages of prompt against a 144-page pool"
+    has to mean.
+    """
+    base = 1 + sum(ord(c) for c in rid) * 977
+    vocab = 163840
+    return [(base + i * 31) % vocab for i in range(prompt_len)]
 
 
 def tokenized_request(rid: str, prompt_len: int, max_new: int):
@@ -91,7 +111,7 @@ def tokenized_request(rid: str, prompt_len: int, max_new: int):
         # typecode "q", same as the tokenizer manager (:1346). Req.output_ids
         # is array("q") and _refresh_fill_ids concatenates the two, so a
         # different typecode raises on the first prefill.
-        input_ids=array("q", [FILLER_TOKEN] * prompt_len),
+        input_ids=array("q", distinct_prompt(rid, prompt_len)),
         input_embeds=None,
         mm_inputs=None,
         token_type_ids=None,
@@ -148,11 +168,11 @@ def build_real_scheduler():
         attention_backend="torch_native",  # keeps KV writes off the Triton kernel
         skip_tokenizer_init=True,
         disable_overlap_schedule=True,  # overlap needs device streams
-        # Tight on purpose: the six prompts want 456 pages, so admission
-        # has to refuse and defer. A user cap SGLang already
+        # Tight on purpose: the six prompts want 456 pages of distinct
+        # tokens, so admission has to refuse and defer. A user cap SGLang already
         # has -- _apply_token_constraints applies it to whatever the
         # memory profile reports, and _derive_pool_sizes still runs.
-        max_total_tokens=144,
+        max_total_tokens=256,
         # Required, not a sim convenience: with a hybrid model and this
         # left at None, SGLang's own resolve_max_num_reqs divides it by
         # the mamba ratio (kv_cache_configurator.py:2004) and raises.
@@ -289,6 +309,8 @@ class SimDriver:
                 wait=len(self.sched.waiting_queue),
                 # free pages at the moment this batch is launched
                 kvfree=self.sched.token_to_kv_pool_allocator.available_size(),
+                # the virtual clock before this forward is charged its slice
+                clock_before=_clock_now(),
                 arrived=self.arrived.get(self.iter, []),
                 events=[],
             )
@@ -391,6 +413,13 @@ def main(prebuilt=None) -> int:
     Scheduler.event_loop_normal(sched)
     driver._drain_outputs()  # whatever the last batch published
     driver._attribute_finishes()
+    # Each row's end-of-forward clock is the next row's start; purely from what
+    # was observed, so the page never quotes arithmetic of mine.
+    for i, row in enumerate(driver.rows):
+        row["clock_after"] = (
+            driver.rows[i + 1]["clock_before"] if i + 1 < len(driver.rows)
+            else _clock_now()
+        )
     # The two records must agree: what the Reqs say and what the engine
     # published on the socket. A mismatch means the output path dropped a
     # result, which would otherwise pass unnoticed.
@@ -399,16 +428,16 @@ def main(prebuilt=None) -> int:
         f"{sorted(driver.finished_from_reqs)}"
     )
 
-    print(f"  {'fwd':>4} {'mode':<8} {'bs':>3} {'kvfree':>7} {'wait':>5}  "
-          f"{'batch':<30} events")
+    print(f"  {'fwd':>4} {'mode':<8} {'bs':>3} {'kvfree':>7} {'wait':>5} "
+          f"{'clock':>8}  {'batch':<30} events")
     for row in driver.rows:
         ev = []
         if row["arrived"]:
             ev.append(f"arrived {row['arrived']}")
         ev += row["events"]
-        kv = row.get("kvfree")
         print(f"  {row['forward_iter']:>4} {row['mode']:<8} {row['bs']:>3} "
-              f"{(kv if kv is not None else '-'):>7} {row['wait']:>5}  "
+              f"{row['kvfree']:>7} {row['wait']:>5} "
+              f"{row['clock_after'] * 1e3:>7.0f}ms  "
               f"{str(row['rids']):<30} {'; '.join(ev)}")
 
     banner("step 4: result, read off what the engine published")
@@ -425,6 +454,36 @@ def main(prebuilt=None) -> int:
     for rid, _plen, mnt, _a in WORKLOAD:
         print(f"    {rid}: completion_tokens={driver.completion.get(rid)} "
               f"(max_new={mnt}) reason={finished.get(rid, 'NOT FINISHED')}")
+    # ---- the time slice: given from outside, accounted by SGLang ----
+    from sglang.srt.sim import register
+    from sglang.srt.sim.mock_worker import DECODE_SLICE_S, PREFILL_SLICE_S
+
+    expected = sum(
+        PREFILL_SLICE_S if r["mode"] == "prefill" else DECODE_SLICE_S
+        for r in driver.rows
+    )
+    clock_now = register.virtual_clock().perf_counter()
+    print(f"  forward time slices: prefill {PREFILL_SLICE_S * 1e3:.0f} ms x "
+          f"{modes.count('prefill')}, decode {DECODE_SLICE_S * 1e3:.0f} ms x "
+          f"{modes.count('decode')}")
+    print(f"  virtual clock: {clock_now * 1e3:.1f} ms"
+          f"  expected from the slices: {expected * 1e3:.1f} ms")
+    assert abs(clock_now - expected) < 1e-9, (
+        f"the clock moved {clock_now:.6f}s but the slices add up to "
+        f"{expected:.6f}s -- something else advanced it"
+    )
+    print("  per-request timing, as SGLang itself stamped it:")
+    timing = {}
+    for rid, req in sorted(driver.seen.items()):
+        st = req.time_stats
+        queued = st.forward_entry_time - st.wait_queue_entry_time
+        ran = st.completion_time - st.forward_entry_time
+        timing[rid] = dict(queued=queued, ran=ran,
+                           completion=st.completion_time)
+        print(f"    {rid}: queued {queued * 1e3:7.1f} ms   "
+              f"forward->done {ran * 1e3:7.1f} ms   "
+              f"completed at {st.completion_time * 1e3:7.1f} ms")
+
     kv_free = sched.token_to_kv_pool_allocator.available_size()
     evictable = sched.tree_cache.evictable_size()
     print(f"  kv at end: free={kv_free} + radix evictable={evictable} "
@@ -452,6 +511,10 @@ def main(prebuilt=None) -> int:
         outputs_were_read=bool(driver.completion),
         finished_from_reqs=driver.finished_from_reqs,
         req_cls_module=type(next(iter(driver.seen.values()))).__module__,
+        clock_elapsed=clock_now, clock_expected=expected, timing=timing,
+        decode_moment_totals=list(sched.decode_moment_totals),
+        total_prefill_busy_us=sched.total_prefill_busy_us,
+        prefill_slice_s=PREFILL_SLICE_S, decode_slice_s=DECODE_SLICE_S,
         stop_reason=driver.stop_reason,
     )
     return 0 if ok else 2

@@ -174,6 +174,43 @@ class MockWorker:
         return {}
 
 
+# How long a forward takes, in seconds, given the batch. The real design fills
+# this from the offline cost library; the default below is a plain per-mode
+# number, supplied rather than computed -- a stand-in with the same interface.
+# Installed via register.forward_cost_hook().
+FORWARD_COST = None
+
+PREFILL_SLICE_S = 0.040
+DECODE_SLICE_S = 0.008
+
+
+def default_forward_cost(batch) -> float:
+    """A given time slice per forward: 40 ms for a prefill, 8 ms for a decode.
+
+    Deliberately not derived from the model, the operator layer or the batch
+    shape. The point of the seam is that a number from elsewhere is accepted
+    as the forward's duration.
+    """
+    return PREFILL_SLICE_S if batch.forward_mode.is_extend() else DECODE_SLICE_S
+
+
+def _charge_forward_time(batch) -> float:
+    """Advance the virtual clock by this forward's cost, and return it.
+
+    Every timestamp SGLang takes afterwards -- the time_stats it stamps per
+    request, the timeout deadlines -- reads that same clock, so the engine
+    accounts for the forward at the duration it was given.
+    """
+    from sglang.srt.sim import register
+
+    cost_fn = FORWARD_COST or default_forward_cost
+    cost = float(cost_fn(batch))
+    if cost < 0:
+        raise ValueError(f"forward cost must not be negative: {cost}")
+    register.virtual_clock().advance(cost)
+    return cost
+
+
 def _sim_forward_batch_generation(self, batch, **kwargs):
     """What the real TpModelWorker returns, with mocked numbers.
 
@@ -181,6 +218,9 @@ def _sim_forward_batch_generation(self, batch, **kwargs):
     shapes follow the real ScheduleBatch; only the values are mock. Returning a
     genuine GenerationBatchResult is what lets Scheduler.run_batch and
     process_batch_result run as SGLang's own code.
+
+    The one thing that is not mocked away is time: the forward is charged the
+    duration the cost seam supplies, on the clock SGLang itself reads.
     """
     import torch
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -188,6 +228,7 @@ def _sim_forward_batch_generation(self, batch, **kwargs):
 
     bs = batch.batch_size()
     vocab = self.model_runner.vocab_size
+    _charge_forward_time(batch)
     logits = torch.zeros((bs, vocab), dtype=torch.float32, device="cpu")
     next_token_ids = self.model_runner.sample_for_batch(logits, batch)
     return GenerationBatchResult(

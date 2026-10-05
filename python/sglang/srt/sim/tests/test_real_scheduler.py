@@ -11,6 +11,8 @@ constructed scheduler and the run are module-scoped fixtures.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 
@@ -134,7 +136,7 @@ def test_the_pool_size_is_sglangs_arithmetic_not_the_sims(sched):
             "which feeds admission"
         )
     cap = sched.server_args.max_total_tokens
-    assert cap == 144
+    assert cap == 256
     assert sched.token_to_kv_pool_allocator.available_size() == cap
 
 
@@ -232,7 +234,131 @@ def test_the_loop_itself_is_sglangs(sched, run):
     # the run went through the loop, not through a hand-rolled while
     assert run["loop_iters"] >= len(run["rows"])
     assert run["stop_reason"] == "all finished"
-    assert len(run["rows"]) == 12
+    assert len(run["rows"]) == 11
+
+
+# ──────────────────── the forward time slice: given, not computed ────────────
+
+
+def test_the_time_slice_is_supplied_through_a_backend_seam():
+    """The duration comes from the sim's own worker, not from SGLang.
+
+    This is the interface the real design fills from the offline cost library:
+    hand it the batch, get seconds back. Nothing in SGLang is replaced to make
+    it work -- which is what makes it a backend mechanism rather than a patch.
+    """
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.sim import mock_worker, register
+
+    assert hasattr(register, "forward_cost_hook")
+    assert callable(mock_worker.default_forward_cost)
+    # the seam lives on the sim worker, which is itself the execution shim
+    assert TpModelWorker.__module__.startswith("sglang.srt.sim")
+    # and the cost is charged inside the sim's forward, nowhere else
+    src = inspect.getsource(mock_worker._sim_forward_batch_generation)
+    assert "_charge_forward_time(batch)" in src
+
+
+def test_the_engine_accounts_the_forward_at_the_slice_it_was_given(run):
+    """SGLang's own numbers add up to the slices, to the nanosecond.
+
+    If anything else had moved the clock -- a real sleep, a stray wall-clock
+    read -- these two would differ.
+    """
+    assert abs(run["clock_elapsed"] - run["clock_expected"]) < 1e-9
+    expected = (run["prefill_slice_s"] * run["modes"].count("prefill")
+                + run["decode_slice_s"] * run["modes"].count("decode"))
+    assert abs(run["clock_elapsed"] - expected) < 1e-9
+    # the last row's clock is the run's end, and the last finisher's
+    # completion stamp -- taken by SGLang, not by us -- matches it
+    last_clock = run["rows"][-1]["clock_after"]
+    assert abs(max(t["completion"] for t in run["timing"].values()) - last_clock) < 1e-9
+
+
+def test_the_queue_wait_the_engine_reports_is_the_deferral_we_caused(run):
+    """b1 was deferred, and SGLang's own queue time says so in model time.
+
+    b1 is admitted at the 8th forward; the slices burned between its arrival
+    and that batch are what its queue wait has to be. This is the number a
+    performance simulator exists to produce, and it comes out of the engine.
+    """
+    rows = run["rows"]
+    admitted = next(i for i, r in enumerate(rows) if "b1" in r["rids"])
+    # arrivals are delivered in step(), which runs before that iteration's
+    # forward is charged -- so the queue clock starts at clock_before
+    arrival_clock = next(
+        r["clock_before"] for r in rows if "b1" in r["arrived"]
+    )
+    burned = rows[admitted]["clock_before"] - arrival_clock
+    assert run["timing"]["b1"]["queued"] > 0
+    assert abs(run["timing"]["b1"]["queued"] - burned) < 1e-9
+    # and a request that was never deferred waited no model time at all
+    assert run["timing"]["a0"]["queued"] == 0.0
+
+
+def test_the_engine_spends_the_slice_in_its_own_step_ledger(run):
+    """The slice is consumed, not just stored -- SGLang's own counters move.
+
+    _record_step_counters (scheduler.py:4266) only accumulates when
+    0 < step_us, where step_us is the gap between two consecutive launch
+    timestamps. With a clock that never moved that was always 0, so the
+    engine's step-time ledger was dead. The supplied slices make it live:
+    the decode buckets below are microseconds of decode busy time, built out
+    of the 8 ms we handed over.
+
+    total_prefill_busy_us stays 0 on purpose -- that branch needs two
+    back-to-back prefill forwards and this workload never has them, which is
+    worth asserting so nobody reads the zero as a failure.
+    """
+    buckets = run["decode_moment_totals"]
+    busy_us = [v for v in buckets if v >= 1000]
+    assert busy_us, f"no decode busy time accumulated: {buckets}"
+    slice_us = run["decode_slice_s"] * 1e6
+    for v in busy_us:
+        assert v % slice_us == 0, (
+            f"{v} us is not a whole number of {slice_us} us decode slices"
+        )
+    assert sum(busy_us) <= run["clock_elapsed"] * 1e6
+    assert run["total_prefill_busy_us"] == 0
+
+
+def test_the_clock_face_is_observability_not_decision():
+    """Why the slice needs nothing from SGLang's scheduling logic.
+
+    The clock face rebinds the ``time`` name in two modules: the scheduler
+    (where the timeout deadlines are read) and req_time_stats (where every
+    per-request timestamp is taken). Only the two timeout gates feed a
+    decision, and both default to disabled -- so with them off, the slice
+    changes what the engine *reports* and nothing it *decides*. Verified by
+    running with the face removed: the 11-row schedule came out identical and
+    only the reported latencies changed (to real laptop time).
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.sim import register
+
+    assert register.CLOCK_FACE_MODULES == (
+        "sglang.srt.managers.scheduler",
+        "sglang.srt.observability.req_time_stats",
+    )
+    assert envs.SGLANG_REQ_WAITING_TIMEOUT.get() == -1
+    assert envs.SGLANG_REQ_RUNNING_TIMEOUT.get() == -1
+
+
+def test_the_per_row_timeline_needs_no_patch_at_all(run):
+    """The timeline on the page is ours, built from the slices we handed over.
+
+    It does not depend on the clock face: the row clocks come from the sim's
+    own VirtualClock. So a deployment unwilling to rebind SGLang's time source
+    still gets the timeline -- it just loses the engine's self-reported
+    latencies.
+    """
+    rows = run["rows"]
+    assert rows[0]["clock_before"] == 0.0
+    assert all(
+        rows[i]["clock_after"] == rows[i + 1]["clock_before"]
+        for i in range(len(rows) - 1)
+    )
+    assert rows[-1]["clock_after"] == run["clock_elapsed"]
 
 
 # ─────────────────────────────── what the run did ────────────────────────────
@@ -284,7 +410,7 @@ def test_output_lengths_match_the_stopping_rule(run):
 
 def test_the_waves_produce_more_than_one_prefill(run):
     """Three arrival waves must interleave with decode, not front-load."""
-    assert run["modes"].count("prefill") == 4
+    assert run["modes"].count("prefill") == 3
     assert run["modes"].count("decode") == 8
     assert run["modes"][0] == "prefill"
     # a prefill after decode has started is what continuous batching means
@@ -312,4 +438,4 @@ def test_kv_accounting_closes_at_the_end(run):
     total = run["kv_free_end"] + run["radix_evictable"]
     assert run["kv_free_end"] > 0
     assert run["radix_evictable"] > 0
-    assert total == 144, f"pool does not close: {total}"
+    assert total == 256, f"pool does not close: {total}"

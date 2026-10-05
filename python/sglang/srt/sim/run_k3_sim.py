@@ -117,6 +117,15 @@ STUB_BOOKKEEPING = {
     "lora_drainer": None,            # only built when LoRA is on
     "prefill_delayer": None,         # only built when the delayer is on
     "min_free_slots_delayer": None,  # ditto
+    # Step-time accounting, same initial values as Scheduler.__init__
+    # (:2208-2210). These only became reachable once the forward started
+    # charging a time slice: _record_step_counters gates on 0 < step_us, and
+    # before that step_us was always 0, so the engine's own step-time ledger
+    # never ran. With a slice it does, which is the point.
+    "_prev_step": None,
+    "total_prefill_uncached_tokens": 0,
+    "total_prefill_busy_us": 0,
+    "decode_moment_totals": None,  # replaced below; a fresh list per stub
 }
 
 
@@ -158,7 +167,8 @@ def extend_stub_for_full_loop(sched) -> list[str]:
     added = []
     for k, v in {**STUB_BOOKKEEPING, **resolved_feature_flags()}.items():
         if not hasattr(sched, k):
-            setattr(sched, k, v)
+            # one list per stub, never a shared default
+            setattr(sched, k, [0.0] * 6 if k == "decode_moment_totals" else v)
             added.append(k)
     tracker = getattr(sched, "new_token_ratio_tracker", None)
     if tracker is not None and not hasattr(tracker, "decay_step"):

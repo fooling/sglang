@@ -526,11 +526,18 @@ def test_k3_logits_carry_the_real_vocab(k3_run):
 
 
 def test_k3_full_loop_stub_surface_stays_bounded(k3_run):
-    """The stub may grow, but not without someone noticing."""
+    """The stub may grow, but not without someone noticing.
+
+    It grew by four when the forward started charging a time slice:
+    _record_step_counters gates on ``0 < step_us``, so with a clock that never
+    moved the engine's own step-time ledger was dead code. Once a slice is
+    supplied the branch is live and wants _prev_step plus the three counters.
+    That is the branch becoming reachable, not the stub papering over a gap.
+    """
     extras = k3_run["stub_extras"]
-    assert len(extras) <= 32, f"full loop now needs {len(extras)} stub fields: {extras}"
+    assert len(extras) <= 36, f"full loop now needs {len(extras)} stub fields: {extras}"
     for required in ("dp_attn_adapter", "ngram_embedding_manager",
-                     "prefill_decode_interval"):
+                     "prefill_decode_interval", "decode_moment_totals"):
         assert required in extras
 
 
