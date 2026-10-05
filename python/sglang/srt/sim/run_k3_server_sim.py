@@ -16,6 +16,7 @@ kernels. Everything about the control plane is.
 
 from __future__ import annotations
 
+import time
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -38,14 +39,89 @@ import torch
 from sglang.srt.sim import register
 from sglang.srt.sim.run_k3_sim import (
     EOS_SCRIPT,
+    FILLER_TOKEN,
     WORKLOAD,
     banner,
     build_k3_model_config,
-    make_k3_req,
     scripted_token,
 )
 
 LAST_RUN: dict = {}
+
+
+def open_input_socket(scheduler):
+    """Stand where the tokenizer manager stands: bind the scheduler's input.
+
+    Not a shim. The scheduler already connected a real zmq.PULL to this
+    endpoint in __init__; this binds the PUSH side, so recv_requests ->
+    process_input_requests -> handle_generate_request all run as SGLang wrote
+    them, and the Req objects are built by the scheduler, not by us.
+    """
+    import zmq
+
+    ctx = zmq.Context()
+    push = ctx.socket(zmq.PUSH)
+    push.bind(scheduler.sim_input_ipc_name)
+    return ctx, push
+
+
+def tokenized_request(rid: str, prompt_len: int, max_new: int):
+    """What the tokenizer manager would hand the scheduler.
+
+    normalize() is the tokenizer manager's job (it is what fills stop_strs,
+    which update_finish_state then reads); the sim does it here because that
+    process is out of scope, not because anything is being faked.
+    """
+    from array import array
+
+    from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    sp = SamplingParams(max_new_tokens=max_new)
+    sp.normalize(None)
+    return TokenizedGenerateReqInput(
+        rid=rid,
+        input_text=None,
+        # typecode "q", same as the tokenizer manager (:1346). Req.output_ids
+        # is array("q") and _refresh_fill_ids concatenates the two, so a
+        # different typecode raises on the first prefill.
+        input_ids=array("q", [FILLER_TOKEN] * prompt_len),
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=sp,
+        return_logprob=False,
+        logprob_start_len=-1,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=False,
+    )
+
+
+def deliver(scheduler, push, rids):
+    """Send, then let SGLang receive and dispatch. Returns the new Reqs."""
+    from sglang.srt.managers.io_struct import sock_send
+    from sglang.srt.managers.scheduler import Scheduler
+
+    spec = {rid: (plen, mnt) for rid, plen, mnt, _a in WORKLOAD}
+    for rid in rids:
+        plen, mnt = spec[rid]
+        sock_send(push, tokenized_request(rid, plen, mnt))
+
+    before = {id(r) for r in scheduler.waiting_queue}
+    got: list = []
+    for _ in range(80):  # the socket is non-blocking; give delivery a moment
+        recv = scheduler.request_receiver.recv_requests()
+        if recv:
+            Scheduler.process_input_requests(scheduler, recv)
+            got += [r for r in scheduler.waiting_queue if id(r) not in before]
+            if len(got) >= len(rids):
+                break
+        time.sleep(0.02)
+    assert len(got) == len(rids), (
+        f"sent {rids} but the scheduler queued {[r.rid for r in got]}"
+    )
+    return got
 
 
 def build_real_scheduler():
@@ -96,6 +172,10 @@ def build_real_scheduler():
         scheduler.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, *a, **k: batch
         )
+    # The scheduler CONNECTS a zmq.PULL here; the binder is normally the
+    # tokenizer manager process. The driver below binds a PUSH and takes
+    # that position, so arrivals go through the real socket.
+    scheduler.sim_input_ipc_name = str(port_args.scheduler_input_ipc_name)
     return scheduler, cfg_dir
 
 
@@ -118,11 +198,14 @@ def main(prebuilt=None) -> int:
           f" size={sched.token_to_kv_pool_allocator.available_size()}")
     print(f"  torch.cuda.is_available()={torch.cuda.is_available()}")
 
-    banner("step 2: workload (arrives in waves)")
-    reqs = {rid: make_k3_req(rid, plen, mnt) for rid, plen, mnt, _ in WORKLOAD}
+    banner("step 2: workload (arrives in waves, through the real socket)")
+    reqs: dict = {}
     for rid, plen, mnt, arrive in WORKLOAD:
         eos = f", EOS at output #{EOS_SCRIPT[rid]}" if rid in EOS_SCRIPT else ""
         print(f"  {rid}: prompt={plen} max_new={mnt} arrives before step {arrive}{eos}")
+    ctx, push = open_input_socket(sched)
+    print(f"  driver bound {sched.sim_input_ipc_name}"
+          f" (the tokenizer manager's position)")
     sched.waiting_queue = []
 
     banner("step 3: scheduler loop on the real Scheduler")
@@ -141,7 +224,10 @@ def main(prebuilt=None) -> int:
         steps += 1
         newly = [rid for rid, _p, _m, a in WORKLOAD if a == steps]
         if newly:
-            sched.waiting_queue.extend(reqs[r] for r in newly)
+            # real socket -> recv_requests -> process_input_requests ->
+            # handle_generate_request: the Req objects are SGLang's own
+            for req in deliver(sched, push, newly):
+                reqs[req.rid] = req
 
         plan = Scheduler.get_next_batch_to_run(
             sched, running_batch=running_batch, last_batch=last_batch
@@ -152,6 +238,9 @@ def main(prebuilt=None) -> int:
             print(f"  {steps:>4} {'(idle)':<8} {'-':>3} {kvfree:>7} "
                   f"{len(sched.waiting_queue):>5}  {'--':<30} "
                   f"{'arrived ' + str(newly) if newly else ''}")
+            # event_loop_normal calls this on the no-batch branch (:3825);
+            # calling it keeps every step of the loop body covered.
+            Scheduler.on_idle(sched)
             idle += 1
             if not sched.waiting_queue or (
                 idle >= 3 and not [a for _r, _p, _m, a in WORKLOAD if a > steps]
@@ -201,6 +290,9 @@ def main(prebuilt=None) -> int:
           f"= {kv_free + evictable}")
     print(f"  waiting_queue left: {len(sched.waiting_queue)}")
 
+    push.close()
+    ctx.term()
+
     ok = len(finished) == len(WORKLOAD)
     print(f"\n  ALL REQUESTS FINISHED ON A REAL SCHEDULER: {ok}")
     LAST_RUN.clear()
@@ -212,6 +304,9 @@ def main(prebuilt=None) -> int:
         by_reason=by_reason,
         reqs=reqs, workload=WORKLOAD, kv_free_end=kv_free,
         radix_evictable=evictable, waiting_left=len(sched.waiting_queue),
+        max_running_requests=sched.max_running_requests,
+        req_pool_size=sched.req_to_token_pool.size,
+        req_cls_module=type(next(iter(reqs.values()))).__module__,
     )
     return 0 if ok else 2
 

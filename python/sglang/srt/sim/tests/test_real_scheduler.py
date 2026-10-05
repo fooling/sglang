@@ -149,6 +149,71 @@ def test_overlap_is_off_by_config_not_by_patching(sched):
     assert getattr(sched, "enable_overlap", False) is False
 
 
+def test_arrivals_go_through_sglangs_own_receive_path(sched):
+    """Requests arrive on the real socket, not by poking waiting_queue.
+
+    The driver binds the endpoint the tokenizer manager normally binds; the
+    scheduler had already connected its zmq.PULL in __init__. So recv_requests,
+    the dispatcher and handle_generate_request are all SGLang's, and the Req
+    objects are built by the scheduler rather than by the harness.
+    """
+    import zmq
+
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.request_receiver import (
+        SchedulerRequestReceiver,
+    )
+
+    # the socket is real and it is the scheduler that connected it
+    assert isinstance(sched.recv_from_tokenizer, zmq.Socket)
+    assert type(sched.request_receiver) is SchedulerRequestReceiver
+    for cls, name, mod in (
+        (SchedulerRequestReceiver, "recv_requests",
+         "sglang.srt.managers.scheduler_components.request_receiver"),
+        (SchedulerRequestReceiver, "_pull_raw_reqs",
+         "sglang.srt.managers.scheduler_components.request_receiver"),
+        (Scheduler, "process_input_requests", "sglang.srt.managers.scheduler"),
+        (Scheduler, "handle_generate_request", "sglang.srt.managers.scheduler"),
+    ):
+        assert getattr(cls, name).__module__ == mod, (
+            f"{cls.__name__}.{name} is no longer SGLang's -- the request path "
+            "must not be reimplemented by the harness"
+        )
+
+
+def test_the_reqs_were_built_by_sglang(run):
+    assert run["req_cls_module"] == "sglang.srt.managers.schedule_batch"
+
+
+def test_concurrency_is_capped_by_the_state_pool_not_by_us(run, sched):
+    """A hybrid model's concurrency limit comes off the state pool.
+
+    64 state slots at 3 slots per request is 21 running requests -- SGLang's
+    own arithmetic (resolve_max_num_reqs), and it is the request pool's real
+    size, not the KV page count. Anyone sizing K3 concurrency has to use this
+    number, so the deck must not quote the raw slot count.
+    """
+    assert sched.server_args.max_mamba_cache_size == 64
+    assert run["max_running_requests"] == 21
+    assert run["req_pool_size"] == 21
+    assert run["req_pool_size"] != sched.server_args.max_mamba_cache_size
+
+
+def test_the_output_path_is_real_but_has_no_reader(sched):
+    """Outputs leave through SGLang's streamer; nothing reads them, no detok.
+
+    Recorded as a constraint rather than papered over: the page may not claim
+    the output side was verified.
+    """
+    from sglang.srt.managers.scheduler_components.output_streamer import (
+        SchedulerOutputStreamer,
+    )
+
+    assert type(sched.output_streamer) is SchedulerOutputStreamer
+    assert sched.server_args.skip_tokenizer_init is True
+    assert sched.tokenizer is None
+
+
 # ─────────────────────────────── what the run did ────────────────────────────
 
 
