@@ -15,18 +15,32 @@ import pytest
 
 
 @pytest.fixture(scope="module")
-def run():
-    from sglang.srt.sim import run_k3_server_sim
+def built():
+    """One Scheduler for the whole module.
 
-    return run_k3_server_sim.run()
+    It owns a gloo process group and ZMQ sockets, so building a second one in
+    the same process is not just wasteful -- when the first build fails, the
+    second blocks, and the suite hangs instead of reporting the failure. Build
+    once, and turn a build failure into a red test here.
+    """
+    from sglang.srt.sim.run_k3_server_sim import build_real_scheduler
+
+    try:
+        return build_real_scheduler()
+    except Exception as exc:  # noqa: BLE001 -- must not escape as a hang
+        pytest.fail(f"Scheduler.__init__ did not survive the sim backend: {exc!r}")
 
 
 @pytest.fixture(scope="module")
-def sched():
-    from sglang.srt.sim.run_k3_server_sim import build_real_scheduler
+def sched(built):
+    return built[0]
 
-    scheduler, _cfg_dir = build_real_scheduler()
-    return scheduler
+
+@pytest.fixture(scope="module")
+def run(built):
+    from sglang.srt.sim import run_k3_server_sim
+
+    return run_k3_server_sim.run(prebuilt=built)
 
 
 # ───────────────────────── what the constructor produced ─────────────────────

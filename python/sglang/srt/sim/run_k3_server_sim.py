@@ -89,13 +89,15 @@ def build_real_scheduler():
     return scheduler, cfg_dir
 
 
-def main() -> int:
+def main(prebuilt=None) -> int:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     banner("step 1: build a real Scheduler (mock backend, no weights)")
-    sched, cfg_dir = build_real_scheduler()
+    # One Scheduler per process: it holds a gloo group and ZMQ sockets, so a
+    # caller that already built one passes it in rather than building a second.
+    sched, cfg_dir = prebuilt if prebuilt is not None else build_real_scheduler()
     mr = sched.tp_worker.model_runner
     print(f"  Scheduler built: {type(sched).__name__}")
     print(f"  worker={type(sched.tp_worker).__name__} runner={type(mr).__name__}")
@@ -200,8 +202,8 @@ def main() -> int:
     return 0 if ok else 2
 
 
-def run() -> dict:
-    main()
+def run(prebuilt=None) -> dict:
+    main(prebuilt)
     return dict(LAST_RUN)
 
 
