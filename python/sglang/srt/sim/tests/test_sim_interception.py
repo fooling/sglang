@@ -531,3 +531,95 @@ def test_k3_full_loop_needs_only_inert_stub_extras(k3_run):
     for required in ("dp_attn_adapter", "ngram_embedding_manager",
                      "prefill_decode_interval"):
         assert required in extras
+
+
+# ───────────────── architecture: backend only, never the logic ─────────────
+DECISION_FUNCTIONS = [
+    # (module path, dotted attribute) -- every one of these decides something.
+    # Installing the sim shims must leave each object identical.
+    ("sglang.srt.managers.scheduler", "Scheduler.get_next_batch_to_run"),
+    ("sglang.srt.managers.scheduler", "Scheduler.get_new_batch_prefill"),
+    ("sglang.srt.managers.scheduler", "Scheduler.get_num_allocatable_reqs"),
+    ("sglang.srt.managers.scheduler", "Scheduler.update_running_batch"),
+    ("sglang.srt.managers.scheduler", "Scheduler._abort_on_waiting_timeout"),
+    ("sglang.srt.managers.scheduler", "Scheduler._abort_on_running_timeout"),
+    ("sglang.srt.managers.schedule_policy", "PrefillAdder.budget_state"),
+    ("sglang.srt.managers.schedule_policy", "PrefillAdder.rem_total_tokens"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.check_decode_mem"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.retract_decode"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.filter_batch"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.prepare_for_decode"),
+    ("sglang.srt.managers.schedule_batch", "Req.update_finish_state"),
+    # the KV seam: configure() and the size derivation are control plane and
+    # must survive untouched; only the probe and the pool construction move.
+    ("sglang.srt.mem_cache.kv_cache_configurator", "KVCacheConfigurator.configure"),
+    ("sglang.srt.mem_cache.kv_cache_configurator",
+     "KVCacheConfigurator._derive_pool_sizes"),
+    ("sglang.srt.mem_cache.allocator.token", "TokenToKVPoolAllocator.alloc"),
+    ("sglang.srt.mem_cache.allocator.token", "TokenToKVPoolAllocator.free"),
+    ("sglang.srt.mem_cache.allocator.token", "TokenToKVPoolAllocator.available_size"),
+    ("sglang.srt.mem_cache.memory_pool", "ReqToTokenPool.available_size"),
+    ("sglang.srt.mem_cache.common", "release_kv_cache"),
+]
+
+
+def _resolve(modpath: str, dotted: str):
+    obj = importlib.import_module(modpath)
+    for part in dotted.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def test_shims_do_not_touch_any_decision_function():
+    """The architectural claim, as a test.
+
+    The shims are installed for the whole session (see the _shims fixture).
+    If any of these objects differs from what the module defines, the sim is
+    replacing logic, not adapting a backend.
+    """
+    for modpath, dotted in DECISION_FUNCTIONS:
+        obj = _resolve(modpath, dotted)
+        assert obj is not None, f"{modpath}.{dotted} vanished"
+        # a shim would show up as a function defined in the sim package
+        mod = getattr(obj, "__module__", "")
+        assert not mod.startswith("sglang.srt.sim"), (
+            f"{modpath}.{dotted} is now provided by {mod} -- that is logic, "
+            "not a backend seam"
+        )
+
+
+def test_the_seams_the_shims_do_take_are_the_backend_ones():
+    """Positive side: the four faces really did take effect, and only there."""
+    import sglang.srt.disaggregation.ascend.conn as conn_mod
+    import sglang.srt.managers.scheduler as scheduler_mod
+    import sglang.srt.managers.tp_worker as tp_worker_mod
+    import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+
+    assert tp_worker_mod.TpModelWorker.__module__.startswith("sglang.srt.sim")
+    assert conn_mod.AscendTransferEngine.__module__.startswith("sglang.srt.sim")
+    assert kvc_mod.KVCacheConfigurator._init_pools.__module__.startswith(
+        "sglang.srt.sim"
+    )
+    assert kvc_mod.KVCacheConfigurator._resolve_memory_pool_config.__module__.startswith(
+        "sglang.srt.sim"
+    )
+    # the clock seam swaps the module's time source, not any scheduler method
+    assert scheduler_mod.time.__class__.__name__ == "_ClockShim"
+
+
+def test_feature_flags_are_read_from_the_config_not_hardcoded():
+    """A hardcoded flag would mean the harness decides what the scheduler does."""
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.runtime_context import get_disagg, get_lora, get_memory, get_schedule
+    from sglang.srt.sim.run_k3_sim import STUB_BOOKKEEPING, resolved_feature_flags
+
+    flags = resolved_feature_flags()
+    assert flags["enable_hisparse"] == get_memory().enable_hisparse
+    assert flags["enable_hierarchical_cache"] == get_memory().enable_hierarchical_cache
+    assert flags["enable_lora"] == get_lora().enable_lora
+    assert flags["prefill_decode_interval"] == get_schedule().prefill_decode_interval
+    assert flags["disaggregation_mode"] == DisaggregationMode(
+        get_disagg().disaggregation_mode
+    )
+    # the bookkeeping half must hold no feature switch
+    assert not any(k.startswith("enable_") for k in STUB_BOOKKEEPING), STUB_BOOKKEEPING

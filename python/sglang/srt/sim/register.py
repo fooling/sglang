@@ -103,45 +103,80 @@ def selftest_execution_shim() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 2. KV interception: KVCacheConfigurator.configure (model_runner.py:878)
+# 2. KV interception: the two device-bound steps inside
+#    KVCacheConfigurator.configure (its only caller is model_runner.py:878).
+#
+#    Cut deliberately *inside* configure, not around it:
+#      _resolve_memory_pool_config  -- profiles GPU memory; pure backend, must go
+#      _derive_pool_sizes           -- arithmetic on the config; CONTROL PLANE,
+#                                      left to SGLang, it feeds admission
+#      _init_pools                  -- constructs the pool classes; pure backend
+#    Replacing configure wholesale would have taken the size derivation with it,
+#    i.e. we would be changing scheduling inputs, not adapting a backend.
 # ---------------------------------------------------------------------------
-def _sim_configure(self, *, pre_model_load_memory: int):
-    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigResult
+def _sim_resolve_memory_pool_config(self, pre_model_load_memory: int):
+    """No device to profile: hand back the sim's pool size as a real config."""
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+
+    size = getattr(self.model_config, "_sim_max_total_num_tokens", 256)
+    return MemoryPoolConfig(max_total_num_tokens=size, max_running_requests=size)
+
+
+def _sim_init_pools(self, *, sizes, req_to_token_pool, token_to_kv_pool_allocator):
+    """Build CPU pools instead of device pools; sizes come from SGLang's own
+    _derive_pool_sizes, so admission sees numbers SGLang derived."""
+    from sglang.srt.mem_cache.kv_cache_configurator import _InitializedPools
     from sglang.srt.sim.cpu_kv import (
         build_cpu_req_to_token_pool,
         build_cpu_token_to_kv_pool_allocator,
     )
 
-    # KVCacheConfigurator is @dataclass(slots=True) -- no room for extra
-    # attributes on `self`, so the sim size knobs ride on model_config
-    # instead (a plain object, not slotted).
-    size = getattr(self.model_config, "_sim_max_total_num_tokens", 256)
     max_context_len = getattr(self.model_config, "_sim_max_context_len", 128)
-    req_pool = build_cpu_req_to_token_pool(size=size, max_context_len=max_context_len)
-    allocator = build_cpu_token_to_kv_pool_allocator(size=size)
-    return KVCacheConfigResult(
-        max_total_num_tokens=size,
-        max_running_requests=size,
-        full_max_total_num_tokens=None,
-        swa_max_total_num_tokens=None,
-        req_to_token_pool=req_pool,
+    allocator = build_cpu_token_to_kv_pool_allocator(size=sizes.max_total_num_tokens)
+    return _InitializedPools(
+        req_to_token_pool=req_to_token_pool
+        or build_cpu_req_to_token_pool(
+            size=sizes.max_total_num_tokens, max_context_len=max_context_len
+        ),
         token_to_kv_pool=allocator.get_kvcache(),  # None -- no device KVCache in sim
-        token_to_kv_pool_allocator=allocator,
-        memory_pool_config=MemoryPoolConfig(max_total_num_tokens=size),
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator or allocator,
     )
 
 
 def install_kv_shim() -> Callable[[], None]:
+    """Swap only the two device-bound steps; configure() and the size
+    derivation stay SGLang's own code."""
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-    original = KVCacheConfigurator.configure
-    KVCacheConfigurator.configure = _sim_configure
+    import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
 
-    def unpatch():
-        KVCacheConfigurator.configure = original
+    originals = {
+        "_resolve_memory_pool_config": KVCacheConfigurator._resolve_memory_pool_config,
+        "_init_pools": KVCacheConfigurator._init_pools,
+    }
+    KVCacheConfigurator._resolve_memory_pool_config = _sim_resolve_memory_pool_config
+    KVCacheConfigurator._init_pools = _sim_init_pools
+    # configure() logs free device memory on the way out. That probe is a
+    # device query like any other -- on a box with no accelerator it shells
+    # out to lscpu and dies. Same treatment as the pools: swap the probe,
+    # leave configure()'s own flow alone.
+    original_probe = kvc_mod.get_available_gpu_memory
+    kvc_mod.get_available_gpu_memory = lambda *a, **k: 0.0
 
-    return unpatch
+    def uninstall() -> None:
+        for name, fn in originals.items():
+            setattr(KVCacheConfigurator, name, fn)
+        kvc_mod.get_available_gpu_memory = original_probe
+
+    return uninstall
+
+
+class SpecStub:
+    """configure() asks the spec algorithm whether it is none; sim has none."""
+
+    @staticmethod
+    def is_none() -> bool:
+        return True
 
 
 def selftest_kv_shim() -> bool:
@@ -150,9 +185,21 @@ def selftest_kv_shim() -> bool:
 
     cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
     cfg.model_config = SimpleNamespace(
-        _sim_max_total_num_tokens=100, _sim_max_context_len=64
+        _sim_max_total_num_tokens=100,
+        _sim_max_context_len=64,
+        # _derive_pool_sizes asks the model config what family this is
+        hf_config=SimpleNamespace(
+            architectures=["KimiK3LinearForCausalLM"], model_type="kimi_k3"
+        ),
     )
 
+    cfg.spec_algorithm = SpecStub()
+    cfg.is_hybrid_swa = False
+    cfg.is_draft_worker = False
+    cfg.req_to_token_pool = None
+    cfg.token_to_kv_pool_allocator = None
+    cfg.device = "cpu"
+    cfg.gpu_id = 0
     result = KVCacheConfigurator.configure(cfg, pre_model_load_memory=0)
 
     ok = (

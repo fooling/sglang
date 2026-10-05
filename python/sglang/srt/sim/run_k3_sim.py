@@ -93,36 +93,60 @@ LAST_RUN: dict = {}
 # Extra stub surface only the full loop touches. Every field is inert: it
 # switches the matching feature off so the plain single-instance path runs.
 # Nothing in SGLang is modified.
-STUB_EXTRAS = {
+# Per-iteration bookkeeping a real Scheduler.__init__ would zero out. These
+# are not decisions -- they are counters and last-seen handles.
+STUB_BOOKKEEPING = {
     "_pending_chunked_abort_req": None,
     "chunked_req": None,
-    "enable_fpm": False,
-    "dllm_config": None,
-    "enable_hisparse": False,
-    "enable_hierarchical_cache": False,
-    "enable_hicache_storage": False,
-    "enable_priority_preemption": False,
-    "is_hybrid_swa": False,
-    "enable_lora": False,
-    "lora_drainer": None,
-    "require_mlp_sync": False,
-    "disaggregation_mode": None,
     "last_batch": None,
     "forward_ct": 0,
-    "_sched_idled": False,
+    "_sched_idled": True,            # scheduler.py starts idle
     "cur_batch_for_debug": None,
-    "prefill_delayer": None,
-    "min_free_slots_delayer": None,
-    "enable_dynamic_chunking": False,
-    "is_mixed_chunk": False,
     "_prefill_decode_interval_remaining": 0,
-    "prefill_decode_interval": 0,  # 0 = feature off (scheduler.py:1251)
+    "dllm_config": None,             # no diffusion-LLM config published
+    "lora_drainer": None,            # only built when LoRA is on
+    "prefill_delayer": None,         # only built when the delayer is on
+    "min_free_slots_delayer": None,  # ditto
 }
+
+
+def resolved_feature_flags() -> dict:
+    """Read every feature flag from the SAME source Scheduler.__init__ reads.
+
+    Hardcoding these would mean the harness, not the config, decides what the
+    scheduler does -- which is exactly the thing this prototype must not do.
+    """
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.managers.scheduler import require_mlp_sync
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_lora,
+        get_memory,
+        get_schedule,
+    )
+
+    schedule = get_schedule()
+    return {
+        "enable_hisparse": get_memory().enable_hisparse,
+        "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
+        "enable_hicache_storage": get_memory().hicache_storage_backend is not None,
+        "enable_lora": get_lora().enable_lora,
+        "require_mlp_sync": require_mlp_sync(),
+        "disaggregation_mode": DisaggregationMode(get_disagg().disaggregation_mode),
+        "prefill_decode_interval": schedule.prefill_decode_interval,
+        "enable_priority_preemption": getattr(
+            schedule, "enable_priority_scheduling", False
+        ),
+        "enable_dynamic_chunking": getattr(schedule, "enable_dynamic_chunking", False),
+        "is_mixed_chunk": getattr(schedule, "enable_mixed_chunk", False),
+        "enable_fpm": getattr(schedule, "enable_fpm", False),
+        "is_hybrid_swa": False,  # K3 is MLA, not hybrid SWA
+    }
 
 
 def extend_stub_for_full_loop(sched) -> list[str]:
     added = []
-    for k, v in STUB_EXTRAS.items():
+    for k, v in {**STUB_BOOKKEEPING, **resolved_feature_flags()}.items():
         if not hasattr(sched, k):
             setattr(sched, k, v)
             added.append(k)
