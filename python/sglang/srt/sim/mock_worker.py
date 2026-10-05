@@ -112,3 +112,29 @@ class MockWorker:
     @property
     def graph_time_usage(self):
         return 0.0
+
+
+def _sim_forward_batch_generation(self, batch, **kwargs):
+    """What the real TpModelWorker returns, with mocked numbers.
+
+    The real worker builds a ForwardBatch, runs the model and samples. Here the
+    shapes follow the real ScheduleBatch; only the values are mock. Returning a
+    genuine GenerationBatchResult is what lets Scheduler.run_batch and
+    process_batch_result run as SGLang's own code.
+    """
+    import torch
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.utils import GenerationBatchResult
+
+    bs = batch.batch_size()
+    vocab = self.model_runner.vocab_size
+    logits = torch.zeros((bs, vocab), dtype=torch.float32, device="cpu")
+    next_token_ids = self.model_runner.sample_for_batch(logits, batch)
+    return GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(next_token_logits=logits),
+        next_token_ids=next_token_ids,
+        can_run_cuda_graph=False,
+    )
+
+
+MockWorker.forward_batch_generation = _sim_forward_batch_generation

@@ -165,6 +165,119 @@ def extend_stub_for_full_loop(sched) -> list[str]:
             maybe_convert_decode_to_extend=lambda batch: batch,
         )
         added.append("dp_attn_adapter")
+    added += _extend_for_real_forward_path(sched)
+    return added
+
+
+class _ZeroCall(int):
+    """Reads as 0, calls as a no-op -- so one sink covers counters and hooks."""
+
+    def __call__(self, *a, **k):
+        return None
+
+
+class _MetricsSink:
+    """Metrics are a side channel, never a decision: everything is 0 / no-op.
+
+    Nothing here feeds a scheduling decision -- if it ever did, this sink would
+    be hiding it, so the architecture test pins the decision functions instead.
+    """
+
+    def __getattr__(self, _name):
+        return _ZeroCall(0)
+
+
+def _extend_for_real_forward_path(sched) -> list[str]:
+    """What Scheduler.run_batch / process_batch_result need beyond the above.
+
+    Two rules here:
+      * anything that *decides* gets the real object (FutureMap, the real
+        SchedulerBatchResultProcessor -- it is the code that writes tokens,
+        judges finish and releases KV);
+      * anything that only *reports* (metrics, load publishing) gets a sink.
+    """
+    import torch
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+        SchedulerBatchResultProcessor,
+    )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    added = []
+    flat = {
+        "scripted_scheduler_hook": None,
+        "forward_sleep_time": None,
+        "is_generation": True,
+        "enable_pdmux": False,
+        "enable_dp_attention": False,
+        "enable_unified_memory": False,
+        "return_health_check_ipcs": False,
+        "_prev_step": None,
+        "load_snapshot_writer": None,
+        "profiler_manager": SimpleNamespace(_profile_batch_predicate=lambda b: None),
+    }
+    for k, v in flat.items():
+        if not hasattr(sched, k):
+            setattr(sched, k, v)
+            added.append(k)
+    # these two already exist on the stub; make sure the methods process_batch_result
+    # calls are on them (load reporting is a side channel, not a decision)
+    for obj_name, meth in (("load_inquirer", "get_loads"),
+                           ("load_publisher", "publish_load_stat")):
+        obj = getattr(sched, obj_name, None)
+        if obj is None:
+            obj = SimpleNamespace()
+            setattr(sched, obj_name, obj)
+            added.append(obj_name)
+        if not hasattr(obj, meth):
+            setattr(obj, meth, lambda *a, **k: None)
+            added.append(f"{obj_name}.{meth}")
+    if not hasattr(sched, "model_worker"):
+        sched.model_worker = sched.tp_worker
+        added.append("model_worker")
+    if not isinstance(getattr(sched, "metrics_reporter", None), _MetricsSink):
+        sched.metrics_reporter = _MetricsSink()
+        added.append("metrics_reporter")
+    # beam search is off: every hook is a no-op, commit_decode yields no groups
+    for name, ret in (("maybe_select_and_relay", None), ("pending_member_rows", 0),
+                      ("retire_group", None), ("commit_decode", ()),
+                      ("commit_prefill", ()), ("finalize_groups", ())):
+        if not hasattr(sched.beam_coordinator, name):
+            setattr(sched.beam_coordinator, name, lambda *a, _r=ret, **k: _r)
+            added.append(f"beam_coordinator.{name}")
+
+    # the real relay buffer, not a fake: it is control-plane plumbing
+    if getattr(sched, "future_map", None) is None:
+        sched.future_map = FutureMap(
+            device=torch.device("cpu"),
+            spec_algo=SpeculativeAlgorithm.NONE,
+            req_to_token_pool=sched.req_to_token_pool,
+        )
+        added.append("future_map(real)")
+
+    # the real result processor: this is the code under test, not a stub
+    if getattr(sched, "batch_result_processor", None) is None:
+        sched.batch_result_processor = SchedulerBatchResultProcessor(
+            is_generation=True,
+            disaggregation_mode=sched.disaggregation_mode,
+            enable_overlap=False,
+            enable_overlap_mlx=False,
+            model_config=sched.model_config,
+            token_to_kv_pool_allocator=sched.token_to_kv_pool_allocator,
+            tree_cache=sched.tree_cache,
+            hisparse_coordinator=None,
+            req_to_token_pool=sched.req_to_token_pool,
+            decode_offload_manager=None,
+            metrics_collector=_MetricsSink(),
+            metrics_reporter=_MetricsSink(),
+            draft_worker=None,
+            model_worker=sched.tp_worker,
+            logprob_result_processor=_MetricsSink(),
+            output_streamer=_MetricsSink(),
+            beam_coordinator=sched.beam_coordinator,
+            abort_request=lambda *a, **k: None,
+        )
+        added.append("batch_result_processor(real)")
     return added
 
 
@@ -244,6 +357,7 @@ def main() -> int:
 
     clock = register.get_shared_clock()
     runner = MockModelRunner(model_config=model_config, device="cpu")
+    runner.token_script = scripted_token  # mock sampler reads this
     sched = build_scheduler_stub(
         kv_pool_size=KV_POOL_SIZE,
         req_pool_size=REQ_POOL_SIZE,
@@ -254,7 +368,6 @@ def main() -> int:
 
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.mem_cache.common import release_kv_cache
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     stub_extras = extend_stub_for_full_loop(sched)
@@ -278,6 +391,7 @@ def main() -> int:
     last_batch = None
     finished: dict[str, str] = {}
     modes: list[str] = []
+    logits_shape = ()
     retractions: list = []
     arrivals: list = []
     steps = 0
@@ -316,27 +430,24 @@ def main() -> int:
         idle_streak = 0
         mode = "prefill" if batch.forward_mode.is_extend() else "decode"
         modes.append(mode)
-        logits = runner.forward(
-            SimpleNamespace(batch_size=batch.batch_size(), seq_lens=batch.seq_lens)
-        )
-        runner.sample(logits)
+
+        in_batch = list(batch.reqs)
+        # SGLang's own forward entry and output handling. The harness no longer
+        # sequences "append token -> judge finish -> release KV" itself; that
+        # whole sequence is process_batch_result's job and it runs here.
+        result = Scheduler.run_batch(sched, batch)
+        Scheduler.process_batch_result(sched, batch, result)
+        logits_shape = tuple(result.logits_output.next_token_logits.shape)
 
         events = []
         if newly:
             events.append(f"arrived {newly}")
         if back_in_queue:
             events.append(f"RETRACTED {back_in_queue}")
-        for req in batch.reqs:
-            req.output_ids.append(scripted_token(req))
-            req.update_finish_state()  # the REAL finish-condition code
+        for req in in_batch:
             if req.finished() and req.rid not in finished:
                 finished[req.rid] = type(req.finished_reason).__name__
                 events.append(f"{req.rid} {finished[req.rid].replace('FINISH_', '')}")
-                # SGLang's own release entry (mem_cache/common.py:201) -- in the
-                # real engine process_batch_result calls it. Without it the
-                # finished request's pages never come back and later arrivals
-                # can never be admitted.
-                release_kv_cache(req, sched.tree_cache)
 
         print(f"  {steps:>4} {mode:<8} {batch.batch_size():>3} "
               f"{sched.token_to_kv_pool_allocator.available_size():>7} "
@@ -380,8 +491,11 @@ def main() -> int:
         retractions=retractions,
         kv_free_end=kv_free, radix_evictable=evictable,
         req_slots_free=sched.req_to_token_pool.available_size(),
-        kv_pool_size=KV_POOL_SIZE, logits_shape=tuple(logits.shape),
+        kv_pool_size=KV_POOL_SIZE, logits_shape=logits_shape,
         waiting_left=len(sched.waiting_queue), stub_extras=stub_extras,
+        result_processor_cls=type(sched.batch_result_processor).__name__,
+        future_map_cls=type(sched.future_map).__name__,
+        ran_real_forward_path=True,
     )
     return 0 if all_done else 2
 

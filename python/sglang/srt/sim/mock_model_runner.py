@@ -88,3 +88,22 @@ class MockModelRunner:
     # -- stubs for completeness / future growth -------------------------
     def account_preloaded_weights(self, *_args, **_kwargs) -> None:
         return None
+
+
+def _sample_for_batch(self, logits, batch):
+    """Sampling hook the sim can script per request.
+
+    ``self.token_script`` (if set) maps rid -> the token to emit next; anything
+    unscripted falls back to greedy argmax over the mock logits.
+    """
+    import torch
+
+    script = getattr(self, "token_script", None)
+    if script is None:
+        return torch.argmax(logits, dim=-1)
+    return torch.tensor(
+        [script(req) for req in batch.reqs], dtype=torch.long, device="cpu"
+    )
+
+
+MockModelRunner.sample_for_batch = _sample_for_batch
