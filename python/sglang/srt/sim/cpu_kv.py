@@ -28,6 +28,8 @@ and documents the finding the task asked for explicitly.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -134,21 +136,152 @@ def build_req_to_token_pool(model_config, size: int, max_context_len: int):
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
     cache_params = spec.mamba2_cache_params
-    return HybridReqToTokenPool(
-        size=size,
-        mamba_size=size,
-        mamba_spec_state_size=size,
-        max_context_len=max_context_len,
-        device="cpu",
-        enable_memory_saver=False,
-        cache_params=cache_params,
-        mamba_layer_ids=list(cache_params.layers),
-        enable_mamba_extra_buffer=False,
-        enable_mamba_extra_buffer_lazy=False,
-        speculative_num_draft_tokens=None,
-        speculative_eagle_topk=None,
-        enable_overlap_schedule=False,
-    )
+    real_slot_bytes = _real_state_bytes_per_slot(cache_params, size)
+    ctx = _flat_state_alloc() if shape_only_enabled() else contextlib.nullcontext()
+    with ctx:
+        pool = HybridReqToTokenPool(
+            size=size,
+            mamba_size=size,
+            mamba_spec_state_size=size,
+            max_context_len=max_context_len,
+            device="cpu",
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=list(cache_params.layers),
+            enable_mamba_extra_buffer=False,
+            enable_mamba_extra_buffer_lazy=False,
+            speculative_num_draft_tokens=None,
+            speculative_eagle_topk=None,
+            enable_overlap_schedule=False,
+        )
+
+    if shape_only_enabled():
+        _shrink_mamba_state(pool, real_slot_bytes)
+    return pool
+
+
+import contextlib
+
+
+def _real_state_bytes_per_slot(cache_params, slots: int) -> int:
+    """压扁之前先把"真实每槽多少字节"算出来——代价模型要的是这个数。
+
+    从 cache_params 自己的形状声明里算，不去量压扁后的张量。
+    """
+    import torch as _t
+    total = 0
+    for name in dir(cache_params):
+        if name.startswith("_"):
+            continue
+        try:
+            v = getattr(cache_params, name)
+        except Exception:
+            continue
+        shapes = v if isinstance(v, (list, tuple)) else [v]
+        for sh in shapes:
+            if not isinstance(sh, (list, tuple)) or len(sh) < 2:
+                continue
+            if not all(isinstance(d, int) and d > 0 for d in sh):
+                continue
+            n = 1
+            for d in sh:
+                n *= d
+            total += n * 2          # 按 2 字节估；真实 dtype 在压扁前量不到
+    return total
+
+
+@contextlib.contextmanager
+def _flat_state_alloc():
+    """构造状态池的那一刻，把 ≥3 维张量的数据维压到 1。
+
+    为什么要在"构造时"而不是"构造后"：构造后再换掉，那 1.1 GB 已经真的向系统要过一次，
+    峰值 RSS 并不会降——形状化的意义就没了（实测：构造后压扁，峰值仍是 1654 MB）。
+
+    只压**第 2 维之后**：前两维是层与槽，分配/释放按它们索引；
+    二维的索引表（req_to_token 是 [size, max_context_len]）整个不动。
+    """
+    import torch as _t
+    orig_zeros, orig_empty = _t.zeros, _t.empty
+
+    def _shrink(args):
+        if not args:
+            return args
+        shape = args[0] if isinstance(args[0], (tuple, list, _t.Size)) else args
+        if not isinstance(shape, (tuple, list, _t.Size)) or len(shape) < 3:
+            return args
+        small = tuple(list(shape[:2]) + [1] * (len(shape) - 2))
+        return (small,) if isinstance(args[0], (tuple, list, _t.Size)) else small
+
+    def _shrink_kw(kw):
+        # memory_pool.py 用的是 torch.zeros(size=(...))，形状走关键字——只拦位置参数会漏
+        sz = kw.get("size")
+        if isinstance(sz, (tuple, list, _t.Size)) and len(sz) >= 3:
+            kw = dict(kw)
+            kw["size"] = tuple(list(sz[:2]) + [1] * (len(sz) - 2))
+        return kw
+
+    def zeros(*a, **kw):
+        return orig_zeros(*_shrink(a), **_shrink_kw(kw))
+
+    def empty(*a, **kw):
+        return orig_empty(*_shrink(a), **_shrink_kw(kw))
+
+    _t.zeros, _t.empty = zeros, empty
+    try:
+        yield
+    finally:
+        _t.zeros, _t.empty = orig_zeros, orig_empty
+
+
+def _shrink_mamba_state(pool, real_slot_bytes: int = 0) -> None:
+    """形状化：只保留**被索引的维度**（层、槽），数据维压到 1。
+
+    为什么可以：仿真里没人读这些状态的**值**——线性注意力本身是 mock 的；
+    真正被用到的是"有多少层、多少槽"（分配/释放按槽号索引）与"每槽多少字节"
+    （代价模型要）。所以把 (层, 槽, H, L, V) 压成 (层, 槽, 1, 1, 1)，
+    槽号索引照常，内存从 1.1 GB 掉到 KB 级。
+
+    真实的每槽字节数记在 ``pool.mamba_pool.shape_only_bytes_per_slot`` 上，
+    谁要算内存账就读它，不要去量压扁后的张量。
+    """
+    mp = getattr(pool, "mamba_pool", None)
+    mc = getattr(mp, "mamba_cache", None)
+    if mc is None:
+        return
+
+    def _flat(t):
+        # 前两维（层、槽）保留，其余压到 1
+        keep = list(t.shape[:2]) + [1] * (t.dim() - 2)
+        return torch.zeros(keep, dtype=t.dtype, device=t.device)
+
+    real_bytes = 0
+    slots = None
+    for name in ("temporal", "conv", "intermediate_conv_window",
+                 "intermediate_ssm", "replayssm_rawv", "replayssm_rawk"):
+        v = getattr(mc, name, None)
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            if not v or not hasattr(v[0], "dim"):
+                continue
+            real_bytes += sum(t.numel() * t.element_size() for t in v)
+            slots = slots or (v[0].shape[1] if v[0].dim() >= 2 else None)
+            small = [_flat(t) for t in v]
+        elif hasattr(v, "dim"):
+            if v.dim() < 2:
+                continue
+            real_bytes += v.numel() * v.element_size()
+            slots = slots or v.shape[1]
+            small = _flat(v)
+        else:
+            continue
+        try:
+            setattr(mc, name, small)
+        except Exception:                      # frozen dataclass
+            object.__setattr__(mc, name, small)
+    mp.shape_only_bytes_per_slot = real_slot_bytes or (
+        (real_bytes // slots) if slots else 0)
+    mp.shape_only = True
 
 
 def selftest() -> None:
@@ -172,6 +305,25 @@ def selftest() -> None:
 
 if __name__ == "__main__":
     selftest()
+
+
+def shape_only_enabled() -> bool:
+    """形状化开关：池子只按真实 shape 记账，不按规模分配那块内存。
+
+    默认关，PoC 原来的行为不变；``SIM_SHAPE_ONLY=1`` 打开。打开之后：
+
+    * KV 的每层区域换成**一块共享 scratch**（行数固定，所有层共用），
+      shape 字段与 ``kv_bytes_for`` 仍按真规模报——算子照常被调到，只是写进 scratch；
+    * mamba/KDA 状态张量只保留**被索引的维度**（层、槽），数据维压到 1。
+
+    为什么这样仍然成立：并发上限由 SGLang 自己的 ``resolve_max_num_reqs``
+    从 ``max_mamba_cache_size`` 算出来（kv_cache_configurator.py:2008），
+    它读配置不读池子实际分配了多少。
+    """
+    return os.environ.get("SIM_SHAPE_ONLY", "") not in ("", "0", "false", "False")
+
+
+SHAPE_ONLY_SCRATCH_ROWS = 64
 
 
 class SimKVCache:
@@ -202,6 +354,7 @@ class SimKVCache:
         self.size = 0  # set by the builder
         # per-layer regions, allocated on first touch at the real shape
         self._buffers: dict = {}
+        self.shape_only = shape_only_enabled()
         # which KV operators were actually invoked, and with what shapes.
         # This is what replaces "raise" as the guard against self-deception:
         # a test asserts the operator ran, not that it was avoided.
@@ -297,6 +450,18 @@ class SimKVCache:
                 "SimKVCache has no shape: build it with model_config so the KV "
                 "shapes are real (cpu_kv.kv_shape_from_config)."
             )
+        if self.shape_only:
+            # 一块共享 scratch，所有层共用；行数固定，不随池子规模涨。
+            # 算子照常被调到、shape 字段仍是真的，只是写进这块而不是真池子。
+            buf = self._buffers.get("scratch")
+            if buf is None:
+                rows = min(self.size, SHAPE_ONLY_SCRATCH_ROWS) or 1
+                buf = torch.zeros(
+                    (rows, self.head_num, self.head_dim),
+                    dtype=self.dtype, device=self.device,
+                )
+                self._buffers["scratch"] = buf
+            return buf
         buf = self._buffers.get(layer_id)
         if buf is None:
             buf = torch.zeros(
