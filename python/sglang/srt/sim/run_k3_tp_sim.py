@@ -50,7 +50,24 @@ for _m in (_c, _u, _nu):
         if hasattr(_m, _n):
             setattr(_m, _n, _f)
 
-DIST_INIT = "tcp://127.0.0.1:29701"
+def _free_rendezvous() -> str:
+    """A rendezvous address nobody else holds.
+
+    Pinning one port means an orphaned rank from an earlier run (a killed
+    harness leaves them behind) blocks every later run: the new ranks cannot
+    form their group and the run just hangs. The parent picks a free port and
+    passes it to the children through SIM_DIST_INIT.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.bind(("127.0.0.1", 0))
+        return f"tcp://127.0.0.1:{sk.getsockname()[1]}"
+
+
+# Children read the address the parent chose; a direct --rank invocation falls
+# back to a fixed one so it is still runnable by hand.
+DIST_INIT = os.environ.get("SIM_DIST_INIT") or "tcp://127.0.0.1:29701"
 
 
 def _server_args(cfg_dir: str, tp_size: int, ep_size: int = 1):
@@ -174,13 +191,16 @@ def main(tp_size: int = 2, ep_size: int = 1) -> int:
     pa_path = tempfile.mktemp(suffix=".portargs")
     Path(pa_path).write_bytes(pickle.dumps(port_args))
     print(f"  config dir: {cfg_dir}")
-    print(f"  gloo rendezvous: {DIST_INIT}")
 
     banner("step 2: every rank runs SGLang's own event_loop_normal")
     env = dict(os.environ)
     # SGLang's own switch; without it its node-locality check deadlocks on a
     # box with no /dev/shm, with or without any sim code (see module docstring).
     env.setdefault("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "0")
+    # Every run gets its own rendezvous port, so an orphan from a killed run
+    # cannot block this one.
+    env["SIM_DIST_INIT"] = _free_rendezvous()
+    print(f"  gloo rendezvous: {env['SIM_DIST_INIT']}")
     procs = [
         subprocess.Popen(
             [sys.executable, __file__, "--rank", str(r), str(tp_size),
