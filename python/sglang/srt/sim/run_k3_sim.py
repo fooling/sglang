@@ -43,6 +43,12 @@ warnings.filterwarnings("ignore")
 
 import torch
 
+# Before anything under sglang.srt.layers is imported -- see fake_npu's module
+# docstring for why the branch is decided by import order.
+from sglang.srt.sim.fake_npu import assert_npu_branch, install_fake_npu
+
+install_fake_npu()
+
 from sglang.srt.sim import register
 from sglang.srt.sim.mock_model_runner import MockModelRunner
 from sglang.srt.sim.mock_worker import MockWorker
@@ -400,6 +406,8 @@ def scripted_token(req) -> int:
 
 def main() -> int:
     banner("step 0: interception points")
+    assert_npu_branch()
+    print("  is_npu() = True (torch_npu stand-in installed; no NPU present)")
     register.install()
     if not register.selftest_all():
         print("  ABORTING: an interception point did not take effect.")

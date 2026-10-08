@@ -474,6 +474,33 @@ def transfer_cost_hook(fn) -> None:
     TRANSFER_COST = fn
 
 
+def install_device_kernel_shim() -> Callable[[], None]:
+    """Take the non-Triton writer in the prefill allocation path.
+
+    On the NPU branch ``support_triton("ascend")`` is True (utils/common.py:1332
+    excludes only torch_native and intel_amx), so alloc_for_extend reaches for
+    ``write_req_to_token_pool_triton`` -- a device kernel, and the sim has no
+    device to launch it on.
+
+    SGLang ships a plain-Python fallback for the same write, in the same
+    function, producing the same req_to_token contents; its own comment says
+    the only difference is that it "pays several .item() syncs per request".
+    So this rebinds the name alloc_for_extend asks, and nothing else: the
+    admission decision, the page accounting and the resulting table are
+    SGLang's own either way. What the sim gives up is the kernel, which it
+    never claimed to execute.
+    """
+    import sglang.srt.mem_cache.allocation as alloc_mod
+
+    original = alloc_mod.support_triton
+    alloc_mod.support_triton = lambda backend: False
+
+    def unpatch():
+        alloc_mod.support_triton = original
+
+    return unpatch
+
+
 def install_transfer_shim() -> Callable[[], None]:
     import sglang.srt.disaggregation.ascend.conn as conn_mod
 
@@ -576,6 +603,7 @@ def install() -> None:
             install_execution_shim(),
             install_kv_shim(),
             install_transfer_shim(),
+            install_device_kernel_shim(),
             install_clock_shim(),
         ]
     )

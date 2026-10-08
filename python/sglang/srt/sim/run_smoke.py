@@ -24,6 +24,15 @@ from types import SimpleNamespace
 
 import torch
 
+# Before anything under sglang.srt.layers is imported: 34 modules freeze
+# _is_npu = is_npu() at module scope and is_npu is lru_cached, so the branch
+# is decided by whichever import lands first. The sim runs the NPU branch --
+# that is the control plane a 910 runs; the non-NPU one is a different
+# codebase and proving things about it would prove nothing.
+from sglang.srt.sim.fake_npu import assert_npu_branch, install_fake_npu
+
+install_fake_npu()
+
 from sglang.srt.sim import register
 from sglang.srt.sim.mock_model_runner import MockModelRunner
 from sglang.srt.sim.mock_worker import MockWorker
@@ -50,7 +59,7 @@ def build_server_args():
     # because of a config choice (no Triton/CUDA kernel in the path), not
     # because scheduler.py/schedule_batch.py were changed.
     server_args = ServerArgs(
-        model_path="dummy", device="cpu", attention_backend="torch_native"
+        model_path="dummy", device="npu", attention_backend="ascend"
     )
     set_global_server_args_for_scheduler(server_args)
     # Real Scheduler.__init__ (scheduler.py:1099-1104) derives
@@ -197,6 +206,8 @@ def build_scheduler_stub(
 
 def main() -> int:
     banner("step 0: register sim shims at the 4 interception points")
+    assert_npu_branch()
+    print("  is_npu() = True (torch_npu stand-in installed; no NPU present)")
     register.install()
     ok = register.selftest_all()
     print(f"\n  all 4 interception-point selftests passed: {ok}")
@@ -390,6 +401,14 @@ def main() -> int:
     # (process_batch_result), out of scope here.
     print(f"  after:  victim={victim.rid} to_finish={victim.to_finish}")
     del _os.environ["SGLANG_REQ_RUNNING_TIMEOUT"]
+
+    banner("step 10: which NPU entry points this run actually reached")
+    counts = __import__("sglang.srt.sim.fake_npu", fromlist=["op_counts"]).op_counts()
+    if counts:
+        for name, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print(f"  {name}: {n}")
+    else:
+        print("  none -- the control plane came up without calling into torch_npu")
 
     return 0
 

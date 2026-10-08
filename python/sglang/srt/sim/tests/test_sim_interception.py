@@ -166,8 +166,20 @@ def test_no_preexisting_sglang_source_modified():
 
 # ───────────────────────── C1: no device libs ─────────────────────────
 def test_no_device_libraries_in_play():
+    """No *real* device library. torch_npu is present and is ours.
+
+    The sim runs the NPU branch, so torch_npu has to be importable -- but what
+    is in sys.modules is the stand-in from fake_npu, which carries no kernels
+    and says so. Asserting its identity is the claim that matters: a real
+    torch_npu would mean a real device under us.
+    """
+    import torch_npu
+
     assert torch.cuda.is_available() is False
-    assert "torch_npu" not in sys.modules
+    assert torch_npu.__version__ == "sim-stand-in", (
+        "a real torch_npu is loaded; this process is not the no-device sim"
+    )
+    assert torch_npu.__file__ == "<sglang.srt.sim.fake_npu>"
 
 
 @pytest.mark.parametrize("module", CONTROL_PLANE_MODULES)
@@ -430,24 +442,30 @@ def test_alloc_for_extend_still_branches_on_support_triton():
     )
 
 
-def test_sim_server_args_select_a_non_triton_backend():
-    """Assert on the pair alloc_for_extend actually reads, not on the raw field.
+def test_sim_names_the_ascend_backend_and_takes_the_fallback_writer():
+    """The NPU branch names ascend, and ascend *does* support Triton.
 
-    alloc_for_extend calls ``attention_backends()`` (runtime_context.py:1951),
-    which falls back to ``attention_backend`` when the split prefill/decode
-    fields are unset -- so that is what has to be non-Triton.
+    support_triton excludes only torch_native and intel_amx, so on this branch
+    alloc_for_extend would reach for write_req_to_token_pool_triton -- a device
+    kernel. install_device_kernel_shim rebinds the name alloc_for_extend asks,
+    so the same function takes SGLang's own Python fallback instead. Both
+    halves are asserted: the backend really is the NPU one, and the writer
+    really is the fallback.
     """
+    import sglang.srt.mem_cache.allocation as alloc_mod
     from sglang.srt.runtime_context import attention_backends
     from sglang.srt.utils.common import support_triton
 
     build_server_args()
-    prefill, decode = attention_backends()
-    assert prefill is not None, "sim must name a prefill backend, not leave it None"
-    assert support_triton(prefill) is False, (
-        f"prefill backend {prefill!r} routes KV writes through the Triton kernel"
+    prefill, _decode = attention_backends()
+    assert prefill == "ascend", f"sim is not on the NPU backend: {prefill!r}"
+    assert support_triton("ascend") is True, (
+        "upstream changed support_triton: ascend no longer routes through "
+        "Triton, so the device-kernel shim may be unnecessary"
     )
-    assert decode is None or support_triton(decode) is False, (
-        f"decode backend {decode!r} routes through the Triton kernel"
+    assert alloc_mod.support_triton("ascend") is False, (
+        "the device-kernel shim is not installed: alloc_for_extend would try "
+        "to launch write_req_to_token_pool_triton, and the sim has no device"
     )
 
 
