@@ -368,6 +368,7 @@ def selftest_kv_shim() -> bool:
     _apply_token_constraints. What a stub can still prove is exactly what is
     checked here: the two shimmed steps are in place and do the backend job.
     """
+    _publish_for_selftest()
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -487,6 +488,7 @@ def install_transfer_shim() -> Callable[[], None]:
 
 def selftest_transfer_shim() -> bool:
     """Calls the REAL AscendKVManager.init_engine bound method."""
+    _publish_for_selftest()
     from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 
     stub = AscendKVManager.__new__(AscendKVManager)
@@ -551,6 +553,7 @@ def virtual_clock() -> "VirtualClock":
 
 def selftest_clock_shim() -> bool:
     """Calls scheduler.py's own time.perf_counter() through its module global."""
+    _publish_for_selftest()
     import sglang.srt.managers.scheduler as scheduler_mod
 
     before = scheduler_mod.time.perf_counter()
