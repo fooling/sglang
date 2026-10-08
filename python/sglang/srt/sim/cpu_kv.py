@@ -303,8 +303,6 @@ def selftest() -> None:
     print("alloc_rows(3) ->", rows, "available_size after:", pool.available_size())
 
 
-if __name__ == "__main__":
-    selftest()
 
 
 def shape_only_enabled() -> bool:
@@ -527,3 +525,10 @@ class SimKVCache:
         """The reload operator (host -> device). Called; copies nothing."""
         self._record("load_cpu_copy", slots=len(indices),
                      layers=len(kv_cache_cpu) if kv_cache_cpu is not None else 0)
+
+
+# The guard goes last on purpose: selftest() reaches SimKVCache (defined
+# below where this block used to sit), so running the module as a script
+# raised NameError while every normal import was fine.
+if __name__ == "__main__":
+    selftest()
