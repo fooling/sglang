@@ -60,6 +60,31 @@ def _free_tcp_init_method() -> str:
         return f"tcp://127.0.0.1:{sk.getsockname()[1]}"
 
 
+def _standin_model_config() -> SimpleNamespace:
+    """The minimum a model config needs to survive SGLang's own
+    initialize_dp_attention (dp_attention.py:357-383), which reads exactly:
+
+        model_config.hf_config  (getattr hybrid_override_pattern)
+        model_config.hidden_size
+        model_config.dtype
+
+    The values are stand-ins, not claims about any model: this config is only
+    reached when no real one was supplied, and the one place hidden_size/dtype
+    land is _DpGatheredBufferWrapper.set_metadata, a buffer the sim never
+    fills. A run that wants real shapes passes a real ModelConfig
+    (server_args._sim_model_config), which is what the runners do.
+    """
+    import torch
+
+    return SimpleNamespace(
+        vocab_size=32000,
+        context_len=8192,
+        hidden_size=4096,
+        dtype=torch.float32,
+        hf_config=SimpleNamespace(),
+    )
+
+
 def _init_sim_parallel_state(
     rank: int = 0, world_size: int = 1, tp_size: int = 1,
     ep_size: int = 1, init_method: str | None = None,
@@ -136,7 +161,7 @@ class SimTpModelWorker:
 
                 model_config = ModelConfig.from_server_args(server_args)
             except Exception:
-                model_config = SimpleNamespace(vocab_size=32000, context_len=8192)
+                model_config = _standin_model_config()
         tp_size = int(getattr(server_args, "tp_size", 1) or 1)
         ep_size = int(getattr(server_args, "ep_size", 1) or 1)
         rank = int(getattr(ps, "tp_rank", 0) or 0)
@@ -170,12 +195,50 @@ def install_execution_shim() -> Callable[[], None]:
     return unpatch
 
 
+def _publish_for_selftest() -> None:
+    """Stand in for the publish a real scheduler process does before it builds
+    the worker.
+
+    Order in production: scheduler.py:5392 publishes, then :960 builds
+    TpModelWorker. This selftest calls :960 directly, so without this the
+    worker is built in an unpublished process and SGLang's own
+    initialize_dp_attention (dp_attention.py:361) raises
+    "config namespace 'parallel' not published".
+
+    Only publishes when nothing is published yet, and re-publish is
+    last-wins anyway, so a runner that publishes its own ServerArgs right
+    after the selftest still gets its own config. attention_backend is the
+    same torch_native the runners pick, for the same reason (support_triton
+    excludes it, so no Triton kernel enters the path on a machine with no GPU).
+    """
+    from sglang.srt.runtime_context import get_context
+
+    try:
+        if get_context().is_config_namespace_published("parallel"):
+            return
+    except Exception:
+        pass
+    from sglang.srt.server_args import (
+        ServerArgs,
+        set_global_server_args_for_scheduler,
+    )
+
+    set_global_server_args_for_scheduler(
+        ServerArgs(model_path="dummy", device="cpu", attention_backend="torch_native")
+    )
+
+
 def selftest_execution_shim() -> bool:
     """Calls the REAL Scheduler.init_tp_model_worker bound method."""
     from sglang.srt.managers.scheduler import Scheduler
 
+    _publish_for_selftest()
+
     stub = Scheduler.__new__(Scheduler)
-    stub.server_args = SimpleNamespace(_sim_model_config=None)
+    # The selftest supplies its own stand-in config rather than falling through
+    # to SimTpModelWorker's except-branch: what this selftest is checking is the
+    # worker-class swap, not the config fallback.
+    stub.server_args = SimpleNamespace(_sim_model_config=_standin_model_config())
     stub.ps = SimpleNamespace(gpu_id=0)
     stub.nccl_port = 29500
 
