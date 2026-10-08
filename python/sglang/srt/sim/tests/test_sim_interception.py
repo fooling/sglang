@@ -30,6 +30,7 @@ import importlib
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -427,6 +428,25 @@ def test_support_triton_semantics_are_what_the_shim_assumes():
     assert support_triton("torch_native") is False
     assert support_triton("intel_amx") is False
     assert support_triton("triton") is True
+
+
+def test_triton_here_is_a_stub_so_the_kernel_branch_would_crash():
+    """Why the shim forces the fallback: the other branch cannot run at all.
+
+    Triton is not installed in this environment. ``import triton`` resolves to
+    SGLang's own stub (sglang/_platform_stubs.py), whose ``@triton.jit`` is a
+    pass-through decorator -- so the "kernel" is a plain function and the
+    launch syntax raises. This also rules out TRITON_INTERPRET=1: the
+    interpreter belongs to the real package, which is absent.
+    """
+    import triton
+
+    from sglang.kernels.ops.memory.common import write_req_to_token_pool_triton
+
+    assert "stub" in repr(triton), f"triton is real now ({triton!r}) -- recheck"
+    assert type(write_req_to_token_pool_triton) is types.FunctionType
+    with pytest.raises(TypeError, match="not subscriptable"):
+        write_req_to_token_pool_triton[(1,)]
 
 
 def test_alloc_for_extend_still_branches_on_support_triton():

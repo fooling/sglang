@@ -316,9 +316,11 @@ def _neutralize_torch_compile() -> None:
 
     On the NPU branch the import chain resolves the inductor backend while a
     class body is still being defined (kvfp4_tensor.py:66, reached from
-    mem_cache/memory_pool.py:55), and this environment's triton is too old for
-    torch._inductor.runtime.triton_compat to import at all:
-    "module 'triton.language.core' has no attribute 'view'". The same import
+    mem_cache/memory_pool.py:55), and torch._inductor.runtime.triton_compat
+    cannot import there: "module 'triton.language.core' has no attribute
+    'view'". Not an old Triton -- there is no Triton here at all; the name is
+    served by SGLang's own stub (sglang/_platform_stubs.py), which cannot
+    satisfy inductor's from-imports at that point in the chain. The same import
     succeeds on the non-NPU branch, so it is the branch that drags inductor in.
 
     Compiling is irrelevant here either way: the sim never executes a compiled

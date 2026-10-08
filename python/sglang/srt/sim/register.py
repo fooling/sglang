@@ -489,6 +489,16 @@ def install_device_kernel_shim() -> Callable[[], None]:
     admission decision, the page accounting and the resulting table are
     SGLang's own either way. What the sim gives up is the kernel, which it
     never claimed to execute.
+
+    What happens without this shim is not a graceful miss, it is a TypeError:
+    there is no Triton in this environment at all. ``import triton`` is served
+    by SGLang's own stub (sglang/_platform_stubs.py, self-reports 3.0.0), where
+    ``@triton.jit`` is a pass-through decorator -- so
+    ``write_req_to_token_pool_triton`` stays a plain function and the launch
+    syntax ``kernel[(grid,)](...)`` raises "'function' object is not
+    subscriptable". TRITON_INTERPRET=1 is no help for the same reason: the
+    interpreter is a feature of the real package, which is not installed.
+    Taking the fallback is therefore the way the code runs, not a compromise.
     """
     import sglang.srt.mem_cache.allocation as alloc_mod
 
